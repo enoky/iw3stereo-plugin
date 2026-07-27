@@ -29,6 +29,7 @@ builds it into a tool creators already use.
 | `docs/phase0-findings.md` | What Resolve can and cannot do, with evidence. |
 | `docs/phase2-onnx.md` | What exported, what did not, and the timing table. |
 | `docs/row-flow-v3.md` | The second model, and the three things ONNX export needed. |
+| `docs/monobw-inpaint.md` | Investigation of the inpaint method: architecture, cost, port inventory. |
 
 ## Status
 
