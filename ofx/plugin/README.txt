@@ -1,0 +1,171 @@
+iw3 Stereo
+==========
+
+Turns a 2D shot plus a depth pass into stereo 3D, inside DaVinci Resolve.
+
+This is the stereo-synthesis half of iw3 (github.com/nagadomi/nunif). It does
+not estimate depth -- you supply that as a clip, from whatever tool you like.
+
+
+REQUIREMENTS
+------------
+
+  * DaVinci Resolve STUDIO. The free version will not load third-party OFX
+    plugins at all.
+  * An NVIDIA GPU. There is a CPU fallback, but it is roughly twenty times
+    slower and is not usable for preview.
+
+Tested on Resolve 21 and an RTX 5080, where a 1920x800 frame takes about 5 ms.
+
+
+QUICK START
+-----------
+
+1. Go to the FUSION page. This plugin needs two inputs, and Fusion is the only
+   place Resolve gives an OFX effect more than one. Dropping it on a timeline
+   clip in Edit or Colour will not work -- see LIMITATIONS.
+
+2. Add the node: Effects Library > Open FX > iw3 > iw3 Stereo.
+
+3. Wire your footage into the YELLOW input and your depth pass into the GREEN
+   input marked Depth.
+
+4. IMPORTANT: select the depth clip in the Media Pool, right-click >
+   Clip Attributes, and set DATA LEVELS to FULL. See the next section for why.
+
+You should immediately see a red/cyan anaglyph. If the right half of the image
+is flat magenta, the depth input is not connected.
+
+
+SET DATA LEVELS TO FULL ON THE DEPTH CLIP
+-----------------------------------------
+
+Resolve treats most video files as "video range", where black is 16 and white
+is 235 rather than 0 and 255, and stretches them to fill the range on the way
+in. That is correct for footage. It is wrong for a depth pass, which is data
+rather than a picture: the stretch shifts every depth value.
+
+The effect is a mild but real error -- your divergence and convergence settings
+stop meaning quite what they say. It will not look obviously broken, which is
+exactly why it is worth setting.
+
+  Media Pool > right-click the depth clip > Clip Attributes > Data Levels: Full
+
+If you cannot change it -- a nested timeline, say -- the Depth Range parameter
+can undo the stretch instead. Prefer fixing it at the clip.
+
+
+PARAMETERS
+----------
+
+Stereo
+
+  Divergence          Strength of the 3D effect, as a percentage of image
+                      width. Default 2.0. Up to about 2 is comfortable; higher
+                      is more dramatic and more prone to artefacts around
+                      edges. Both eyes are synthesised, each carrying half.
+
+  Convergence         Which depth sits on the screen plane. Default 0.5.
+                      0 pushes the whole scene behind the screen, 1 brings it
+                      all in front. Behind is easier on the eyes.
+
+  Preserve Screen     Fades the parallax to nothing at the left and right
+  Border              edges. Helps when objects run off the side of frame.
+
+Depth
+
+  Depth Is Inverted   Turn on if your depth pass has near = black. Tools
+                      disagree about this and there is no way to detect it.
+                      If the 3D looks inside-out, this is the switch.
+
+  Foreground Scale    Reshapes the depth to push the foreground forward
+                      (positive) or flatten it (negative). 0 is off.
+
+  Mapper Type         Which family Foreground Scale draws from. Only matters
+                      when Foreground Scale is not 0.
+
+  Stereo Width        Width the depth is reduced to before warping. Leave at 0
+                      unless you have a reason. See below.
+
+  Depth Range         Leave on "As delivered" and set the clip's Data Levels
+                      instead. "Undo video expansion" is the fallback.
+
+Output
+
+  Anaglyph            Red/cyan, using Dubois coefficients. The default,
+                      because it makes the effect visible at a glance.
+  Left eye            The synthesised left view on its own.
+  Right eye           The synthesised right view on its own.
+  Half SBS            Both eyes squeezed side by side into one frame.
+  Depth (debug)       What the model actually sees, after all depth
+                      processing. Useful for checking Stereo Width and
+                      Depth Is Inverted.
+
+For a proper stereo pair, use two copies of the node -- one set to Left eye,
+one to Right eye -- and combine them however your delivery needs.
+
+
+ABOUT STEREO WIDTH
+------------------
+
+Resolve always hands the plugin depth at the composition's resolution, whatever
+size the depth file really is. That matters: the warp takes its scale from the
+depth's width, and the model was trained on depth at the size a depth estimator
+produces. Give it a full-resolution depth map and the picture develops fine
+vertical stripes.
+
+So Stereo Width = 0 does not mean "leave it alone". It means "reduce the depth
+to the size a depth model would have produced", which for a 1920x800 comp is
+about 938x392.
+
+Set it explicitly only if you want to override that -- 1280 or 640 are sensible
+values. Use the Depth (debug) output to see the result.
+
+
+LIMITATIONS
+-----------
+
+  * Fusion page only. On the Edit and Colour pages Resolve gives an OFX effect
+    a single input, so there is nowhere for the depth to arrive. The node will
+    appear there but passes the image through untouched.
+
+  * NVIDIA only for GPU speed. The plugin will run on the CPU if it must, and
+    warns you in the node when it does, but expect roughly 250 ms a frame
+    rather than 5.
+
+  * Full SBS is not offered, only Half SBS. An OFX plugin cannot enlarge its
+    output frame in Resolve.
+
+
+IF SOMETHING IS WRONG
+---------------------
+
+The plugin writes a log to:
+
+    %LOCALAPPDATA%\iw3probe\probe.log
+
+Paste that into a bug report. It records which GPU path started, how long
+start-up took, and any error from the inference runtime.
+
+Common cases:
+
+  Image unchanged, no error
+      Depth input not connected, or you are on the Edit/Colour page rather
+      than Fusion.
+
+  Warning about running on the CPU
+      The CUDA runtime did not start. The log says why. Check your NVIDIA
+      driver.
+
+  3D looks inside-out
+      Turn on Depth Is Inverted.
+
+  Fine vertical stripes over the picture
+      Stereo Width has been set too high. Return it to 0.
+
+
+LICENCE
+-------
+
+MIT. Derived from nunif/iw3 by nagadomi, also MIT, and shipped with the
+author's permission. See LICENSE and NOTICE in the source repository.
