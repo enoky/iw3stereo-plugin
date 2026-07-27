@@ -327,12 +327,10 @@ depth map does that, and only the range expansion produces it.
 Two things follow, and the second is the more consequential:
 
 **The transform is affine, not a gamma curve.** `v_full = (v*255 - 16) / 219`.
-That means the depth's structure survives — it is rescaled, not bent — so the
-error shows up as an effective change in divergence and convergence rather than
-as distorted geometry. It is also exactly invertible. The fix is either to set
-the depth clip's **Data Levels to Full** in Resolve's clip attributes, or to let
-the plugin undo it; the former is better, because the plugin cannot reliably
-tell whether an expansion happened.
+The depth's structure survives — it is rescaled, not bent.
+
+**It is not an error, and must not be "fixed".** This was measured later and
+reversed the original conclusion here; see the correction below.
 
 **Resolve resizes the depth clip to the composition resolution.** The file is
 960x384. The plugin receives it at **1920x800**, the comp size, as
@@ -345,6 +343,37 @@ Resolve hands the plugin full-comp-resolution depth *unconditionally*, which is
 the exact failure case. So **`stereo_width` is not optional in this plugin**: it
 has to downsample the depth it is given, every time, and the resampling has to
 be the antialiased filter from Phase 2 rather than a naive one.
+
+### Correction: the range expansion is correct, and must be left alone
+
+This section originally called the range expansion an error and recommended
+setting the depth clip's **Data Levels to Full** to stop it. That advice was
+wrong, and it shipped in the plugin's README before being measured.
+
+**iw3 applies the same expansion when it reads its own depth videos.**
+`nunif/utils/video/color_transform.py: setup_color_transform()` sets
+`dst_color_range: ColorRange.JPEG`, i.e. full range. Running iw3's own reader
+over the same frame of the same file settles it:
+
+| | min | max | mean |
+| --- | --- | --- | --- |
+| **iw3's depth reader** (960x384 native) | **0.20128** | **1.00000** | **0.66892** |
+| decoded with the expansion | 0.19216 | 0.99608 | 0.66501 |
+| decoded without it, raw Y | 0.23529 | 0.92549 | 0.63897 |
+| what the plugin gets from Resolve | 0.21021 | 1.00360 | 0.67265 |
+
+iw3 matches the expanded interpretation and is nowhere near the unexpanded one.
+So Resolve's expansion is what makes the plugin agree with iw3, and forcing Data
+Levels to Full would remove it here but not in iw3, breaking the agreement.
+
+The right advice is to **leave Data Levels at whatever Resolve chose**. The
+plugin's `Depth Range` parameter stays on "As delivered", and its other setting
+is for a file whose range tag is genuinely wrong — it will make a correctly
+tagged file worse.
+
+The lesson is not subtle: "Resolve transformed the data" was observed, and
+"therefore Resolve is wrong" was assumed. What the other end of the pipeline
+did was never checked until it was.
 
 ## What Phase 3 inherits
 

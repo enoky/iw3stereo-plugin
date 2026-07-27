@@ -30,29 +30,32 @@ QUICK START
 3. Wire your footage into the YELLOW input and your depth pass into the GREEN
    input marked Depth.
 
-4. IMPORTANT: select the depth clip in the Media Pool, right-click >
-   Clip Attributes, and set DATA LEVELS to FULL. See the next section for why.
-
 You should immediately see a red/cyan anaglyph. If the right half of the image
 is flat magenta, the depth input is not connected.
 
 
-SET DATA LEVELS TO FULL ON THE DEPTH CLIP
+A NOTE ON DATA LEVELS -- LEAVE THEM ALONE
 -----------------------------------------
 
-Resolve treats most video files as "video range", where black is 16 and white
-is 235 rather than 0 and 255, and stretches them to fill the range on the way
-in. That is correct for footage. It is wrong for a depth pass, which is data
-rather than a picture: the stretch shifts every depth value.
+Most video files are tagged "video range", where black is 16 and white is 235
+rather than 0 and 255, and Resolve stretches them to fill the range on the way
+in. Depth passes written by iw3 are tagged that way too.
 
-The effect is a mild but real error -- your divergence and convergence settings
-stop meaning quite what they say. It will not look obviously broken, which is
-exactly why it is worth setting.
+It is tempting to think that stretch corrupts a depth map and should be turned
+off by setting Clip Attributes > Data Levels to Full. It should not.
 
-  Media Pool > right-click the depth clip > Clip Attributes > Data Levels: Full
+iw3 applies exactly the same stretch when it reads its own depth videos. So
+leaving Resolve to do it is what makes this plugin agree with iw3. Forcing Data
+Levels to Full removes the stretch here but not in iw3, and the two stop
+matching.
 
-If you cannot change it -- a nested timeline, say -- the Depth Range parameter
-can undo the stretch instead. Prefer fixing it at the clip.
+Measured on the same frame of the same file: iw3's reader gives 0.201 to 1.000
+with a mean of 0.669, and what this plugin receives from Resolve is 0.210 to
+1.004, mean 0.673. Without the stretch it would be 0.235 to 0.926, mean 0.639 --
+clearly a different signal.
+
+So: leave Data Levels at whatever Resolve picked. The Depth Range parameter
+exists for the rarer case of a file whose range tag is simply wrong.
 
 
 PARAMETERS
@@ -87,8 +90,10 @@ Depth
   Stereo Width        Width the depth is reduced to before warping. Leave at 0
                       unless you have a reason. See below.
 
-  Depth Range         Leave on "As delivered" and set the clip's Data Levels
-                      instead. "Undo video expansion" is the fallback.
+  Depth Range         Leave on "As delivered". Resolve's range handling
+                      already matches what iw3 does. "Undo video expansion" is
+                      for a file whose range tag is wrong, and will make a
+                      correctly tagged one worse.
 
 Output
 

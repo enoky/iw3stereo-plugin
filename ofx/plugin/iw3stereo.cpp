@@ -618,8 +618,8 @@ void Iw3StereoFactory::describe(OFX::ImageEffectDescriptor& desc)
     desc.setPluginDescription(
         "Stereo 3D from a colour frame and a depth pass, using iw3's row_flow_v2 warp.\n"
         "\n"
-        "Connect the depth pass to the Depth input. Set the depth clip's Data Levels "
-        "to Full, or Resolve will expand it as video-range footage.");
+        "Connect the depth pass to the Depth input. Leave the depth clip's Data Levels "
+        "alone: Resolve's range handling already matches what iw3 does.");
 
     // General is where the second input clip exists; filter is described only
     // so the effect appears rather than failing oddly on the Edit page.
@@ -734,8 +734,8 @@ void Iw3StereoFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OFX::
 
     OFX::ChoiceParamDescriptor* depthRange = desc.defineChoiceParam("depthRange");
     depthRange->setLabels("Depth Range", "Depth Range", "Depth Range");
-    depthRange->setHint("Resolve expands video-range clips to full range. Prefer setting the depth clip's "
-                        "Data Levels to Full; use this only if you cannot.");
+    depthRange->setHint("Resolve expands video-range clips to full range, which is what iw3 does too, "
+                        "so leave this alone. Only useful for a file whose range tag is wrong.");
     depthRange->appendOption("As delivered");
     depthRange->appendOption("Undo video expansion");
     depthRange->setDefault(0);

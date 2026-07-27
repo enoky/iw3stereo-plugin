@@ -102,9 +102,13 @@ The plugin always clamps to 0–1 before use, because the mappers and the model
 assume that range. The **Depth Range** parameter additionally offers to undo the
 expansion, `v_original = (v * 219 + 16) / 255`.
 
-The documented recommendation is to **set the depth clip's Data Levels to Full**
-in Resolve's clip attributes and leave this parameter alone. The plugin cannot
-detect reliably whether an expansion happened, so it must not try to guess.
+**Measured afterwards: the expansion is correct and must be left alone.** iw3
+applies the same one when reading its own depth videos, so Resolve's handling is
+what makes the plugin agree with it. The documented recommendation is therefore
+to leave Data Levels at whatever Resolve chose, and to leave this parameter on
+"As delivered". Its other setting is for a file whose range tag is wrong, and
+will make a correctly tagged one worse. See the correction in
+`docs/phase0-findings.md`.
 
 ### Rendering
 
@@ -154,9 +158,10 @@ Settled 2026-07-27.
    Not shipped, not tested further.
 2. **Output defaults to Anaglyph**, so the node's effect is visible the moment
    it is added.
-3. **Depth Range defaults to As delivered.** The Undo option exists for users
-   who need it. Whether iw3 reads its own depth videos as full or limited range
-   is still unmeasured; the default does not depend on the answer.
+3. **Depth Range defaults to As delivered** — since confirmed correct by
+   measurement. iw3 reads its own depth videos with the same limited-to-full
+   expansion Resolve applies, so "As delivered" is what matches it. The Undo
+   option is for a mis-tagged file only.
 4. **No Edit/Color page variant.** Fusion is where a depth pass is composited.
    The filter context is still described, so the effect appears rather than
    failing oddly, but it passes the source through.
