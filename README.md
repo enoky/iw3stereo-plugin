@@ -28,6 +28,7 @@ builds it into a tool creators already use.
 | `scripts/resolve_probe.py` | Queries a running Resolve via the scripting API. |
 | `docs/phase0-findings.md` | What Resolve can and cannot do, with evidence. |
 | `docs/phase2-onnx.md` | What exported, what did not, and the timing table. |
+| `docs/row-flow-v3.md` | The second model, and the three things ONNX export needed. |
 
 ## Status
 
@@ -40,6 +41,10 @@ builds it into a tool creators already use.
 
 **iw3 Stereo** is a Fusion node with Source and Depth inputs, producing an
 anaglyph, either eye, or half SBS. Interface in `docs/phase3-interface.md`.
+
+Both `row_flow_v2` and `row_flow_v3` are supported, selected by the Model
+parameter. v3 needed no pipeline change but three separate fixes to export at
+dynamic shapes; `docs/row-flow-v3.md` records them.
 
 It renders entirely on the GPU: Resolve's device buffers, six CUDA kernels and
 ONNX Runtime bound to device memory, with nothing crossing PCIe. A 1920x800

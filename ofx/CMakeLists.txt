@@ -105,6 +105,9 @@ function(stage_runtime TARGET)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${CMAKE_CURRENT_SOURCE_DIR}/../models/stereo_warp.onnx"
                 "${BUNDLE}/stereo_warp.onnx"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_CURRENT_SOURCE_DIR}/../models/stereo_warp_v3.onnx"
+                "${BUNDLE}/stereo_warp_v3.onnx"
         COMMENT "Staging ONNX Runtime and the model into the ${TARGET} bundle")
 endfunction()
 

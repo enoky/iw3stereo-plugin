@@ -14,6 +14,7 @@
 
 #include "numeric_math.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -47,6 +48,7 @@ struct Settings
     int stereoWidth = 0;  // 0 = auto
     bool undoVideoRange = false;
     OutputMode output = OutputMode::Anaglyph;
+    size_t model = 0;  // index into the runtime's graphs
 };
 
 // iw3's depth mappers, for relative depth only.

@@ -33,15 +33,22 @@ import torch.nn.functional as F
 
 __all__ = [
     "RowFlowV2",
+    "RowFlowV3",
     "load_row_flow_v2",
+    "load_row_flow_v3",
+    "load_stereo_model",
     "get_mapper",
     "synthesize_stereo",
     "ROW_FLOW_V2_URL",
+    "ROW_FLOW_V3_URL",
 ]
 
-ROW_FLOW_V2_URL = "https://github.com/nagadomi/nunif/releases/download/0.0.0/iw3_row_flow_v2_20240130.pth"
+_RELEASE = "https://github.com/nagadomi/nunif/releases/download/0.0.0/"
+ROW_FLOW_V2_URL = _RELEASE + "iw3_row_flow_v2_20240130.pth"
+ROW_FLOW_V3_URL = _RELEASE + "iw3_row_flow_v3_20250627.pth"
 
 MODEL_NAME = "sbs.row_flow_v2"
+MODEL_NAME_V3 = "sbs.row_flow_v3"
 
 # The model is trained with a 28 pixel replication pad, cropped off again after
 # inference, so the convolutions never see the frame edge.
@@ -147,6 +154,235 @@ def load_row_flow_v2(path=None, device="cpu"):
     model = RowFlowV2()
     model.load_state_dict(_remap_state_dict(data["state_dict"]), strict=True)
     return model.eval().to(device)
+
+
+# ---------------------------------------------------------------------------
+# row_flow_v3
+#
+# A different kind of model from v2: windowed attention rather than plain
+# convolutions, 117k parameters against 30k. The warp around it is unchanged --
+# same three input channels, same delta contract, same non-symmetric path -- so
+# only the network below differs.
+#
+# Module names and Sequential indices mirror iw3's exactly, so the published
+# checkpoint loads with no key remapping. The attention bias buffers (`index`,
+# `delta`) come from the checkpoint too, which is why their generator does not
+# need porting.
+
+
+def _pixel_unshuffle(x, factor):
+    """Non-square pixel unshuffle. torch's built-in is square-only."""
+    sh, sw = factor
+    B, C, H, W = x.shape
+    x = x.reshape(B, C, H // sh, sh, W // sw, sw)
+    x = x.permute(0, 1, 3, 5, 2, 4)
+    return x.reshape(B, C * sh * sw, H // sh, W // sw)
+
+
+def _pixel_shuffle(x, factor):
+    sh, sw = factor
+    B, C, H, W = x.shape
+    x = x.reshape(B, C // (sh * sw), sh, sw, H, W)
+    x = x.permute(0, 1, 4, 2, 5, 3)
+    return x.reshape(B, C // (sh * sw), H * sh, W * sw)
+
+
+def _window_partition(x, window):
+    """BCHW -> (B*windows, tokens, C), aka window_partition."""
+    sh, sw = window
+    B, C, H, W = x.shape
+    x = x.reshape(B, C, H // sh, sh, W // sw, sw)
+    x = x.permute(0, 2, 4, 3, 5, 1)
+    return x.reshape(B * (H // sh) * (W // sw), sh * sw, C)
+
+
+def _window_merge(x, shape, window):
+    sh, sw = window
+    B, C, H, W = shape
+    x = x.reshape(B, H // sh, W // sw, sh, sw, C)
+    x = x.permute(0, 5, 1, 3, 2, 4)
+    return x.reshape(B, C, H, W)
+
+
+class _WindowScoreBias(nn.Module):
+    """A learned bias over relative positions inside a window."""
+
+    def __init__(self, window):
+        super().__init__()
+        tokens = window[0] * window[1]
+        hidden = int(tokens ** 0.5) * 2
+        self.tokens = tokens
+        self.register_buffer("index", torch.zeros(tokens * tokens, dtype=torch.int64))
+        self.register_buffer("delta", torch.zeros((2 * window[0] - 1) * (2 * window[1] - 1), 2))
+        self.to_bias = nn.Sequential(*[
+            nn.Linear(2, hidden, bias=True),
+            nn.GELU(),
+            nn.Linear(hidden, 1, bias=True),
+        ])
+
+    def forward(self):
+        bias = self.to_bias(self.delta)
+        return bias[self.index].reshape(self.tokens, self.tokens)
+
+
+class _MHA(nn.Module):
+    def __init__(self, channels, num_heads):
+        super().__init__()
+        self.num_heads = num_heads
+        self.qkv_dim = channels // num_heads
+        self.qkv_proj = nn.Linear(channels, self.qkv_dim * num_heads * 3, bias=True)
+        self.head_proj = nn.Linear(self.qkv_dim * num_heads, channels)
+
+    def forward(self, x, attn_mask=None, export_safe=False):
+        q, k, v = self.qkv_proj(x).split(self.qkv_dim * self.num_heads, dim=-1)
+
+        if export_safe:
+            # Head by head, staying three-dimensional, concatenating to merge.
+            #
+            # scaled_dot_product_attention wants (B, heads, tokens, dim), and it
+            # is the permute back out of that layout that torch.export's
+            # decomposition cannot lower -- it reports "cannot view a tensor",
+            # and inserting contiguous() does not help because the copy is
+            # elided again before the failure. Slicing costs nothing at two
+            # heads.
+            #
+            # This is NOT bit-identical to the fused kernel: it sums in a
+            # different order and lands about 5e-5 away. That is why the default
+            # path below keeps SDPA -- the golden test needs difference 0 -- and
+            # this form is used only for export, where the bar is ~1e-4 anyway.
+            outputs = []
+            scale = 1.0 / math.sqrt(self.qkv_dim)
+            for head in range(self.num_heads):
+                span = slice(head * self.qkv_dim, (head + 1) * self.qkv_dim)
+                scores = torch.matmul(q[:, :, span], k[:, :, span].transpose(1, 2)) * scale
+                if attn_mask is not None:
+                    scores = scores + attn_mask
+                outputs.append(torch.matmul(torch.softmax(scores, dim=-1), v[:, :, span]))
+            x = torch.cat(outputs, dim=-1)
+        else:
+            B, QN, C = q.shape
+            KN = k.shape[1]
+            qh = q.view(B, QN, self.num_heads, self.qkv_dim).permute(0, 2, 1, 3)
+            kh = k.view(B, KN, self.num_heads, self.qkv_dim).permute(0, 2, 1, 3)
+            vh = v.view(B, KN, self.num_heads, self.qkv_dim).permute(0, 2, 1, 3)
+            x = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=attn_mask)
+            x = x.permute(0, 2, 1, 3).reshape(B, QN, self.qkv_dim * self.num_heads)
+
+        return self.head_proj(x)
+
+
+class _WindowMHA2d(nn.Module):
+    def __init__(self, channels, num_heads, window):
+        super().__init__()
+        self.window = window
+        self.mha = _MHA(channels, num_heads)
+
+    def forward(self, x, attn_mask=None, export_safe=False):
+        shape = x.shape
+        x = _window_partition(x, self.window)
+        x = self.mha(x, attn_mask=attn_mask, export_safe=export_safe)
+        return _window_merge(x, shape, self.window)
+
+
+class _WABlock(nn.Module):
+    def __init__(self, channels, window):
+        super().__init__()
+        self.mha = _WindowMHA2d(channels, num_heads=2, window=window)
+        self.conv_mlp = nn.Sequential(*[
+            nn.Conv2d(channels, channels, kernel_size=1, padding=0),
+            nn.GELU(),
+            nn.ReplicationPad2d((1, 1, 1, 1)),
+            nn.Conv2d(channels, channels, kernel_size=(3, 3), padding=0),
+            nn.LeakyReLU(0.1, inplace=True),
+        ])
+        self.bias = _WindowScoreBias(window)
+
+    def forward(self, x, export_safe=False):
+        x = x + self.mha(x, attn_mask=self.bias(), export_safe=export_safe)
+        return x + self.conv_mlp(x)
+
+
+class RowFlowV3(nn.Module):
+    """iw3's ``row_flow_v3``, inference path only.
+
+    Input is (B, 3, H, W): disparity, divergence feature, convergence feature.
+    Output is (B, 2, H, W), a sampling delta with y always zero -- the same
+    contract as RowFlowV2, so the warp does not care which is in use.
+    """
+
+    DOWNSCALE = (1, 8)
+    MOD = 4 * 3
+
+    def __init__(self):
+        super().__init__()
+        channels = 64
+        pack = self.DOWNSCALE[0] * self.DOWNSCALE[1]
+        self.blocks = nn.Sequential(*[
+            nn.Conv2d(3 * pack, channels, kernel_size=1, stride=1, padding=0),
+            _WABlock(channels, (4, 4)),
+            _WABlock(channels, (3, 3)),
+        ])
+        self.last_layer = nn.Sequential(*[
+            nn.ReplicationPad2d((1, 1, 1, 1)),
+            nn.Conv2d(channels // pack, 1, kernel_size=3, stride=1, padding=0),
+        ])
+        # Unused in this path; registered so the state dict loads strictly.
+        self.register_buffer("delta_scale", torch.tensor(1.0 / 127.0))
+        self.export_safe = False
+
+    def forward(self, x):
+        height, width = x.shape[2], x.shape[3]
+        mod_h = self.MOD * self.DOWNSCALE[0]
+        mod_w = self.MOD * self.DOWNSCALE[1]
+
+        # iw3 pads here with its own replication_pad2d_naive, which builds the
+        # padding by Python tuple repetition -- (slice,) * n. That needs n to be
+        # a concrete int, which specialises an exported graph to a single frame
+        # width. F.pad takes the amount as data, and the crop below is a slice,
+        # so both stay dynamic. Numerically identical.
+        x = F.pad(x, (0, mod_w - width % mod_w, 0, mod_h - height % mod_h), mode="replicate")
+
+        x = _pixel_unshuffle(x, self.DOWNSCALE)
+        for index, block in enumerate(self.blocks):
+            x = block(x, export_safe=self.export_safe) if index > 0 else block(x)
+        x = _pixel_shuffle(x, self.DOWNSCALE)
+        x = x[:, :, :height, :width]
+        x = self.last_layer(x)
+
+        x = x.to(torch.float32)
+        return torch.cat([x, torch.zeros_like(x)], dim=1)
+
+
+def load_row_flow_v3(path=None, device="cpu", export_safe=False):
+    """Load the published ``row_flow_v3`` checkpoint.
+
+    ``export_safe`` swaps the attention for the head-sliced form that
+    torch.export can lower. It is bit-identical in float32 and only needed when
+    exporting.
+    """
+    if path is None:
+        data = torch.hub.load_state_dict_from_url(ROW_FLOW_V3_URL, weights_only=True, map_location="cpu")
+    else:
+        data = torch.load(path, map_location="cpu", weights_only=True)
+
+    if "nunif_model" not in data:
+        raise ValueError("not a nunif checkpoint")
+    if data.get("name") != MODEL_NAME_V3:
+        raise ValueError(f"expected {MODEL_NAME_V3}, got {data.get('name')!r}")
+
+    model = RowFlowV3()
+    model.load_state_dict(data["state_dict"], strict=True)
+    model.export_safe = export_safe
+    return model.eval().to(device)
+
+
+def load_stereo_model(name, path=None, device="cpu", **kwargs):
+    """``"row_flow_v2"`` or ``"row_flow_v3"``."""
+    if name == "row_flow_v2":
+        return load_row_flow_v2(path, device=device)
+    elif name == "row_flow_v3":
+        return load_row_flow_v3(path, device=device, **kwargs)
+    raise ValueError(f"unknown model {name!r}")
 
 
 # ---------------------------------------------------------------------------

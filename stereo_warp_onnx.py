@@ -143,8 +143,17 @@ class StereoWarpSession:
     which re-reads its checkpoint on every call.
     """
 
-    def __init__(self, models_dir="models", provider=None, use_tf32=False, allow_broken=False):
+    GRAPHS = {
+        "row_flow_v2": "stereo_warp.onnx",
+        "row_flow_v3": "stereo_warp_v3.onnx",
+    }
+
+    def __init__(self, models_dir="models", model="row_flow_v2",
+                 provider=None, use_tf32=False, allow_broken=False):
+        if model not in self.GRAPHS:
+            raise ValueError(f"unknown model {model!r}; have {sorted(self.GRAPHS)}")
         self.models_dir = models_dir
+        self.model = model
         available = ort.get_available_providers()
 
         if provider is None:
@@ -173,7 +182,7 @@ class StereoWarpSession:
             entry = provider
 
         self._warp = ort.InferenceSession(
-            os.path.join(models_dir, "stereo_warp.onnx"), options, providers=[entry])
+            os.path.join(models_dir, self.GRAPHS[model]), options, providers=[entry])
         # Resampling weights only change when a size changes, which is once per
         # timeline in practice, so they are worth keeping.
         self._weight_cache = {}

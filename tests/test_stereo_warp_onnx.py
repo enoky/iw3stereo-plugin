@@ -21,9 +21,11 @@ import stereo_warp  # noqa: E402
 import stereo_warp_onnx  # noqa: E402
 
 MODELS_DIR = os.path.join(REPO_ROOT, "models")
-CHECKPOINT = os.path.join(
+_CHECKPOINT_DIR = os.path.join(
     os.environ.get("NUNIF_ROOT", r"F:\_AI_PROJECTS_\nunif"),
-    "iw3", "pretrained_models", "hub", "checkpoints", "iw3_row_flow_v2_20240130.pth")
+    "iw3", "pretrained_models", "hub", "checkpoints")
+CHECKPOINT = os.path.join(_CHECKPOINT_DIR, "iw3_row_flow_v2_20240130.pth")
+CHECKPOINT_V3 = os.path.join(_CHECKPOINT_DIR, "iw3_row_flow_v3_20250627.pth")
 
 # Real content, not noise. Noise maximises every interpolation difference and
 # would report a tolerance the plugin will never actually see.
@@ -146,6 +148,47 @@ class OnnxTest(unittest.TestCase):
         for case in cases:
             with self.subTest(**case):
                 self.assert_close(image, depth, **case)
+
+
+class OnnxV3Test(OnnxTest):
+    """The same comparisons against row_flow_v3.
+
+    The tolerance is looser than v2's for a known reason rather than a vague
+    one: the exported graph uses the head-sliced attention, which sums in a
+    different order from the fused kernel and sits about 5e-5 away before the
+    warp amplifies it.
+    """
+
+    TOLERANCE = 6e-4
+
+    @classmethod
+    def setUpClass(cls):
+        if not os.path.exists(os.path.join(MODELS_DIR, "stereo_warp_v3.onnx")):
+            raise unittest.SkipTest("row_flow_v3 graph not exported")
+        if not os.path.exists(CHECKPOINT_V3):
+            raise unittest.SkipTest("row_flow_v3 checkpoint not downloaded")
+        cls.session = stereo_warp_onnx.StereoWarpSession(MODELS_DIR, model="row_flow_v3")
+        cls.model = stereo_warp.load_row_flow_v3(CHECKPOINT_V3, device="cpu")
+
+    def assert_close(self, image, depth, **settings):
+        with torch.inference_mode():
+            expected = stereo_warp.synthesize_stereo(
+                image, depth, self.model, enable_amp=False, **settings)
+        actual = self.session.synthesize_stereo(image.numpy(), depth.numpy(), **settings)
+        for eye, want, got in zip(("left", "right"), expected, actual):
+            want = want.numpy()
+            self.assertEqual(want.shape, got.shape, f"{eye} shape, {settings}")
+            diff = np.abs(want - got).max()
+            self.assertLess(diff, self.TOLERANCE, f"{eye} max abs diff {diff:.3e}, {settings}")
+
+    def test_graph_is_really_v3(self):
+        """Guard: the v2 and v3 graphs must not agree."""
+        image, depth = make_pair(216, 384)
+        v2 = stereo_warp_onnx.StereoWarpSession(MODELS_DIR, model="row_flow_v2")
+        left_v3, _ = self.session.synthesize_stereo(image.numpy(), depth.numpy(), divergence=5.0)
+        left_v2, _ = v2.synthesize_stereo(image.numpy(), depth.numpy(), divergence=5.0)
+        self.assertGreater(np.abs(left_v3 - left_v2).max(), 1e-3,
+                           "the v3 graph agrees with the v2 graph; is it really v3?")
 
 
 if __name__ == "__main__":

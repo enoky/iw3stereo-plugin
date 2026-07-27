@@ -38,15 +38,21 @@ public:
     OrtRuntime(const OrtRuntime&) = delete;
     OrtRuntime& operator=(const OrtRuntime&) = delete;
 
-    // Loads onnxruntime.dll from `directory`, creates an environment, and opens
-    // `modelPath` with the CUDA provider (TF32 off). Falls back to CPU if CUDA
-    // will not come up, and says so in `report`. Returns false only if even
-    // that fails.
-    bool open(const std::wstring& directory, const std::wstring& modelPath, bool preferCuda);
+    // Loads onnxruntime.dll from `directory`, creates one environment, and
+    // opens each of `modelPaths` as its own session with the CUDA provider
+    // (TF32 off). Falls back to CPU if CUDA will not come up, and says so in
+    // `report`. Returns false only if even that fails.
+    //
+    // Several models share one environment and one loaded library on purpose:
+    // ORT expects a single OrtEnv per process, and the sessions are small next
+    // to the provider's own start-up cost.
+    bool open(const std::wstring& directory, const std::vector<std::wstring>& modelPaths,
+              bool preferCuda);
 
-    // Runs the graph. Shapes are NCHW. `left` and `right` must have room for
-    // imageCount floats each.
-    bool run(const float* image, const int64_t* imageShape,
+    // Runs one of the graphs, by index into the modelPaths given to open().
+    // Shapes are NCHW; `left` and `right` need room for imageCount floats each.
+    bool run(size_t model,
+             const float* image, const int64_t* imageShape,
              const float* x, const int64_t* xShape,
              float deltaScale,
              float* left, float* right, size_t imageCount);
@@ -57,38 +63,46 @@ public:
     //
     // This is what keeps a frame off the PCIe bus: through the host run()
     // above, 1080p costs 25 MB up and 50 MB back, every frame.
-    bool runDevice(const float* image, const int64_t* imageShape,
+    bool runDevice(size_t model,
+                   const float* image, const int64_t* imageShape,
                    const float* x, const int64_t* xShape,
                    float deltaScale,
                    const float** left, const float** right);
 
-    bool deviceCapable() const { return _session && _provider == "CUDA" && _cudaMemoryInfo; }
+    bool deviceCapable() const { return ready() && _provider == "CUDA" && _cudaMemoryInfo; }
 
-    bool ready() const { return _session != nullptr; }
+    bool ready() const { return !_models.empty() && _models[0].session != nullptr; }
+    size_t modelCount() const { return _models.size(); }
     const std::string& provider() const { return _provider; }
     const std::string& version() const { return _version; }
     const std::vector<std::string>& report() const { return _report; }
     double lastRunMilliseconds() const { return _lastRunMs; }
 
 private:
+    struct Model
+    {
+        OrtSession* session = nullptr;
+        OrtIoBinding* binding = nullptr;
+        OrtValue** boundOutputs = nullptr;
+        size_t boundOutputCount = 0;
+    };
+
     void note(const std::string& line) { _report.push_back(line); }
     bool failed(OrtStatus* status, const char* what);
-    void releaseBoundOutputs();
+    void releaseBoundOutputs(Model& model);
+    bool bindOutputs(Model& model);
 
-    // One throwaway inference, so the first real frame does not pay for
-    // loading cuDNN's kernels and choosing algorithms.
-    void warmUp();
+    // One throwaway inference per model, so the first real frame does not pay
+    // for loading cuDNN's kernels and choosing algorithms.
+    void warmUp(size_t model);
 
     HMODULE _library = nullptr;
     const OrtApi* _api = nullptr;
     OrtEnv* _env = nullptr;
-    OrtSession* _session = nullptr;
+    std::vector<Model> _models;
     OrtMemoryInfo* _memoryInfo = nullptr;
     OrtMemoryInfo* _cudaMemoryInfo = nullptr;
-    OrtIoBinding* _binding = nullptr;
     OrtAllocator* _allocator = nullptr;
-    OrtValue** _boundOutputs = nullptr;
-    size_t _boundOutputCount = 0;
     std::string _provider = "none";
     std::string _version;
     std::vector<std::string> _report;

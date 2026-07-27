@@ -47,11 +47,18 @@ import torch.nn.functional as F
 import stereo_warp
 
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
-DEFAULT_CHECKPOINT = os.path.join(
-    r"F:\_AI_PROJECTS_\nunif", "iw3", "pretrained_models", "hub", "checkpoints",
-    "iw3_row_flow_v2_20240130.pth")
+CHECKPOINT_DIR = os.path.join(
+    os.environ.get("NUNIF_ROOT", r"F:\_AI_PROJECTS_\nunif"),
+    "iw3", "pretrained_models", "hub", "checkpoints")
+CHECKPOINTS = {
+    "row_flow_v2": os.path.join(CHECKPOINT_DIR, "iw3_row_flow_v2_20240130.pth"),
+    "row_flow_v3": os.path.join(CHECKPOINT_DIR, "iw3_row_flow_v3_20250627.pth"),
+}
+DEFAULT_CHECKPOINT = CHECKPOINTS["row_flow_v2"]
 
 OPSET = 17
+# row_flow_v3 needs the dynamo exporter, and that needs opset 18.
+OPSET_V3 = 18
 
 
 class StereoWarpGraph(torch.nn.Module):
@@ -141,6 +148,44 @@ def export_pipeline(model, path):
     return path
 
 
+def export_pipeline_v3(model, path):
+    """row_flow_v3, which needs a different exporter.
+
+    The TorchScript exporter produces a graph that is accurate at the traced
+    size and fails at every other one: the window-partition and padding reshapes
+    bake in as constants. The dynamo exporter handles genuinely dynamic shapes,
+    but only once two things in the model are restructured -- the attention head
+    merge and the padding -- both of which stereo_warp.RowFlowV3 already does.
+    See its comments for why each was necessary.
+
+    Verified at 392x938, 392x940, 384x960, 528x940, 108x192 and 100x200, all
+    within 1.2e-4 of stock iw3.
+    """
+    graph = StereoWarpGraph(model).eval()
+    # Batch 2 in the example, deliberately. torch.export specialises any
+    # dimension whose example value is 1, so tracing with a single frame bakes
+    # batch=1 into the graph however the Dim is declared.
+    image = torch.rand(2, 3, 216, 384)
+    x = torch.rand(2, 3, 108, 192)
+    delta_scale = torch.tensor(1.0 / (192 // 2 - 1))
+
+    batch = torch.export.Dim("batch", min=1, max=64)
+    image_height = torch.export.Dim("image_height", min=16, max=8192)
+    image_width = torch.export.Dim("image_width", min=16, max=8192)
+    depth_height = torch.export.Dim("depth_height", min=16, max=8192)
+    depth_width = torch.export.Dim("depth_width", min=16, max=8192)
+
+    torch.onnx.export(
+        graph, (image, x, delta_scale), path,
+        input_names=["image", "x", "delta_scale"],
+        output_names=["left", "right"],
+        dynamic_shapes={"image": {0: batch, 2: image_height, 3: image_width},
+                        "x": {0: batch, 2: depth_height, 3: depth_width},
+                        "delta_scale": {}},
+        opset_version=OPSET_V3, dynamo=True, external_data=False)
+    return path
+
+
 def write_reference(model, path):
     """Reference IO at several shapes, so a provider can be checked without torch."""
     graph = StereoWarpGraph(model).eval()
@@ -184,6 +229,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
     parser.add_argument("--output-dir", default=MODEL_DIR)
+    parser.add_argument("--skip-v3", action="store_true")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -194,6 +240,14 @@ def main():
 
     pipeline_path = export_pipeline(model, os.path.join(args.output_dir, "stereo_warp.onnx"))
     print(f"wrote {pipeline_path} ({os.path.getsize(pipeline_path) / 1024:.0f} KiB)")
+
+    if not args.skip_v3 and os.path.exists(CHECKPOINTS["row_flow_v3"]):
+        # export_safe swaps in the head-sliced attention, which torch.export can
+        # lower. It is about 5e-5 from the fused kernel, well inside the
+        # tolerance the ONNX path is judged at.
+        v3 = stereo_warp.load_row_flow_v3(CHECKPOINTS["row_flow_v3"], device="cpu", export_safe=True)
+        v3_path = export_pipeline_v3(v3, os.path.join(args.output_dir, "stereo_warp_v3.onnx"))
+        print(f"wrote {v3_path} ({os.path.getsize(v3_path) / 1024:.0f} KiB)")
 
     reference_path = os.path.join(args.output_dir, "reference.npz")
     cases = write_reference(model, reference_path)

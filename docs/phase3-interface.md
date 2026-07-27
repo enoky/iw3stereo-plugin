@@ -39,6 +39,17 @@ the plugin — a 960x384 file arrives as 1920x800.
 
 ## Parameters
 
+### Model
+
+| Parameter | Type | Range | Default | Meaning |
+| --- | --- | --- | --- | --- |
+| **Model** | choice | row_flow_v2 / row_flow_v3 | **row_flow_v2** | Which warp network runs. Both graphs ship in the bundle and each gets its own ONNX Runtime session, built once at start-up. |
+
+Added after the first release; the spec below was written when only
+`row_flow_v2` existed. `row_flow_v3` needed no pipeline change at all -- same
+three input channels, same delta contract, same non-symmetric path -- but it did
+need a different ONNX exporter. See `docs/row-flow-v3.md`.
+
 ### Stereo
 
 | Parameter | Type | Range | Default | Meaning |
@@ -143,9 +154,9 @@ Never a black frame, never a silent wrong result.
   (it needs the warp fed back into itself). `stereo_warp.py` supports it and is
   tested at 1–3, so it can be added if a reason appears.
 - **The mapper by name** — twenty variants, and iw3 recommends Foreground Scale.
-- **Method selection** — `row_flow_v2` only, per the plan. `row_flow_v3` and the
-  `mlbw` family are candidates for later; the inpaint methods are a different
-  shape of problem.
+- **The `mlbw` family and the inpaint methods.** `row_flow_v2` and
+  `row_flow_v3` are both supported; `mlbw` is a candidate for later, and the
+  inpaint methods are a different shape of problem.
 - **DirectML / provider choice** — DirectML miscomputes the model, so there is
   nothing to choose between.
 

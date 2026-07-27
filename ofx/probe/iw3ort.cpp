@@ -162,7 +162,7 @@ iw3::OrtRuntime& OrtStereoEffect::runtime()
     {
         auto* runtime = new iw3::OrtRuntime();
         const std::wstring directory = bundleDirectory();
-        const bool ok = runtime->open(directory + L"\\ort", directory + L"\\stereo_warp.onnx", true);
+        const bool ok = runtime->open(directory + L"\\ort", {directory + L"\\stereo_warp.onnx"}, true);
         probe::logf("---- ONNX Runtime bring-up (%s) ----", ok ? "OK" : "FAILED");
         for (const std::string& line : runtime->report())
         {
@@ -286,7 +286,7 @@ void OrtStereoEffect::render(const OFX::RenderArguments& args)
     // stereo_width resize is not implemented in this probe.
     const float deltaScale = float(1.0 / double(width / 2 - 1));
 
-    if (!ort.run(_image.data(), imageShape, _x.data(), xShape, deltaScale,
+    if (!ort.run(0, _image.data(), imageShape, _x.data(), xShape, deltaScale,
                  _left.data(), _right.data(), pixels * 3))
     {
         probe::logf("    Run FAILED");

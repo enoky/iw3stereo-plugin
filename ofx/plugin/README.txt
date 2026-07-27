@@ -61,6 +61,15 @@ exists for the rarer case of a file whose range tag is simply wrong.
 PARAMETERS
 ----------
 
+  Model               Which warp network to use.
+
+                      row_flow_v2 is a small convolution stack and the default.
+                      row_flow_v3 is a windowed-attention model with about four
+                      times the parameters; slower, and generally cleaner around
+                      edges. Try both on a shot and keep whichever you prefer --
+                      the difference is a matter of taste more than of one being
+                      correct.
+
 Stereo
 
   Divergence          Strength of the 3D effect, as a percentage of image

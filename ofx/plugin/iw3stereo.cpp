@@ -108,6 +108,7 @@ public:
         _stereoWidth = fetchIntParam("stereoWidth");
         _depthRange = fetchChoiceParam("depthRange");
         _output = fetchChoiceParam("output");
+        _modelChoice = fetchChoiceParam("model");
 
         startRuntimeBringUp();
     }
@@ -133,6 +134,7 @@ private:
     OFX::IntParam* _stereoWidth = nullptr;
     OFX::ChoiceParam* _depthRange = nullptr;
     OFX::ChoiceParam* _output = nullptr;
+    OFX::ChoiceParam* _modelChoice = nullptr;
 
     // Reused across frames; resized only when the frame size changes.
     std::vector<float> _image, _depthFull, _depthSmall, _x, _left, _right, _composed;
@@ -163,7 +165,12 @@ static iw3::OrtRuntime& sharedRuntime()
     {
         auto* runtime = new iw3::OrtRuntime();
         const std::wstring directory = bundleDirectory();
-        const bool ok = runtime->open(directory + L"\\ort", directory + L"\\stereo_warp.onnx", true);
+        // Index order matters: it is what the Model parameter selects.
+        const std::vector<std::wstring> graphs = {
+            directory + L"\\stereo_warp.onnx",     // 0: row_flow_v2
+            directory + L"\\stereo_warp_v3.onnx",  // 1: row_flow_v3
+        };
+        const bool ok = runtime->open(directory + L"\\ort", graphs, true);
         probe::logf("---- iw3 Stereo: ONNX Runtime bring-up (%s) ----", ok ? "OK" : "FAILED");
         for (const std::string& line : runtime->report())
         {
@@ -207,6 +214,8 @@ iw3::Settings Iw3StereoEffect::readSettings(double time) const
     settings.mapperType = choice == 1 ? iw3::MapperType::Shift : iw3::MapperType::Multiply;
     _depthRange->getValueAtTime(time, choice);
     settings.undoVideoRange = (choice == 1);
+    _modelChoice->getValueAtTime(time, choice);
+    settings.model = size_t(choice == 1 ? 1 : 0);
     _output->getValueAtTime(time, choice);
     settings.output = choice == 1 ? iw3::OutputMode::LeftEye
                     : choice == 2 ? iw3::OutputMode::RightEye
@@ -334,7 +343,8 @@ bool Iw3StereoEffect::renderCuda(const OFX::RenderArguments& args, const iw3::Se
     const int64_t xShape[4] = {1, 3, depthHeight, depthWidth};
     const float* left = nullptr;
     const float* right = nullptr;
-    if (!ort.runDevice(_gpu.imageDevice(), imageShape, _gpu.inputTensorDevice(), xShape,
+    const size_t model = std::min(settings.model, ort.modelCount() - 1);
+    if (!ort.runDevice(model, _gpu.imageDevice(), imageShape, _gpu.inputTensorDevice(), xShape,
                        iw3::deltaScale(depthWidth), &left, &right))
     {
         report("GPU inference failed; see the log. Falling back to the CPU.", true);
@@ -362,8 +372,8 @@ bool Iw3StereoEffect::renderCuda(const OFX::RenderArguments& args, const iw3::Se
         const double total = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - started).count();
         probe::logf("iw3 Stereo: CUDA path %dx%d, depth %dx%d, inference %.2f ms, "
-                    "total %.2f ms (compose+unpack still queued)",
-                    width, height, depthWidth, depthHeight, ort.lastRunMilliseconds(), total);
+                    "total %.2f ms (compose+unpack still queued), model=%zu",
+                    width, height, depthWidth, depthHeight, ort.lastRunMilliseconds(), total, model);
     }
     report(std::string(), false);
     return true;
@@ -499,7 +509,8 @@ void Iw3StereoEffect::render(const OFX::RenderArguments& args)
     const int64_t imageShape[4] = {1, 3, height, width};
     const int64_t xShape[4] = {1, 3, depthHeight, depthWidth};
 
-    if (!ort.run(_image.data(), imageShape, _x.data(), xShape, iw3::deltaScale(depthWidth),
+    const size_t model = std::min(settings.model, ort.modelCount() - 1);
+    if (!ort.run(model, _image.data(), imageShape, _x.data(), xShape, iw3::deltaScale(depthWidth),
                  _left.data(), _right.data(), pixels * 3))
     {
         report("Inference failed; see the log.", true);
@@ -662,6 +673,15 @@ void Iw3StereoFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OFX::
     dst->setSupportsTiles(false);
 
     OFX::PageParamDescriptor* page = desc.definePageParam("Controls");
+
+    OFX::ChoiceParamDescriptor* model = desc.defineChoiceParam("model");
+    model->setLabels("Model", "Model", "Model");
+    model->setHint("row_flow_v2 is a small convolution stack and the faster of the two. "
+                   "row_flow_v3 is a windowed-attention model, roughly four times the parameters.");
+    model->appendOption("row_flow_v2");
+    model->appendOption("row_flow_v3");
+    model->setDefault(0);
+    page->addChild(*model);
 
     // -- Stereo ------------------------------------------------------------
     OFX::GroupParamDescriptor* stereo = desc.defineGroupParam("stereoGroup");

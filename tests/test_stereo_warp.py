@@ -29,8 +29,13 @@ from iw3 import models as _iw3_models  # noqa: E402,F401  (registers sbs.row_flo
 from iw3.stereo_model_factory import create_stereo_model  # noqa: E402
 from iw3.utils import apply_divergence  # noqa: E402
 
-CHECKPOINT = os.path.join(
-    NUNIF_ROOT, "iw3", "pretrained_models", "hub", "checkpoints", "iw3_row_flow_v2_20240130.pth")
+CHECKPOINTS = {
+    "row_flow_v2": os.path.join(NUNIF_ROOT, "iw3", "pretrained_models", "hub", "checkpoints",
+                                "iw3_row_flow_v2_20240130.pth"),
+    "row_flow_v3": os.path.join(NUNIF_ROOT, "iw3", "pretrained_models", "hub", "checkpoints",
+                                "iw3_row_flow_v3_20250627.pth"),
+}
+CHECKPOINT = CHECKPOINTS["row_flow_v2"]
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DEVICE_ID = 0 if DEVICE == "cuda" else -1
@@ -41,6 +46,7 @@ class Args:
 
     def __init__(self, **overrides):
         self.method = "row_flow_v2"
+        self.model_name = "row_flow_v2"
         self.divergence = 2.0
         self.convergence = 0.5
         self.synthetic_view = "both"
@@ -271,6 +277,82 @@ class GoldenTest(unittest.TestCase):
         for case in cases:
             with self.subTest(**case):
                 self.assert_identical(image, depth, **case)
+
+
+class GoldenV3Test(GoldenTest):
+    """The same matrix again against row_flow_v3.
+
+    It is a windowed-attention transformer rather than a convolution stack, but
+    the warp around it is unchanged -- same three input channels, same delta
+    contract, same non-symmetric path -- so every case above should hold at
+    difference 0 for it too.
+    """
+
+    MODEL = "row_flow_v3"
+
+    @classmethod
+    def setUpClass(cls):
+        if not os.path.exists(CHECKPOINTS["row_flow_v3"]):
+            raise unittest.SkipTest("row_flow_v3 checkpoint not downloaded")
+        cls.reference_model = create_stereo_model("row_flow_v3", divergence=2.0, device_id=DEVICE_ID)
+        cls.model = stereo_warp.load_row_flow_v3(CHECKPOINTS["row_flow_v3"], device=DEVICE)
+
+    def assert_identical(self, image, depth, **settings):
+        settings.setdefault("method", "row_flow_v3")
+        super().assert_identical(image, depth, **settings)
+
+    def test_cpu(self):
+        image, depth = make_pair(96, 160, device="cpu")
+        model = stereo_warp.load_row_flow_v3(CHECKPOINTS["row_flow_v3"], device="cpu")
+        reference_model = create_stereo_model("row_flow_v3", divergence=2.0, device_id=-1)
+        args = Args(method="row_flow_v3")
+        with torch.inference_mode():
+            reference = apply_divergence(depth.clone(), image.clone(), args, reference_model)
+            actual = stereo_warp.synthesize_stereo(image.clone(), depth.clone(), model)
+        for eye, expected, got in zip(("left", "right"), reference, actual):
+            diff = (expected.float() - got.float()).abs().max().item()
+            self.assertEqual(diff, 0.0, f"cpu {eye} diff {diff} != 0")
+
+    def test_mapper(self):
+        image, depth = make_pair(96, 160, device=DEVICE)
+        for mapper in ("none", "pow2", "mul_2", "div_6"):
+            with self.subTest(mapper=mapper):
+                args = Args(mapper=mapper, method="row_flow_v3")
+                with torch.inference_mode():
+                    reference = apply_divergence(depth.clone(), image.clone(), args, self.reference_model)
+                    actual = stereo_warp.synthesize_stereo(
+                        image.clone(), depth.clone(), self.model, mapper=mapper,
+                        divergence=args.divergence, convergence=args.convergence)
+                for eye, expected, got in zip(("left", "right"), reference, actual):
+                    diff = (expected.float() - got.float()).abs().max().item()
+                    self.assertEqual(diff, 0.0, f"{eye} diff {diff} != 0, mapper={mapper}")
+
+    def test_is_really_v3(self):
+        """Guard against the suite silently running v2 on both sides.
+
+        setUpClass loads v3 for the reference and the standalone alike, so a
+        wiring mistake that used v2 for both would still pass every case above.
+        The two models must disagree.
+        """
+        image, depth = make_pair(96, 160, device=DEVICE)
+        v2 = stereo_warp.load_row_flow_v2(CHECKPOINTS["row_flow_v2"], device=DEVICE)
+        with torch.inference_mode():
+            from_v3 = stereo_warp.synthesize_stereo(image, depth, self.model, divergence=5.0)
+            from_v2 = stereo_warp.synthesize_stereo(image, depth, v2, divergence=5.0)
+        difference = (from_v3[0] - from_v2[0]).abs().max().item()
+        self.assertGreater(difference, 1e-3,
+                           f"row_flow_v3 and row_flow_v2 agree to {difference}; is this really v3?")
+
+    def test_export_safe_attention_is_close(self):
+        """The export-only attention is a different reduction order, not identical."""
+        image, depth = make_pair(96, 160, device=DEVICE)
+        safe = stereo_warp.load_row_flow_v3(CHECKPOINTS["row_flow_v3"], device=DEVICE, export_safe=True)
+        with torch.inference_mode():
+            expected = stereo_warp.synthesize_stereo(image, depth, self.model)
+            actual = stereo_warp.synthesize_stereo(image, depth, safe)
+        for eye, want, got in zip(("left", "right"), expected, actual):
+            diff = (want - got).abs().max().item()
+            self.assertLess(diff, 1e-3, f"{eye} export-safe diff {diff}")
 
 
 if __name__ == "__main__":
