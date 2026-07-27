@@ -152,13 +152,17 @@ when your delivery expects that.
 
 Every setting on the two iw3 Stereo nodes must match except Output, or the eyes
 will not correspond. Rather than change both by hand each time, it is worth
-adding a controller: a Background node parked off to the side with user controls
-for divergence, convergence and the rest, and both iw3 nodes linked to it by
-simple expressions such as
+adding a controller node: one parked off to the side, connected to nothing, with
+user controls for divergence, convergence and the rest, and both iw3 nodes
+linked to it by simple expressions such as
 
     iw3Control.Divergence
 
 Then one panel drives both, and the two cannot drift apart.
+
+An sMerge (Shape category) is a good host for it. It works on vector shapes
+rather than images, so unconnected it allocates nothing and brings almost no
+controls of its own to crowd out yours.
 
 
 ABOUT STEREO WIDTH
