@@ -125,13 +125,13 @@ one to Right eye -- and combine them however your delivery needs.
 FULL SIDE BY SIDE
 -----------------
 
-The Full SBS option cannot work, and the plugin will tell you so and render
-Half SBS instead. This is not a bug that can be fixed here.
+There is no Full SBS option, and there cannot be one.
 
 An OFX effect cannot output an image larger than its input unless the host
 supports multiple resolutions, and Resolve's OFX host reports that it does not
-(kOfxImageEffectPropSupportsMultiResolution = 0). The plugin does ask for a
-double-width output; Resolve declines.
+(kOfxImageEffectPropSupportsMultiResolution = 0). It was implemented and tried:
+the plugin asked for a double-width output and Resolve declined, which the
+specification entitles it to do.
 
 Fusion's own nodes have no such limit, so build it there instead:
 

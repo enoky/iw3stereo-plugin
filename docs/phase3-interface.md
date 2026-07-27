@@ -76,7 +76,7 @@ on the other; that is **not exposed** — see the decisions below.
 
 | Parameter | Type | Range | Default | Meaning |
 | --- | --- | --- | --- | --- |
-| **Output** | choice | Anaglyph / Left eye / Right eye / Half SBS / Depth (debug) | **Anaglyph** | What the single output image contains. |
+| **Output** | choice | Anaglyph / Left eye / Right eye / Half SBS / Depth (debug) | **Anaglyph** | What the single output image contains. No Full SBS — see the decisions below. |
 
 ## Behaviour that is not a parameter
 
@@ -170,6 +170,11 @@ Settled 2026-07-27.
    and output images can be of any size" is *not* available, and Resolve's host
    descriptor reports 0. The plugin does implement `getRegionOfDefinition()` and
    ask; Resolve declines, and the option reports why and renders Half SBS.
+
+   The option was then **removed from the menu**: an entry that can never do
+   what it says is worse than no entry, and the code behind it was unreachable.
+   The attempt is in the history and the reason is in the README, which is where
+   both belong.
 
    Full side by side is still reachable, just not from one node: two iw3 Stereo
    nodes set to Left eye and Right eye, merged over a double-width Background.

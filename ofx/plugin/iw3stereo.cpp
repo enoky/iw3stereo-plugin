@@ -116,25 +116,8 @@ public:
     virtual void render(const OFX::RenderArguments& args) override;
     virtual bool isIdentity(const OFX::IsIdentityArguments&, OFX::Clip*&, double&) override { return false; }
 
-    // Full SBS is twice as wide as its source, so the effect has to ask for a
-    // bigger output than it was given. Resolve reports supportsMultiResolution
-    // = 0, which in OFX terms means it need not honour this at all; whether it
-    // does is measured rather than assumed, and render() copes either way.
-    virtual bool getRegionOfDefinition(const OFX::RegionOfDefinitionArguments& args,
-                                       OfxRectD& rod) override;
-
 private:
     iw3::Settings readSettings(double time) const;
-
-    // What to render and at what size. These differ only for Full SBS, where
-    // the warp runs at the source's resolution and the output is twice as wide.
-    struct Layout
-    {
-        iw3::OutputMode output = iw3::OutputMode::Anaglyph;
-        int width = 0;   // the size the warp runs at
-        int height = 0;
-    };
-    Layout resolveLayout(const iw3::Settings& settings, const OfxRectI& window, OFX::Image* src);
     // Passes the source through, on whichever side of the PCIe bus the buffers
     // actually live. Every giving-up path must go through this: with CUDA
     // render enabled getPixelData() is device memory, and reading it on the CPU
@@ -240,61 +223,12 @@ iw3::Settings Iw3StereoEffect::readSettings(double time) const
     _modelChoice->getValueAtTime(time, choice);
     settings.model = size_t(choice == 1 ? 1 : 0);
     _output->getValueAtTime(time, choice);
-    // The option indices and the enum are kept in the same order deliberately:
-    // getRegionOfDefinition() runs before any Settings exist and compares the
-    // raw choice, so it does not have to duplicate this mapping.
     settings.output = choice == 1 ? iw3::OutputMode::LeftEye
                     : choice == 2 ? iw3::OutputMode::RightEye
                     : choice == 3 ? iw3::OutputMode::HalfSbs
                     : choice == 4 ? iw3::OutputMode::DepthDebug
-                    : choice == 5 ? iw3::OutputMode::FullSbs
                                   : iw3::OutputMode::Anaglyph;
     return settings;
-}
-
-Iw3StereoEffect::Layout Iw3StereoEffect::resolveLayout(const iw3::Settings& settings,
-                                                       const OfxRectI& window, OFX::Image* src)
-{
-    Layout layout;
-    layout.output = settings.output;
-    layout.width = window.x2 - window.x1;
-    layout.height = window.y2 - window.y1;
-
-    if (settings.output != iw3::OutputMode::FullSbs)
-    {
-        return layout;
-    }
-
-    // Did the host actually grant the doubled region asked for in
-    // getRegionOfDefinition()? Resolve says supportsMultiResolution = 0, so it
-    // is entitled not to, and the answer decides what can be rendered.
-    const int sourceWidth = src ? (src->getBounds().x2 - src->getBounds().x1) : 0;
-    if (sourceWidth > 0 && layout.width >= sourceWidth * 2 - 2)
-    {
-        layout.width /= 2;
-        return layout;
-    }
-
-    report("Resolve's OFX host does not allow an effect to change its output size "
-           "(supportsMultiResolution = 0), so Full SBS cannot work here. Rendering Half SBS. "
-           "The bundle's README has a Fusion node setup that does give full side by side.", true);
-    layout.output = iw3::OutputMode::HalfSbs;
-    return layout;
-}
-
-bool Iw3StereoEffect::getRegionOfDefinition(const OFX::RegionOfDefinitionArguments& args,
-                                            OfxRectD& rod)
-{
-    int choice = 0;
-    _output->getValueAtTime(args.time, choice);
-    if (choice != int(iw3::OutputMode::FullSbs) || !_srcClip || !_srcClip->isConnected())
-    {
-        return false;  // same size as the source, which is the default anyway
-    }
-
-    rod = _srcClip->getRegionOfDefinition(args.time);
-    rod.x2 = rod.x1 + (rod.x2 - rod.x1) * 2.0;
-    return true;
 }
 
 void Iw3StereoEffect::report(const std::string& message, bool warning)
@@ -408,10 +342,8 @@ bool Iw3StereoEffect::renderCuda(const OFX::RenderArguments& args, const iw3::Se
         return false;
     }
     const auto started = std::chrono::steady_clock::now();
-
-    const Layout layout = resolveLayout(settings, window, src);
-    const int width = layout.width;
-    const int height = layout.height;
+    const int width = window.x2 - window.x1;
+    const int height = window.y2 - window.y1;
 
     const std::pair<int, int> target = iw3::depthTargetSize(width, height, settings.stereoWidth);
     const int depthWidth = target.first;
@@ -480,17 +412,8 @@ bool Iw3StereoEffect::renderCuda(const OFX::RenderArguments& args, const iw3::Se
         size_t(window.y1 - dstBounds.y1) * destinationPitch +
         size_t(window.x1 - dstBounds.x1) * size_t(components);
 
-    if (layout.output == iw3::OutputMode::FullSbs)
-    {
-        // Nothing to compose: the two eyes go straight into their own halves.
-        _gpu.unpackFullSbs(left, right, destination, destinationPitch, components,
-                           window.x2 - window.x1, stream);
-    }
-    else
-    {
-        _gpu.compose(layout.output, left, right, stream);
-        _gpu.unpack(destination, destinationPitch, components, stream);
-    }
+    _gpu.compose(settings.output, left, right, stream);
+    _gpu.unpack(destination, destinationPitch, components, stream);
 
     if (!_gpu.ok())
     {
@@ -590,22 +513,11 @@ void Iw3StereoEffect::render(const OFX::RenderArguments& args)
     // --- unpack the two inputs into planar float ---------------------------
     const auto cpuStarted = std::chrono::steady_clock::now();
 
-    // Full SBS is deliberately not implemented here. This path only runs when
-    // the host renders without CUDA, which at ~250 ms a frame is not a mode
-    // anyone delivers from, and a doubled output would mean a second copy of
-    // all the sizing logic for no practical gain.
-    iw3::Settings effective = settings;
-    if (effective.output == iw3::OutputMode::FullSbs)
-    {
-        report("Full SBS needs the GPU render path; rendering Half SBS on the CPU.", true);
-        effective.output = iw3::OutputMode::HalfSbs;
-    }
-
     _image.resize(pixels * 3);
     _depthFull.resize(pixels);
 
     const int depthComponents = componentCount(depth->getPixelComponents());
-    const iw3::Mapper mapper(effective.foregroundScale, effective.mapperType);
+    const iw3::Mapper mapper(settings.foregroundScale, settings.mapperType);
 
     for (int y = 0; y < height; ++y)
     {
@@ -698,7 +610,7 @@ void Iw3StereoEffect::render(const OFX::RenderArguments& args)
 
     // --- compose -----------------------------------------------------------
     _composed.resize(pixels * 3);
-    switch (effective.output)
+    switch (settings.output)
     {
         case iw3::OutputMode::Anaglyph:
             iw3::duboisAnaglyph(_left.data(), _right.data(), pixels, _composed.data());
@@ -740,7 +652,6 @@ void Iw3StereoEffect::render(const OFX::RenderArguments& args)
             break;
         }
 
-        case iw3::OutputMode::FullSbs:  // downgraded to HalfSbs above
         case iw3::OutputMode::DepthDebug:
         {
             // The depth as the model actually saw it, nearest-upscaled back to
@@ -945,10 +856,9 @@ void Iw3StereoFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OFX::
     output->appendOption("Right eye");
     output->appendOption("Half SBS");
     output->appendOption("Depth (debug)");
-    // Appended rather than placed beside Half SBS: the option index is what a
-    // saved comp stores, so inserting in the middle would change what an
-    // existing project means.
-    output->appendOption("Full SBS (not supported by Resolve - see README)");
+    // No Full SBS: an OFX effect cannot output an image larger than its input
+    // unless the host supports multiple resolutions, and Resolve's reports that
+    // it does not. The bundle README has the Fusion setup that does work.
     output->setDefault(0);
     page->addChild(*output);
 }

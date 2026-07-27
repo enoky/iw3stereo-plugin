@@ -271,37 +271,6 @@ __global__ void passthroughKernel(const float* __restrict__ source, size_t sourc
     }
 }
 
-__global__ void unpackFullSbsKernel(const float* __restrict__ left, const float* __restrict__ right,
-                                    int width, int height,
-                                    float* __restrict__ destination, size_t rowPitch,
-                                    int components, int destinationWidth)
-{
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= width || y >= height) return;
-
-    const size_t pixels = size_t(width) * size_t(height);
-    const size_t index = size_t(y) * size_t(width) + size_t(x);
-
-    for (int side = 0; side < 2; ++side)
-    {
-        const int outX = side == 0 ? x : x + width;
-        if (outX >= destinationWidth)
-        {
-            continue;  // the host did not give us the width we asked for
-        }
-        const float* eye = side == 0 ? left : right;
-        float* out = destination + size_t(y) * rowPitch + size_t(outX) * size_t(components);
-        out[0] = eye[index];
-        out[1] = eye[pixels + index];
-        out[2] = eye[2 * pixels + index];
-        if (components > 3)
-        {
-            out[3] = 1.0f;
-        }
-    }
-}
-
 }  // namespace
 
 bool devicePassthrough(const float* source, size_t sourcePitch,
@@ -550,21 +519,6 @@ void GpuPipeline::compose(OutputMode mode, const float* left, const float* right
     composeKernel<<<grid2d(_width, _height), dim3(kBlock, kBlock), 0,
                     static_cast<cudaStream_t>(stream)>>>(
         modeIndex, left, right, _width, _height, depth, _depthWidth, _depthHeight, _composed);
-}
-
-void GpuPipeline::unpackFullSbs(const float* left, const float* right,
-                                float* destination, size_t rowPitch, int components,
-                                int destinationWidth, void* stream)
-{
-    unpackFullSbsKernel<<<grid2d(_width, _height), dim3(kBlock, kBlock), 0,
-                          static_cast<cudaStream_t>(stream)>>>(
-        left, right, _width, _height, destination, rowPitch, components, destinationWidth);
-
-    const cudaError_t status = cudaGetLastError();
-    if (status != cudaSuccess)
-    {
-        _error = std::string("kernel launch failed: ") + cudaGetErrorString(status);
-    }
 }
 
 void GpuPipeline::unpack(float* destination, size_t rowPitch, int components, void* stream)

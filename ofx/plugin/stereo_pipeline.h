@@ -37,8 +37,7 @@ enum class OutputMode
     LeftEye,
     RightEye,
     HalfSbs,
-    DepthDebug,
-    FullSbs
+    DepthDebug
 };
 
 struct Settings
