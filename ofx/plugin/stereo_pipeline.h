@@ -28,13 +28,17 @@ enum class MapperType
     Shift
 };
 
+// The order is the order of the Output parameter's options, and adding to the
+// middle would silently change what an already-saved comp means. New modes go
+// on the end even when that reads oddly in the menu.
 enum class OutputMode
 {
     Anaglyph,
     LeftEye,
     RightEye,
     HalfSbs,
-    DepthDebug
+    DepthDebug,
+    FullSbs
 };
 
 struct Settings

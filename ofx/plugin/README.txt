@@ -122,6 +122,35 @@ For a proper stereo pair, use two copies of the node -- one set to Left eye,
 one to Right eye -- and combine them however your delivery needs.
 
 
+FULL SIDE BY SIDE
+-----------------
+
+The Full SBS option cannot work, and the plugin will tell you so and render
+Half SBS instead. This is not a bug that can be fixed here.
+
+An OFX effect cannot output an image larger than its input unless the host
+supports multiple resolutions, and Resolve's OFX host reports that it does not
+(kOfxImageEffectPropSupportsMultiResolution = 0). The plugin does ask for a
+double-width output; Resolve declines.
+
+Fusion's own nodes have no such limit, so build it there instead:
+
+  1. Add a Background node, set to your full output size -- 3840 x 1080 for
+     1920 x 1080 source footage.
+
+  2. Add two iw3 Stereo nodes fed from the same source and depth. Set one to
+     Output: Left eye and the other to Output: Right eye.
+
+  3. Merge each over the Background, using the Merge's Center to place them:
+     X = 0.25 for the left eye, X = 0.75 for the right.
+
+  4. Feed the result to MediaOut.
+
+Each eye stays at its native resolution, which is what Full SBS is for. The
+Half SBS option squeezes both into one frame instead, and is the right choice
+when your delivery expects that.
+
+
 ABOUT STEREO WIDTH
 ------------------
 

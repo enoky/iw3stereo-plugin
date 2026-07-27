@@ -59,6 +59,14 @@ public:
     // Planar RGB -> Resolve's destination.
     void unpack(float* destination, size_t rowPitch, int components, void* stream);
 
+    // Full side by side: both eyes at their own resolution, written straight to
+    // the destination, which must be twice as wide as the processed frame.
+    // Skips the composed buffer entirely -- there is nothing to compose, the
+    // two eyes just land in different halves.
+    void unpackFullSbs(const float* left, const float* right,
+                       float* destination, size_t rowPitch, int components,
+                       int destinationWidth, void* stream);
+
     const float* imageDevice() const { return _image; }
     const float* inputTensorDevice() const { return _x; }
 

@@ -164,9 +164,17 @@ Never a black frame, never a silent wrong result.
 
 Settled 2026-07-27.
 
-1. **Half SBS only.** Full SBS would need the plugin to declare an output region
-   twice the input width, which `multiRes=0` suggests Resolve will not honour.
-   Not shipped, not tested further.
+1. **Half SBS only — now tested, and confirmed impossible.** Full SBS needs the
+   plugin to declare an output twice the input width. `ofxImageEffect.h` is
+   explicit that `kOfxImageEffectPropSupportsMultiResolution = 0` means "input
+   and output images can be of any size" is *not* available, and Resolve's host
+   descriptor reports 0. The plugin does implement `getRegionOfDefinition()` and
+   ask; Resolve declines, and the option reports why and renders Half SBS.
+
+   Full side by side is still reachable, just not from one node: two iw3 Stereo
+   nodes set to Left eye and Right eye, merged over a double-width Background.
+   Fusion's own nodes have no such restriction. The recipe is in the bundle's
+   README.
 2. **Output defaults to Anaglyph**, so the node's effect is visible the moment
    it is added.
 3. **Depth Range defaults to As delivered** — since confirmed correct by
