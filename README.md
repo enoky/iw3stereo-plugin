@@ -90,5 +90,10 @@ cd F:/_AI_PROJECTS_/resolve-iw3 && F:/_AI_PROJECTS_/nunif/venv/Scripts/python.ex
 
 ## Licence
 
-nunif is MIT. See `docs/phase0-findings.md` for the position on the model
-weights.
+MIT, see `LICENSE`. The warping code is derived from nagadomi's nunif, which is
+also MIT, and the `row_flow_v2` weights ship with the author's confirmation.
+
+`NOTICE` records the provenance of each part. Worth knowing: the cc-by-nc-4.0
+restrictions described in iw3's README attach to third-party **depth** models,
+none of which this project uses or ships — depth arrives from outside. Dropping
+depth estimation drops every non-commercial encumbrance in the original.
