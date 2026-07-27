@@ -79,6 +79,46 @@ to know the frame size before its first render.
 Warming at a guessed set of common resolutions would trade certain waste for an
 uncertain 18 ms on one frame. Not worth it, and left alone deliberately.
 
+## The trap: device pointers reach every code path, not just the GPU one
+
+Asking for CUDA render changes what `getPixelData()` returns **for the whole
+effect**, not only for the code that means to use the GPU. Any path that
+forgets is an access violation on a device address, and it takes Resolve down
+with it.
+
+It was found the hard way. Inserting the node between MediaIn and MediaOut
+crashed Resolve, but only with MediaOut selected as the viewer output. The
+minidump:
+
+```
+exception code : 0xC0000005 ACCESS_VIOLATION
+                 tried to read 0x0000001325200000
+faulting module: VCRUNTIME140.dll (+0x11516)      <- memcpy
+```
+
+`0x1325200000` is about 82 GB in — not a heap address, a CUDA device pointer.
+
+The cause was `render()` calling a plain CPU copy loop to pass the source
+through when the depth input is not connected, before any CUDA consideration at
+all. That is the state the node is in the moment it is inserted, and selecting
+MediaOut is what makes the host render with CUDA. The conditions in the bug
+report were not incidental; each one was a necessary part of it.
+
+Three rules came out of it, and they are worth applying to any OFX plugin that
+declares GPU render:
+
+1. **Every giving-up path needs a device version.** Passthrough, error paths,
+   unsupported formats — all of them touch pixels, and all of them are reached
+   with device pointers. Here they go through one `passSourceThrough()`.
+2. **A CPU fallback is not a fallback.** If the GPU path declines while CUDA
+   render is enabled, dropping into CPU pixel loops turns a recoverable problem
+   into a crash. The frame is passed through on the device instead.
+3. **Respect each image's bounds.** An OFX image is not guaranteed to start at
+   the render window's origin or to cover it. Indexing from the window origin
+   as though it does is an out-of-bounds *device* read — a GPU fault rather
+   than a tidy exception. The pack kernels take each image's own offset and
+   extent and read black outside them.
+
 ## Why the arithmetic is not written twice
 
 The obvious way to write this is to transcribe the mappers, the Dubois matrix
