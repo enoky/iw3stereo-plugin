@@ -19,7 +19,7 @@ builds it into a tool creators already use.
 | `tools/check_ort.py` | Validates and times any execution provider; needs only ORT and numpy. |
 | `tests/` | Golden test against stock iw3 at diff 0, and ONNX against PyTorch. |
 | `ofx/` | CMake build for OFX plugins, against the OpenFX SDK Resolve ships. |
-| `ofx/plugin/` | **The plugin.** `iw3stereo.cpp` is the OFX glue; `stereo_pipeline.cpp` is the numeric core. |
+| `ofx/plugin/` | **The plugin.** `iw3stereo.cpp` is the OFX glue, `stereo_pipeline.cpp` the CPU core, `stereo_gpu.cu` the kernels, `numeric_math.h` the arithmetic both share. |
 | `ofx/common/` | ONNX Runtime loader (dynamic, never linked) and the log. |
 | `ofx/probe/` | Phase 0 probe plugins — instrumentation, not product. |
 | `tests/cpp/` | Checks the C++ numeric core against the Python implementation. |
@@ -36,10 +36,15 @@ builds it into a tool creators already use.
 | 0 — de-risk Resolve | **done** — the answer is an OFX C++ plugin, as a Fusion node |
 | 1 — standalone PyTorch | **done**, 20/20 at max abs diff 0 vs stock iw3 |
 | 2 — ONNX | **done**, 12/12 vs PyTorch within 2e-4; 1080p in ~13 ms on CUDA |
-| 3 — the plugin | **built**, 36/36 on the numeric core; awaiting verification in Resolve |
+| 3 — the plugin | **done**, running in Resolve on the GPU at ~5 ms a frame |
 
 **iw3 Stereo** is a Fusion node with Source and Depth inputs, producing an
 anaglyph, either eye, or half SBS. Interface in `docs/phase3-interface.md`.
+
+It renders entirely on the GPU: Resolve's device buffers, six CUDA kernels and
+ONNX Runtime bound to device memory, with nothing crossing PCIe. A 1920x800
+frame takes **5.1 - 6.3 ms** end to end, of which ~5 ms is inference. See
+`docs/gpu-render.md`.
 
 Correctness carries across three hops, each measured rather than assumed:
 `stereo_warp.py` matches stock iw3 at **diff 0**; the ONNX implementation

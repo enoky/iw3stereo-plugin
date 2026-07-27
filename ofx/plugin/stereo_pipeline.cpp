@@ -1,5 +1,7 @@
 #include "stereo_pipeline.h"
 
+#include "numeric_math.h"
+
 #include <algorithm>
 #include <cmath>
 
@@ -8,70 +10,6 @@ namespace iw3
 
 namespace
 {
-
-// --- mappers, ported from iw3/mapper.py -------------------------------------
-
-double softplus01(double x, double bias, double scale)
-{
-    const double minV = std::log(1 + std::exp((0 - bias) * scale));
-    const double maxV = std::log(1 + std::exp((1 - bias) * scale));
-    const double v = std::log(1.0 + std::exp((x - bias) * scale));
-    return (v - minV) / (maxV - minV);
-}
-
-double invSoftplus01(double x, double bias, double scale)
-{
-    const auto safeLog = [](double value) { return std::log(std::max(std::expm1(value), 1e-6)); };
-    const double minV = safeLog((0 - bias) * scale);
-    const double maxV = safeLog((1 - bias) * scale);
-    return (safeLog((x - bias) * scale) - minV) / (maxV - minV);
-}
-
-double shiftRelativeDepth(double x, double minDistance)
-{
-    const double maxDistance = 16.0;
-    const double provisionalMax = minDistance + maxDistance;
-    const double A = 1.0 / provisionalMax;
-    const double B = (1.0 / minDistance) - (1.0 / provisionalMax);
-    double distance = 1.0 / (A + B * x);
-    distance = (1.0 - minDistance) + distance;
-    const double newX = 1.0 / distance;
-    const double minValue = 1.0 / (maxDistance + 1.0);
-    const double valueRange = 1.0 - 1.0 / (maxDistance + 1.0);
-    return (newX - minValue) / valueRange;
-}
-
-// RELATIVE_MUL_MAPPER and RELATIVE_SHIFT_MAPPER from iw3/mapper.py, indexed by
-// foreground_scale + 3. Index 3 is "none" in both.
-double applyMultiplyMapper(int index, double x)
-{
-    switch (index)
-    {
-        case 0: return invSoftplus01(x, -0.0001, 3.4343);   // inv_mul_3
-        case 1: return invSoftplus01(x, -0.0003, 6.2626);   // inv_mul_2
-        case 2: return invSoftplus01(x, -0.002102, 7.8788); // inv_mul_1
-        case 3: return x;                                   // none
-        case 4: return softplus01(x, 0.343, 12);            // mul_1
-        case 5: return softplus01(x, 0.515, 12);            // mul_2
-        case 6: return softplus01(x, 0.687, 12);            // mul_3
-        default: return x;
-    }
-}
-
-double applyShiftMapper(int index, double x)
-{
-    switch (index)
-    {
-        case 0: return shiftRelativeDepth(x, 0.45);  // shift_045
-        case 1: return shiftRelativeDepth(x, 0.6);   // shift_06
-        case 2: return shiftRelativeDepth(x, 0.8);   // shift_08
-        case 3: return x;                            // none
-        case 4: return shiftRelativeDepth(x, 1.4);   // shift_14
-        case 5: return shiftRelativeDepth(x, 2.0);   // shift_20
-        case 6: return shiftRelativeDepth(x, 3.0);   // shift_30
-        default: return x;
-    }
-}
 
 // The sizing rule from iw3_ext/depth_file.py.
 constexpr int kPrepMultiple = 14;
@@ -107,22 +45,20 @@ Mapper::Mapper(double foregroundScale, MapperType type)
     _b = std::clamp(b + 3, 0, 6);
 }
 
+iw3::math::MapperParams Mapper::params() const
+{
+    iw3::math::MapperParams params;
+    params.a = _a;
+    params.b = _b;
+    params.weight = _weight;
+    params.shift = _type == MapperType::Shift ? 1 : 0;
+    params.identity = _identity ? 1 : 0;
+    return params;
+}
+
 double Mapper::operator()(double x) const
 {
-    if (_identity)
-    {
-        return x;
-    }
-    const auto apply = [this](int index, double value)
-    {
-        return _type == MapperType::Multiply ? applyMultiplyMapper(index, value)
-                                             : applyShiftMapper(index, value);
-    };
-    if (_a == _b)
-    {
-        return apply(_a, x);
-    }
-    return apply(_a, x) * (1.0 - _weight) + apply(_b, x) * _weight;
+    return iw3::math::applyMapper(params(), x);
 }
 
 std::pair<int, int> autoDepthSize(int frameWidth, int frameHeight)
@@ -165,7 +101,7 @@ std::pair<int, int> depthTargetSize(int frameWidth, int frameHeight, int stereoW
     return {width, std::max(1, height)};
 }
 
-void DepthResizer::build(Axis& axis, int inSize, int outSize)
+void buildResampleAxis(ResampleAxis& axis, int inSize, int outSize)
 {
     if (axis.inSize == inSize && axis.outSize == outSize)
     {
@@ -216,8 +152,8 @@ void DepthResizer::build(Axis& axis, int inSize, int outSize)
 void DepthResizer::resize(const float* source, int sourceWidth, int sourceHeight,
                           std::vector<float>& target, int targetWidth, int targetHeight)
 {
-    build(_horizontal, sourceWidth, targetWidth);
-    build(_vertical, sourceHeight, targetHeight);
+    buildResampleAxis(_horizontal, sourceWidth, targetWidth);
+    buildResampleAxis(_vertical, sourceHeight, targetHeight);
 
     // Horizontal first, into scratch at (sourceHeight x targetWidth).
     _scratch.resize(size_t(sourceHeight) * size_t(targetWidth));
@@ -269,9 +205,8 @@ void buildInputTensor(const float* depth, int width, int height,
 
     // image_width is the depth's longer side, as in iw3.
     const double imageWidth = double(std::max(width, height));
-    const double divergencePix = divergence * 0.5 * 0.01 * imageWidth;
-    const float divergenceValue = float(divergencePix / 32.0);
-    const float convergenceValue = float((-divergencePix * convergence) / 32.0);
+    float divergenceValue = 0.0f, convergenceValue = 0.0f;
+    iw3::math::featureValues(divergence, convergence, imageWidth, divergenceValue, convergenceValue);
 
     std::copy(depth, depth + pixels, out.begin());
     std::fill(out.begin() + ptrdiff_t(pixels), out.begin() + ptrdiff_t(pixels * 2), divergenceValue);
@@ -313,35 +248,15 @@ float deltaScale(int depthWidth)
 
 void duboisAnaglyph(const float* left, const float* right, size_t pixels, float* out)
 {
-    // Red/cyan Dubois. Each row sums to 1.0 across all six coefficients, so a
-    // grey pair comes out the same grey.
-    static const double kLeft[3][3] = {
-        {0.4561, 0.500484, 0.176381},
-        {-0.0400822, -0.0378246, -0.0157589},
-        {-0.0152161, -0.0205971, -0.00546856},
-    };
-    static const double kRight[3][3] = {
-        {-0.0434706, -0.0879388, -0.00155529},
-        {0.378476, 0.73364, -0.0184503},
-        {-0.0721527, -0.112961, 1.2264},
-    };
-
     for (size_t i = 0; i < pixels; ++i)
     {
-        const double lr = left[i];
-        const double lg = left[pixels + i];
-        const double lb = left[2 * pixels + i];
-        const double rr = right[i];
-        const double rg = right[pixels + i];
-        const double rb = right[2 * pixels + i];
-
-        for (int o = 0; o < 3; ++o)
-        {
-            const double value =
-                kLeft[o][0] * lr + kLeft[o][1] * lg + kLeft[o][2] * lb +
-                kRight[o][0] * rr + kRight[o][1] * rg + kRight[o][2] * rb;
-            out[size_t(o) * pixels + i] = float(std::clamp(value, 0.0, 1.0));
-        }
+        double r = 0.0, g = 0.0, b = 0.0;
+        iw3::math::duboisPixel(left[i], left[pixels + i], left[2 * pixels + i],
+                               right[i], right[pixels + i], right[2 * pixels + i],
+                               r, g, b);
+        out[i] = float(iw3::math::clamp01(r));
+        out[pixels + i] = float(iw3::math::clamp01(g));
+        out[2 * pixels + i] = float(iw3::math::clamp01(b));
     }
 }
 

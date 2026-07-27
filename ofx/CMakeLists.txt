@@ -1,6 +1,25 @@
 cmake_minimum_required(VERSION 3.20)
 project(resolve_iw3_ofx CXX)
 
+# CUDA is optional: without it the plugin still builds and runs, just on the CPU
+# path. With it, Resolve's GPU render suites keep every frame in device memory.
+include(CheckLanguage)
+check_language(CUDA)
+if(CMAKE_CUDA_COMPILER)
+    enable_language(CUDA)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    # 5080 is sm_120; 75 and 86 cover the older cards most users will have.
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES 75 86 89 120)
+    endif()
+    set(IW3_HAS_CUDA ON)
+    message(STATUS "CUDA found: building the GPU render path")
+else()
+    set(IW3_HAS_CUDA OFF)
+    message(WARNING "No CUDA compiler: the plugin will be CPU-only")
+endif()
+
 # Resolve ships the OpenFX headers and the OFX C++ Support wrapper with the
 # application, so there is nothing to vendor. Override with -DOFX_SDK_DIR=... if
 # Resolve is installed somewhere unusual.
@@ -92,11 +111,21 @@ endfunction()
 stage_runtime(iw3ort)
 
 # --- the plugin --------------------------------------------------------------
-ofx_bundle(iw3stereo plugin/iw3stereo.cpp plugin/stereo_pipeline.cpp common/ort_runtime.cpp)
+set(IW3STEREO_SOURCES plugin/iw3stereo.cpp plugin/stereo_pipeline.cpp common/ort_runtime.cpp)
+if(IW3_HAS_CUDA)
+    list(APPEND IW3STEREO_SOURCES plugin/stereo_gpu.cu)
+endif()
+
+ofx_bundle(iw3stereo ${IW3STEREO_SOURCES})
 target_include_directories(iw3stereo PRIVATE
     "${IW3_COMMON}"
     "${CMAKE_CURRENT_SOURCE_DIR}/plugin"
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnxruntime")
+if(IW3_HAS_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    target_link_libraries(iw3stereo PRIVATE CUDA::cudart_static)
+    set_target_properties(iw3stereo PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+endif()
 stage_runtime(iw3stereo)
 
 # --- the numeric core's test, built as a plain executable --------------------

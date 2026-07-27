@@ -12,6 +12,8 @@
 
 #pragma once
 
+#include "numeric_math.h"
+
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -62,6 +64,9 @@ public:
     double operator()(double x) const;
     bool isIdentity() const { return _identity; }
 
+    // The resolved form, small enough to hand to a CUDA kernel by value.
+    iw3::math::MapperParams params() const;
+
 private:
     int _a = 3;  // index into the mapper list, 3 == "none"
     int _b = 3;
@@ -82,10 +87,27 @@ std::pair<int, int> autoDepthSize(int frameWidth, int frameHeight);
 // back to autoDepthSize(). Returns {width, height}.
 std::pair<int, int> depthTargetSize(int frameWidth, int frameHeight, int stereoWidth);
 
-// PyTorch's antialiased bilinear resample, separable, single channel.
+// One axis of a separable resample: for each output sample, where its taps
+// start and what they weigh.
+struct ResampleAxis
+{
+    int inSize = 0;
+    int outSize = 0;
+    std::vector<int> start;
+    std::vector<int> count;
+    std::vector<int> offset;     // into weights
+    std::vector<float> weights;  // packed, count[i] entries per output
+};
+
+// PyTorch's antialiased bilinear resample weights for one axis.
 //
-// ONNX Resize cannot reproduce this -- see docs/phase2-onnx.md. Weights are
-// rebuilt only when a size changes, which is once per timeline in practice.
+// ONNX Resize cannot reproduce this -- see docs/phase2-onnx.md. Public because
+// the CUDA path uploads exactly these weights rather than deriving its own,
+// which is what keeps the two paths identical.
+void buildResampleAxis(ResampleAxis& axis, int inSize, int outSize);
+
+// The CPU resampler. Weights are rebuilt only when a size changes, which is
+// once per timeline in practice.
 class DepthResizer
 {
 public:
@@ -93,20 +115,8 @@ public:
                 std::vector<float>& target, int targetWidth, int targetHeight);
 
 private:
-    struct Axis
-    {
-        int inSize = 0;
-        int outSize = 0;
-        std::vector<int> start;
-        std::vector<int> count;
-        std::vector<float> weights;  // packed, count[i] entries per output
-        std::vector<int> offset;
-    };
-
-    static void build(Axis& axis, int inSize, int outSize);
-
-    Axis _horizontal;
-    Axis _vertical;
+    ResampleAxis _horizontal;
+    ResampleAxis _vertical;
     std::vector<float> _scratch;
 };
 

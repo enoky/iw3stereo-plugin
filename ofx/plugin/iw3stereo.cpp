@@ -15,9 +15,13 @@
 
 #include "ort_runtime.h"
 #include "probe_log.h"
+#include "stereo_gpu.h"
 #include "stereo_pipeline.h"
 
+#include <cuda_runtime.h>
+
 #include <algorithm>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -127,7 +131,15 @@ private:
     // Reused across frames; resized only when the frame size changes.
     std::vector<float> _image, _depthFull, _depthSmall, _x, _left, _right, _composed;
     iw3::DepthResizer _resizer;
+    iw3::GpuPipeline _gpu;
     std::string _lastMessage;
+    unsigned _frameCounter = 0;
+
+    // Returns false if the GPU path could not be taken, so render() can fall
+    // through to the CPU one.
+    bool renderCuda(const OFX::RenderArguments& args, const iw3::Settings& settings,
+                    OFX::Image* dst, OFX::Image* src, OFX::Image* depth,
+                    int components, int width, int height);
 };
 
 // One session for the process. Bring-up costs 60-240 ms for the CUDA provider
@@ -232,6 +244,107 @@ void Iw3StereoEffect::passthrough(OFX::Image* dst, OFX::Image* src, const OfxRec
     }
 }
 
+// The GPU path. Everything stays in device memory from Resolve's source buffer
+// through to Resolve's destination buffer -- at 1080p the CPU path was moving
+// 25 MB up and 50 MB back across PCIe every frame, which cost more than the
+// inference did.
+//
+// Returns false without touching the output if the GPU path is unavailable, so
+// the caller can fall through to the CPU implementation.
+bool Iw3StereoEffect::renderCuda(const OFX::RenderArguments& args, const iw3::Settings& settings,
+                                 OFX::Image* dst, OFX::Image* src, OFX::Image* depth,
+                                 int components, int width, int height)
+{
+    if (!args.isEnabledCudaRender || !iw3::GpuPipeline::deviceAvailable())
+    {
+        return false;
+    }
+    iw3::OrtRuntime& ort = sharedRuntime();
+    if (!ort.deviceCapable())
+    {
+        return false;
+    }
+    const auto started = std::chrono::steady_clock::now();
+
+    const std::pair<int, int> target = iw3::depthTargetSize(width, height, settings.stereoWidth);
+    const int depthWidth = target.first;
+    const int depthHeight = target.second;
+    if (depthWidth < 4)
+    {
+        return false;
+    }
+
+    if (!_gpu.prepare(width, height, depthWidth, depthHeight))
+    {
+        report("GPU setup failed: " + _gpu.error() + " -- falling back to the CPU.", true);
+        return false;
+    }
+
+    // getRowBytes() is a byte stride; the kernels index in floats.
+    const size_t sourcePitch = size_t(src->getRowBytes()) / sizeof(float);
+    const size_t depthPitch = size_t(depth->getRowBytes()) / sizeof(float);
+    const size_t destinationPitch = size_t(dst->getRowBytes()) / sizeof(float);
+
+    void* stream = args.pCudaStream;
+    const iw3::Mapper mapper(settings.foregroundScale, settings.mapperType);
+
+    _gpu.packSource(static_cast<const float*>(src->getPixelData()), sourcePitch, components, stream);
+    _gpu.packDepth(static_cast<const float*>(depth->getPixelData()), depthPitch,
+                   componentCount(depth->getPixelComponents()),
+                   settings.undoVideoRange, settings.depthInverted, mapper.params(), stream);
+    _gpu.resizeDepth(stream);
+    _gpu.buildInputTensor(settings.divergence, settings.convergence,
+                          settings.preserveScreenBorder, stream);
+
+    // ORT runs on its own stream, so Resolve's work has to have landed first.
+    // Sharing the stream through user_compute_stream would remove this
+    // synchronise; it is not done because the session is built once and the
+    // host's stream is only known per render call.
+    if (cudaStreamSynchronize(static_cast<cudaStream_t>(stream)) != cudaSuccess)
+    {
+        report("CUDA stream sync failed -- falling back to the CPU.", true);
+        return false;
+    }
+
+    const int64_t imageShape[4] = {1, 3, height, width};
+    const int64_t xShape[4] = {1, 3, depthHeight, depthWidth};
+    const float* left = nullptr;
+    const float* right = nullptr;
+    if (!ort.runDevice(_gpu.imageDevice(), imageShape, _gpu.inputTensorDevice(), xShape,
+                       iw3::deltaScale(depthWidth), &left, &right))
+    {
+        report("GPU inference failed; see the log. Falling back to the CPU.", true);
+        return false;
+    }
+
+    _gpu.compose(settings.output, left, right, stream);
+    _gpu.unpack(static_cast<float*>(dst->getPixelData()), destinationPitch, components, stream);
+
+    if (!_gpu.ok())
+    {
+        report("GPU kernel failed: " + _gpu.error(), true);
+        return false;
+    }
+
+    // Logged every 60th frame so playback does not swamp the file.
+    //
+    // The total is honest about most of the work but not all of it: ORT's Run
+    // synchronises, so everything up to and including inference is inside the
+    // window, while compose and unpack are still queued on Resolve's stream
+    // when this returns. Forcing a sync to measure them would slow the path
+    // being measured.
+    if ((_frameCounter++ % 60) == 0)
+    {
+        const double total = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - started).count();
+        probe::logf("iw3 Stereo: CUDA path %dx%d, depth %dx%d, inference %.2f ms, "
+                    "total %.2f ms (compose+unpack still queued)",
+                    width, height, depthWidth, depthHeight, ort.lastRunMilliseconds(), total);
+    }
+    report(std::string(), false);
+    return true;
+}
+
 void Iw3StereoEffect::render(const OFX::RenderArguments& args)
 {
     const iw3::Settings settings = readSettings(args.time);
@@ -274,7 +387,13 @@ void Iw3StereoEffect::render(const OFX::RenderArguments& args)
         return;
     }
 
+    if (renderCuda(args, settings, dst.get(), src.get(), depth.get(), components, width, height))
+    {
+        return;
+    }
+
     // --- unpack the two inputs into planar float ---------------------------
+    const auto cpuStarted = std::chrono::steady_clock::now();
     _image.resize(pixels * 3);
     _depthFull.resize(pixels);
 
@@ -432,6 +551,14 @@ void Iw3StereoEffect::render(const OFX::RenderArguments& args)
         }
     }
 
+    if ((_frameCounter++ % 60) == 0)
+    {
+        probe::logf("iw3 Stereo: CPU path %dx%d, depth %dx%d, inference %.2f ms, total %.2f ms",
+                    width, height, depthWidth, depthHeight, ort.lastRunMilliseconds(),
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - cpuStarted).count());
+    }
+
     // --- pack back ---------------------------------------------------------
     for (int y = 0; y < height; ++y)
     {
@@ -483,6 +610,12 @@ void Iw3StereoFactory::describe(OFX::ImageEffectDescriptor& desc)
     desc.setTemporalClipAccess(false);
     desc.setRenderTwiceAlways(false);
     desc.setSupportsMultipleClipPARs(false);
+
+    // Ask for CUDA render. Resolve then hands render() device pointers and a
+    // stream, and the whole frame stays on the GPU. Falls back automatically:
+    // the host clears args.isEnabledCudaRender when it renders on the CPU.
+    desc.setSupportsCudaRender(true);
+    desc.setSupportsCudaStream(true);
 }
 
 void Iw3StereoFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OFX::ContextEnum context)

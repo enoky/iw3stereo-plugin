@@ -179,7 +179,124 @@ bool OrtRuntime::open(const std::wstring& directory, const std::wstring& modelPa
     {
         return false;
     }
+
+    if (cudaAttached)
+    {
+        // Set up for device-resident tensors. If any of this fails the session
+        // still works through run(); it just pays for the copies.
+        if (!failed(_api->CreateMemoryInfo("Cuda", OrtDeviceAllocator, 0, OrtMemTypeDefault,
+                                           &_cudaMemoryInfo), "CreateMemoryInfo(Cuda)") &&
+            !failed(_api->CreateIoBinding(_session, &_binding), "CreateIoBinding") &&
+            !failed(_api->GetAllocatorWithDefaultOptions(&_allocator), "GetAllocatorWithDefaultOptions"))
+        {
+            // Outputs land in device memory rather than being copied back.
+            if (!failed(_api->BindOutputToDevice(_binding, "left", _cudaMemoryInfo), "BindOutput(left)") &&
+                !failed(_api->BindOutputToDevice(_binding, "right", _cudaMemoryInfo), "BindOutput(right)"))
+            {
+                note("device binding ready: inputs and outputs stay on the GPU");
+            }
+            else
+            {
+                _api->ReleaseIoBinding(_binding);
+                _binding = nullptr;
+            }
+        }
+        if (!_binding && _cudaMemoryInfo)
+        {
+            _api->ReleaseMemoryInfo(_cudaMemoryInfo);
+            _cudaMemoryInfo = nullptr;
+        }
+    }
     return true;
+}
+
+void OrtRuntime::releaseBoundOutputs()
+{
+    if (!_boundOutputs)
+    {
+        return;
+    }
+    for (size_t i = 0; i < _boundOutputCount; ++i)
+    {
+        if (_boundOutputs[i]) _api->ReleaseValue(_boundOutputs[i]);
+    }
+    _api->AllocatorFree(_allocator, _boundOutputs);
+    _boundOutputs = nullptr;
+    _boundOutputCount = 0;
+}
+
+bool OrtRuntime::runDevice(const float* image, const int64_t* imageShape,
+                           const float* x, const int64_t* xShape,
+                           float deltaScale,
+                           const float** left, const float** right)
+{
+    if (!deviceCapable() || !_binding)
+    {
+        return false;
+    }
+
+    // The previous frame's outputs are only valid until here.
+    releaseBoundOutputs();
+
+    const size_t imageElements = size_t(imageShape[0] * imageShape[1] * imageShape[2] * imageShape[3]);
+    const size_t xElements = size_t(xShape[0] * xShape[1] * xShape[2] * xShape[3]);
+
+    OrtValue* imageValue = nullptr;
+    OrtValue* xValue = nullptr;
+    OrtValue* scaleValue = nullptr;
+    bool ok = false;
+
+    if (!failed(_api->CreateTensorWithDataAsOrtValue(
+            _cudaMemoryInfo, const_cast<float*>(image), imageElements * sizeof(float),
+            imageShape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &imageValue), "device image tensor") &&
+        !failed(_api->CreateTensorWithDataAsOrtValue(
+            _cudaMemoryInfo, const_cast<float*>(x), xElements * sizeof(float),
+            xShape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &xValue), "device x tensor") &&
+        // delta_scale stays on the host: four bytes, and ORT wants it where the
+        // shape arithmetic happens anyway.
+        !failed(_api->CreateTensorWithDataAsOrtValue(
+            _memoryInfo, &deltaScale, sizeof(float),
+            nullptr, 0, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &scaleValue), "delta_scale tensor"))
+    {
+        if (!failed(_api->BindInput(_binding, "image", imageValue), "BindInput(image)") &&
+            !failed(_api->BindInput(_binding, "x", xValue), "BindInput(x)") &&
+            !failed(_api->BindInput(_binding, "delta_scale", scaleValue), "BindInput(delta_scale)"))
+        {
+            const auto started = std::chrono::steady_clock::now();
+            OrtStatus* status = _api->RunWithBinding(_session, nullptr, _binding);
+            _lastRunMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - started).count();
+
+            if (!failed(status, "RunWithBinding") &&
+                !failed(_api->GetBoundOutputValues(_binding, _allocator,
+                                                   &_boundOutputs, &_boundOutputCount),
+                        "GetBoundOutputValues") &&
+                _boundOutputCount == 2)
+            {
+                float* leftData = nullptr;
+                float* rightData = nullptr;
+                if (!failed(_api->GetTensorMutableData(_boundOutputs[0],
+                                                       reinterpret_cast<void**>(&leftData)),
+                            "left device data") &&
+                    !failed(_api->GetTensorMutableData(_boundOutputs[1],
+                                                       reinterpret_cast<void**>(&rightData)),
+                            "right device data"))
+                {
+                    *left = leftData;
+                    *right = rightData;
+                    ok = true;
+                }
+            }
+        }
+    }
+
+    // Binding an input takes its own reference, so dropping ours here is right.
+    for (OrtValue* value : {imageValue, xValue, scaleValue})
+    {
+        if (value) _api->ReleaseValue(value);
+    }
+    _api->ClearBoundInputs(_binding);
+    return ok;
 }
 
 bool OrtRuntime::run(const float* image, const int64_t* imageShape,

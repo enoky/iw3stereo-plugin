@@ -51,6 +51,19 @@ public:
              float deltaScale,
              float* left, float* right, size_t imageCount);
 
+    // The same run with every buffer already on the GPU. `left` and `right`
+    // come back as device pointers owned by this object, valid until the next
+    // call. Only usable when deviceCapable().
+    //
+    // This is what keeps a frame off the PCIe bus: through the host run()
+    // above, 1080p costs 25 MB up and 50 MB back, every frame.
+    bool runDevice(const float* image, const int64_t* imageShape,
+                   const float* x, const int64_t* xShape,
+                   float deltaScale,
+                   const float** left, const float** right);
+
+    bool deviceCapable() const { return _session && _provider == "CUDA" && _cudaMemoryInfo; }
+
     bool ready() const { return _session != nullptr; }
     const std::string& provider() const { return _provider; }
     const std::string& version() const { return _version; }
@@ -60,12 +73,18 @@ public:
 private:
     void note(const std::string& line) { _report.push_back(line); }
     bool failed(OrtStatus* status, const char* what);
+    void releaseBoundOutputs();
 
     HMODULE _library = nullptr;
     const OrtApi* _api = nullptr;
     OrtEnv* _env = nullptr;
     OrtSession* _session = nullptr;
     OrtMemoryInfo* _memoryInfo = nullptr;
+    OrtMemoryInfo* _cudaMemoryInfo = nullptr;
+    OrtIoBinding* _binding = nullptr;
+    OrtAllocator* _allocator = nullptr;
+    OrtValue** _boundOutputs = nullptr;
+    size_t _boundOutputCount = 0;
     std::string _provider = "none";
     std::string _version;
     std::vector<std::string> _report;
