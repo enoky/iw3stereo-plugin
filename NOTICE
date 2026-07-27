@@ -1,0 +1,47 @@
+Provenance and licences of the parts of this project.
+
+----
+stereo_warp.py, stereo_warp_onnx.py, ofx/plugin/stereo_pipeline.cpp
+
+Derived from nunif / iw3 by nagadomi, MIT License.
+https://github.com/nagadomi/nunif
+
+Specifically from iw3/backward_warp.py, iw3/utils.py, iw3/mapper.py and
+iw3/models/row_flow_v2.py. The arithmetic is kept expression-for-expression
+identical where the tests require exact agreement.
+
+The depth sizing rule in ofx/plugin/stereo_pipeline.cpp (autoDepthSize) follows
+iw3_ext/depth_file.py, itself following depth_anything_model.batch_preprocess().
+
+----
+models/row_flow_v2.onnx, models/stereo_warp.onnx
+
+Converted from iw3_row_flow_v2_20240130.pth, nagadomi's own weight, published
+from the nunif GitHub releases and not listed among nunif's third-party assets.
+Redistribution confirmed with the author.
+
+Note that the cc-by-nc-4.0 restrictions described in iw3/README.md attach to
+third-party *depth* models (Depth-Anything V2, Video-Depth-Anything and the
+metric variants). This project does not use or ship any of them: depth arrives
+from outside.
+
+----
+ofx/third_party/onnxruntime/*.h
+
+ONNX Runtime C API headers, v1.28.0, Microsoft Corporation, MIT License.
+https://github.com/microsoft/onnxruntime
+
+Vendored so the build is reproducible. No ONNX Runtime import library is used
+and no link-time dependency exists; the runtime is loaded at run time by
+absolute path. See ofx/common/ort_runtime.h for why that matters.
+
+----
+The OpenFX headers and the OFX C++ Support library are not vendored. They ship
+with DaVinci Resolve, under
+C:\ProgramData\Blackmagic Design\DaVinci Resolve\Support\Developer\OpenFX,
+and are compiled from there. OpenFX is BSD-licensed by
+The Open Effects Association Ltd.
+
+----
+The Dubois anaglyph coefficients implement the method of Eric Dubois,
+"A projection method to generate anaglyph stereo images" (2001).

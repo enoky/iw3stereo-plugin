@@ -1,0 +1,4 @@
+[flake8]
+max-line-length = 120
+exclude = .git,__pycache__,ofx/build,venv
+ignore = E741,W503,W504

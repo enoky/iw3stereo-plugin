@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+ofx/build/
+
+# Checkpoints are downloaded, not vendored. The exported .onnx files ARE
+# committed -- they are the plugin's payload, and they are ~200 KiB together.
+*.pth
+
+# Regenerable by export_onnx.py, and large.
+models/reference.npz
+
+# Regenerable by tools/dump_pipeline_reference.py, and large.
+tests/cpp/pipeline_reference.bin
