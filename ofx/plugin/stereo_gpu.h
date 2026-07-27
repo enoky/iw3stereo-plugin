@@ -32,10 +32,18 @@ public:
     bool prepare(int width, int height, int depthWidth, int depthHeight);
 
     // Resolve's source -> planar RGB. rowPitch is in floats.
-    void packSource(const float* source, size_t rowPitch, int components, void* stream);
+    //
+    // An OFX image's bounds need not start at the render window's origin, nor
+    // cover it. offsetX/Y locate the window inside the image and sourceWidth/
+    // Height give its extent; anything outside reads as black rather than
+    // running off the allocation. Ignoring this is an out-of-bounds device read,
+    // which is a GPU fault, which takes Resolve with it.
+    void packSource(const float* source, size_t rowPitch, int components,
+                    int offsetX, int offsetY, int sourceWidth, int sourceHeight, void* stream);
 
     // Resolve's depth clip -> a single mapped channel at frame resolution.
     void packDepth(const float* depth, size_t rowPitch, int components,
+                   int offsetX, int offsetY, int sourceWidth, int sourceHeight,
                    bool undoVideoRange, bool inverted,
                    const math::MapperParams& mapper, void* stream);
 
@@ -61,6 +69,7 @@ public:
     static bool deviceAvailable();
 
 private:
+
     void uploadWeights();
     bool allocate(float** pointer, size_t floats, size_t& held);
 
@@ -86,5 +95,22 @@ private:
 
     std::string _error;
 };
+
+// Copy Resolve's source buffer straight to its destination, on the device.
+//
+// This exists because of a crash: when Resolve renders with CUDA enabled,
+// OFX::Image::getPixelData() returns *device* pointers, and every path that
+// gives up and passes the source through was reading them on the CPU. That is
+// an access violation on a device address, and it takes Resolve down with it.
+//
+// Pointers must already be offset to the top-left of the region being written.
+// `sourceOffsetX/Y` place that region within the source image, whose extent is
+// `sourceWidth/Height`; anything outside it is written as black rather than
+// read out of bounds. Pitches are in floats. A null `source` fills black.
+bool devicePassthrough(const float* source, size_t sourcePitch,
+                       int sourceOffsetX, int sourceOffsetY,
+                       int sourceWidth, int sourceHeight,
+                       float* destination, size_t destinationPitch,
+                       int width, int height, int components, void* stream);
 
 }  // namespace iw3

@@ -118,7 +118,13 @@ public:
 
 private:
     iw3::Settings readSettings(double time) const;
-    void passthrough(OFX::Image* dst, OFX::Image* src, const OfxRectI& window, int components);
+    // Passes the source through, on whichever side of the PCIe bus the buffers
+    // actually live. Every giving-up path must go through this: with CUDA
+    // render enabled getPixelData() is device memory, and reading it on the CPU
+    // is an access violation that takes Resolve down.
+    void passSourceThrough(const OFX::RenderArguments& args, OFX::Image* dst, OFX::Image* src,
+                           const OfxRectI& window, int components);
+    void passthroughHost(OFX::Image* dst, OFX::Image* src, const OfxRectI& window, int components);
     void report(const std::string& message, bool warning);
 
     OFX::Clip* _dstClip = nullptr;
@@ -147,7 +153,7 @@ private:
     // through to the CPU one.
     bool renderCuda(const OFX::RenderArguments& args, const iw3::Settings& settings,
                     OFX::Image* dst, OFX::Image* src, OFX::Image* depth,
-                    int components, int width, int height);
+                    int components, const OfxRectI& window);
 };
 
 // One session for the process. Bring-up costs 60-240 ms for the CUDA provider
@@ -251,7 +257,45 @@ void Iw3StereoEffect::report(const std::string& message, bool warning)
     }
 }
 
-void Iw3StereoEffect::passthrough(OFX::Image* dst, OFX::Image* src, const OfxRectI& window, int components)
+void Iw3StereoEffect::passSourceThrough(const OFX::RenderArguments& args, OFX::Image* dst,
+                                        OFX::Image* src, const OfxRectI& window, int components)
+{
+    if (!dst)
+    {
+        return;
+    }
+    if (args.isEnabledCudaRender)
+    {
+        const OfxRectI& dstBounds = dst->getBounds();
+        const size_t dstPitch = size_t(dst->getRowBytes()) / sizeof(float);
+        float* destination = static_cast<float*>(dst->getPixelData()) +
+            size_t(window.y1 - dstBounds.y1) * dstPitch +
+            size_t(window.x1 - dstBounds.x1) * size_t(components);
+
+        const float* source = nullptr;
+        size_t sourcePitch = 0;
+        int offsetX = 0, offsetY = 0, sourceWidth = 0, sourceHeight = 0;
+        if (src)
+        {
+            const OfxRectI& srcBounds = src->getBounds();
+            source = static_cast<const float*>(src->getPixelData());
+            sourcePitch = size_t(src->getRowBytes()) / sizeof(float);
+            offsetX = window.x1 - srcBounds.x1;
+            offsetY = window.y1 - srcBounds.y1;
+            sourceWidth = srcBounds.x2 - srcBounds.x1;
+            sourceHeight = srcBounds.y2 - srcBounds.y1;
+        }
+
+        iw3::devicePassthrough(source, sourcePitch, offsetX, offsetY, sourceWidth, sourceHeight,
+                               destination, dstPitch,
+                               window.x2 - window.x1, window.y2 - window.y1, components,
+                               args.pCudaStream);
+        return;
+    }
+    passthroughHost(dst, src, window, components);
+}
+
+void Iw3StereoEffect::passthroughHost(OFX::Image* dst, OFX::Image* src, const OfxRectI& window, int components)
 {
     for (int y = window.y1; y < window.y2; ++y)
     {
@@ -286,8 +330,11 @@ void Iw3StereoEffect::passthrough(OFX::Image* dst, OFX::Image* src, const OfxRec
 // the caller can fall through to the CPU implementation.
 bool Iw3StereoEffect::renderCuda(const OFX::RenderArguments& args, const iw3::Settings& settings,
                                  OFX::Image* dst, OFX::Image* src, OFX::Image* depth,
-                                 int components, int width, int height)
+                                 int components, const OfxRectI& window)
 {
+    const int width = window.x2 - window.x1;
+    const int height = window.y2 - window.y1;
+
     if (!args.isEnabledCudaRender || !iw3::GpuPipeline::deviceAvailable())
     {
         return false;
@@ -321,9 +368,20 @@ bool Iw3StereoEffect::renderCuda(const OFX::RenderArguments& args, const iw3::Se
     void* stream = args.pCudaStream;
     const iw3::Mapper mapper(settings.foregroundScale, settings.mapperType);
 
-    _gpu.packSource(static_cast<const float*>(src->getPixelData()), sourcePitch, components, stream);
+    // Every image gets its own bounds handed to the kernel. They are not
+    // guaranteed to start at the render window's origin or to cover it, and
+    // assuming otherwise is an out-of-bounds device read.
+    const OfxRectI& srcBounds = src->getBounds();
+    const OfxRectI& depthBounds = depth->getBounds();
+    const OfxRectI& dstBounds = dst->getBounds();
+
+    _gpu.packSource(static_cast<const float*>(src->getPixelData()), sourcePitch, components,
+                    window.x1 - srcBounds.x1, window.y1 - srcBounds.y1,
+                    srcBounds.x2 - srcBounds.x1, srcBounds.y2 - srcBounds.y1, stream);
     _gpu.packDepth(static_cast<const float*>(depth->getPixelData()), depthPitch,
                    componentCount(depth->getPixelComponents()),
+                   window.x1 - depthBounds.x1, window.y1 - depthBounds.y1,
+                   depthBounds.x2 - depthBounds.x1, depthBounds.y2 - depthBounds.y1,
                    settings.undoVideoRange, settings.depthInverted, mapper.params(), stream);
     _gpu.resizeDepth(stream);
     _gpu.buildInputTensor(settings.divergence, settings.convergence,
@@ -352,7 +410,10 @@ bool Iw3StereoEffect::renderCuda(const OFX::RenderArguments& args, const iw3::Se
     }
 
     _gpu.compose(settings.output, left, right, stream);
-    _gpu.unpack(static_cast<float*>(dst->getPixelData()), destinationPitch, components, stream);
+    _gpu.unpack(static_cast<float*>(dst->getPixelData()) +
+                    size_t(window.y1 - dstBounds.y1) * destinationPitch +
+                    size_t(window.x1 - dstBounds.x1) * size_t(components),
+                destinationPitch, components, stream);
 
     if (!_gpu.ok())
     {
@@ -400,15 +461,28 @@ void Iw3StereoEffect::render(const OFX::RenderArguments& args)
         return;
     }
 
-    const OfxRectI& window = args.renderWindow;
+    // Clamped to what we are actually allowed to write. OFX says the render
+    // window lies inside the output image, but the cost of checking is nothing
+    // and the cost of being wrong is a GPU fault.
+    const OfxRectI& bounds = dst->getBounds();
+    OfxRectI window = args.renderWindow;
+    window.x1 = std::max(window.x1, bounds.x1);
+    window.y1 = std::max(window.y1, bounds.y1);
+    window.x2 = std::min(window.x2, bounds.x2);
+    window.y2 = std::min(window.y2, bounds.y2);
+
     const int width = window.x2 - window.x1;
     const int height = window.y2 - window.y1;
+    if (width <= 0 || height <= 0)
+    {
+        return;
+    }
     const size_t pixels = size_t(width) * size_t(height);
 
     if (!depth)
     {
         report("Depth input is not connected -- passing the source through.", false);
-        passthrough(dst.get(), src.get(), window, components);
+        passSourceThrough(args, dst.get(), src.get(), window, components);
         return;
     }
 
@@ -417,12 +491,22 @@ void Iw3StereoEffect::render(const OFX::RenderArguments& args)
     {
         report("ONNX Runtime failed to start; see " +
                std::string("%LOCALAPPDATA%\\iw3probe\\probe.log"), true);
-        passthrough(dst.get(), src.get(), window, components);
+        passSourceThrough(args, dst.get(), src.get(), window, components);
         return;
     }
 
-    if (renderCuda(args, settings, dst.get(), src.get(), depth.get(), components, width, height))
+    if (renderCuda(args, settings, dst.get(), src.get(), depth.get(), components, window))
     {
+        return;
+    }
+
+    if (args.isEnabledCudaRender)
+    {
+        // The GPU path declined and the CPU one below cannot stand in for it:
+        // with CUDA render enabled these buffers are device memory, and the
+        // loops that follow would read it on the CPU. That was the crash.
+        // Whatever went wrong has already been reported by renderCuda().
+        passSourceThrough(args, dst.get(), src.get(), window, components);
         return;
     }
 
@@ -491,7 +575,7 @@ void Iw3StereoEffect::render(const OFX::RenderArguments& args)
     if (depthWidth < 4)
     {
         report("Frame is too small to warp.", true);
-        passthrough(dst.get(), src.get(), window, components);
+        passSourceThrough(args, dst.get(), src.get(), window, components);
         return;
     }
 
@@ -514,7 +598,7 @@ void Iw3StereoEffect::render(const OFX::RenderArguments& args)
                  _left.data(), _right.data(), pixels * 3))
     {
         report("Inference failed; see the log.", true);
-        passthrough(dst.get(), src.get(), window, components);
+        passSourceThrough(args, dst.get(), src.get(), window, components);
         return;
     }
 

@@ -20,22 +20,39 @@ dim3 grid2d(int width, int height)
     return dim3((unsigned(width) + kBlock - 1) / kBlock, (unsigned(height) + kBlock - 1) / kBlock);
 }
 
+__device__ inline bool insideSource(int x, int y, int offsetX, int offsetY,
+                                    int sourceWidth, int sourceHeight, int& sx, int& sy)
+{
+    sx = x + offsetX;
+    sy = y + offsetY;
+    return sx >= 0 && sx < sourceWidth && sy >= 0 && sy < sourceHeight;
+}
+
 __global__ void packSourceKernel(const float* __restrict__ source, size_t rowPitch, int components,
+                                 int offsetX, int offsetY, int sourceWidth, int sourceHeight,
                                  int width, int height, float* __restrict__ planar)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= width || y >= height) return;
 
-    const float* pixel = source + size_t(y) * rowPitch + size_t(x) * size_t(components);
     const size_t pixels = size_t(width) * size_t(height);
     const size_t index = size_t(y) * size_t(width) + size_t(x);
+
+    int sx = 0, sy = 0;
+    if (!source || !insideSource(x, y, offsetX, offsetY, sourceWidth, sourceHeight, sx, sy))
+    {
+        planar[index] = planar[pixels + index] = planar[2 * pixels + index] = 0.0f;
+        return;
+    }
+    const float* pixel = source + size_t(sy) * rowPitch + size_t(sx) * size_t(components);
     planar[index] = pixel[0];
     planar[pixels + index] = pixel[1];
     planar[2 * pixels + index] = pixel[2];
 }
 
 __global__ void packDepthKernel(const float* __restrict__ source, size_t rowPitch, int components,
+                                int offsetX, int offsetY, int sourceWidth, int sourceHeight,
                                 int width, int height,
                                 int undoVideoRange, int inverted,
                                 math::MapperParams mapper,
@@ -45,7 +62,13 @@ __global__ void packDepthKernel(const float* __restrict__ source, size_t rowPitc
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= width || y >= height) return;
 
-    float value = source[size_t(y) * rowPitch + size_t(x) * size_t(components)];
+    int sx = 0, sy = 0;
+    if (!source || !insideSource(x, y, offsetX, offsetY, sourceWidth, sourceHeight, sx, sy))
+    {
+        out[size_t(y) * size_t(width) + size_t(x)] = 0.0f;
+        return;
+    }
+    float value = source[size_t(sy) * rowPitch + size_t(sx) * size_t(components)];
     if (undoVideoRange)
     {
         // Resolve expanded 16-235 to 0-1 on the way in; put it back.
@@ -217,7 +240,55 @@ __global__ void unpackKernel(const float* __restrict__ planar, int width, int he
     }
 }
 
+__global__ void passthroughKernel(const float* __restrict__ source, size_t sourcePitch,
+                                  int sourceOffsetX, int sourceOffsetY,
+                                  int sourceWidth, int sourceHeight,
+                                  float* __restrict__ destination, size_t destinationPitch,
+                                  int width, int height, int components)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    float* out = destination + size_t(y) * destinationPitch + size_t(x) * size_t(components);
+    const int sx = x + sourceOffsetX;
+    const int sy = y + sourceOffsetY;
+
+    if (source && sx >= 0 && sx < sourceWidth && sy >= 0 && sy < sourceHeight)
+    {
+        const float* in = source + size_t(sy) * sourcePitch + size_t(sx) * size_t(components);
+        for (int c = 0; c < components; ++c)
+        {
+            out[c] = in[c];
+        }
+    }
+    else
+    {
+        for (int c = 0; c < components; ++c)
+        {
+            out[c] = 0.0f;
+        }
+    }
+}
+
 }  // namespace
+
+bool devicePassthrough(const float* source, size_t sourcePitch,
+                       int sourceOffsetX, int sourceOffsetY,
+                       int sourceWidth, int sourceHeight,
+                       float* destination, size_t destinationPitch,
+                       int width, int height, int components, void* stream)
+{
+    if (!destination || width <= 0 || height <= 0)
+    {
+        return false;
+    }
+    passthroughKernel<<<grid2d(width, height), dim3(kBlock, kBlock), 0,
+                        static_cast<cudaStream_t>(stream)>>>(
+        source, sourcePitch, sourceOffsetX, sourceOffsetY, sourceWidth, sourceHeight,
+        destination, destinationPitch, width, height, components);
+    return cudaGetLastError() == cudaSuccess;
+}
 
 bool GpuPipeline::deviceAvailable()
 {
@@ -373,21 +444,25 @@ void GpuPipeline::uploadWeights()
     _weightsCurrent = true;
 }
 
-void GpuPipeline::packSource(const float* source, size_t rowPitch, int components, void* stream)
+void GpuPipeline::packSource(const float* source, size_t rowPitch, int components,
+                             int offsetX, int offsetY, int sourceWidth, int sourceHeight,
+                             void* stream)
 {
     packSourceKernel<<<grid2d(_width, _height), dim3(kBlock, kBlock), 0,
                        static_cast<cudaStream_t>(stream)>>>(
-        source, rowPitch, components, _width, _height, _image);
+        source, rowPitch, components, offsetX, offsetY, sourceWidth, sourceHeight,
+        _width, _height, _image);
 }
 
 void GpuPipeline::packDepth(const float* depth, size_t rowPitch, int components,
+                            int offsetX, int offsetY, int sourceWidth, int sourceHeight,
                             bool undoVideoRange, bool inverted,
                             const math::MapperParams& mapper, void* stream)
 {
     packDepthKernel<<<grid2d(_width, _height), dim3(kBlock, kBlock), 0,
                       static_cast<cudaStream_t>(stream)>>>(
-        depth, rowPitch, components, _width, _height,
-        undoVideoRange ? 1 : 0, inverted ? 1 : 0, mapper, _depthFull);
+        depth, rowPitch, components, offsetX, offsetY, sourceWidth, sourceHeight,
+        _width, _height, undoVideoRange ? 1 : 0, inverted ? 1 : 0, mapper, _depthFull);
 }
 
 void GpuPipeline::resizeDepth(void* stream)
