@@ -42,9 +42,22 @@ Two honest caveats on those numbers:
   938x392. Phase 2 measured depth resolution alone as worth roughly 3x, so both
   changes contribute and the split between them is not separately measured.
 
-**The first frame costs ~450 ms**, which is cuDNN choosing kernels. A dummy run
-at session creation would move that cost off the first visible frame; it has not
-been done.
+### The first frame
+
+It used to cost **~450 ms**. Two things caused that, and both are fixed:
+
+**`cudnn_conv_algo_search` defaults to EXHAUSTIVE**, which benchmarks every
+convolution algorithm the first time it meets a shape. It is now set to
+HEURISTIC, which picks from cuDNN's own table. On a model this small — 30k
+parameters, mostly 1x9 row convolutions — there is little for an exhaustive
+search to find that a heuristic misses.
+
+**Bring-up happened on the render thread.** The runtime was created lazily on
+the first render, so the first visible frame paid for provider start-up, session
+creation *and* the first inference. It now starts on a background thread from
+the effect's constructor, and does a throwaway 128x128 inference there, so all
+of it overlaps with the user wiring the node up. No extra synchronisation was
+needed: the function-local static already blocks a render that arrives early.
 
 ## Why the arithmetic is not written twice
 

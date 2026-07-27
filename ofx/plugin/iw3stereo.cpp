@@ -25,6 +25,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #define kPluginName "iw3 Stereo"
@@ -76,6 +77,9 @@ inline float* rowPointer(OFX::Image* image, int y)
 
 }  // namespace
 
+// Defined below, next to the runtime singleton it starts.
+static void startRuntimeBringUp();
+
 ////////////////////////////////////////////////////////////////////////////////
 
 class Iw3StereoEffect : public OFX::ImageEffect
@@ -104,6 +108,8 @@ public:
         _stereoWidth = fetchIntParam("stereoWidth");
         _depthRange = fetchChoiceParam("depthRange");
         _output = fetchChoiceParam("output");
+
+        startRuntimeBringUp();
     }
 
     virtual void render(const OFX::RenderArguments& args) override;
@@ -166,6 +172,24 @@ static iw3::OrtRuntime& sharedRuntime()
         return runtime;
     }();
     return *instance;
+}
+
+// Bring the runtime up as soon as a node exists, rather than on the first
+// render. Provider start-up, session creation and the warm-up run together
+// cost a few hundred milliseconds; spending them while the user is still
+// wiring the node up means the first visible frame does not.
+//
+// No extra synchronisation is needed: sharedRuntime()'s function-local static
+// already blocks any later caller until the initializer finishes, so a render
+// that arrives early simply waits.
+//
+// The thread is leaked rather than joined. A std::thread destructor on a
+// joinable thread calls terminate(), and joining at process exit is the same
+// shutdown deadlock this plugin avoids with the runtime itself.
+static void startRuntimeBringUp()
+{
+    static std::thread* thread = new std::thread([]() { sharedRuntime(); });
+    (void)thread;
 }
 
 iw3::Settings Iw3StereoEffect::readSettings(double time) const

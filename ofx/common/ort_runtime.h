@@ -75,6 +75,10 @@ private:
     bool failed(OrtStatus* status, const char* what);
     void releaseBoundOutputs();
 
+    // One throwaway inference, so the first real frame does not pay for
+    // loading cuDNN's kernels and choosing algorithms.
+    void warmUp();
+
     HMODULE _library = nullptr;
     const OrtApi* _api = nullptr;
     OrtEnv* _env = nullptr;

@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <sstream>
+#include <vector>
 
 namespace iw3
 {
@@ -118,9 +119,16 @@ bool OrtRuntime::open(const std::wstring& directory, const std::wstring& modelPa
         {
             // TF32 is on by default and costs three orders of magnitude of
             // accuracy on this model for well under a millisecond.
-            const char* keys[] = {"device_id", "use_tf32"};
-            const char* values[] = {"0", "0"};
-            failed(_api->UpdateCUDAProviderOptions(cudaOptions, keys, values, 2),
+            //
+            // cudnn_conv_algo_search defaults to EXHAUSTIVE, which benchmarks
+            // every convolution algorithm the first time it meets a shape. That
+            // was most of the 450 ms the first frame used to cost. HEURISTIC
+            // picks from cuDNN's own table instead; on a model this small --
+            // 30k parameters, mostly 1x9 row convolutions -- there is little
+            // for an exhaustive search to find.
+            const char* keys[] = {"device_id", "use_tf32", "cudnn_conv_algo_search"};
+            const char* values[] = {"0", "0", "HEURISTIC"};
+            failed(_api->UpdateCUDAProviderOptions(cudaOptions, keys, values, 3),
                    "UpdateCUDAProviderOptions");
             if (!failed(_api->SessionOptionsAppendExecutionProvider_CUDA_V2(options, cudaOptions),
                         "SessionOptionsAppendExecutionProvider_CUDA_V2"))
@@ -207,7 +215,42 @@ bool OrtRuntime::open(const std::wstring& directory, const std::wstring& modelPa
             _cudaMemoryInfo = nullptr;
         }
     }
+
+    warmUp();
     return true;
+}
+
+void OrtRuntime::warmUp()
+{
+    if (!_session)
+    {
+        return;
+    }
+
+    // The first Run of a session pays for loading cuDNN and cuBLAS kernel
+    // modules and picking algorithms. Spending it here, off the render thread,
+    // is the whole point -- open() is called from a background thread while the
+    // user is still wiring the node up.
+    //
+    // The shape does not have to match the real frame. Most of the cost is
+    // per-session rather than per-shape, and what remains is per-shape only
+    // through cuDNN's algorithm cache, which HEURISTIC keeps cheap.
+    constexpr int kSize = 128;
+    constexpr size_t kElements = size_t(kSize) * kSize * 3;
+    const int64_t shape[4] = {1, 3, kSize, kSize};
+
+    std::vector<float> image(kElements, 0.5f);
+    std::vector<float> x(kElements, 0.5f);
+    std::vector<float> left(kElements);
+    std::vector<float> right(kElements);
+
+    const auto started = std::chrono::steady_clock::now();
+    const bool ok = run(image.data(), shape, x.data(), shape,
+                        1.0f / float(kSize / 2 - 1),
+                        left.data(), right.data(), kElements);
+    const double ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - started).count();
+    note("warm-up run: " + std::to_string(ms) + " ms" + (ok ? "" : " (FAILED)"));
 }
 
 void OrtRuntime::releaseBoundOutputs()
