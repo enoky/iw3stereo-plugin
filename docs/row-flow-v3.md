@@ -89,12 +89,31 @@ otherwise pass just as happily if something had wired v2 into both.
 in the bundle and each gets its own session, built once during the background
 start-up.
 
+## Speed: v3 is the faster of the two
+
+Measured in Resolve at 1920x800 with depth at 938x392, from the plugin's log:
+
+| | inference | total | session | warm-up |
+| --- | --- | --- | --- | --- |
+| row_flow_v2 | 5.34 - 5.43 ms | 6.35 - 6.49 ms | 63.4 ms | 217.9 ms |
+| **row_flow_v3** | **4.74 - 4.84 ms** | **4.95 - 5.05 ms** | 56.2 ms | 85.8 ms |
+
+This was predicted the wrong way round, on the reasoning that v3 has four times
+the parameters. Parameter count is not the work: v3 pixel-unshuffles by (1, 8)
+before its attention blocks, so they run on a grid eight times narrower, while
+v2 applies 1x9 convolutions across 32 channels at the full depth resolution.
+
+The second warm-up costs 86 ms against the first's 218 ms, which confirms most
+of that cost is one-time CUDA module loading shared across sessions rather than
+anything per-model. Adding a second model to the bundle is close to free at
+start-up.
+
+Caveat: a handful of sampled frames each, not a benchmark. The two are close
+enough that the choice should be made on how the picture looks.
+
 ## Not done
 
 **`row_flow_v3_sym`.** It sets `symmetric=True`, which iw3 routes through
 `apply_divergence_nn_symmetric` — one delta warped in both directions rather
 than two runs of a mirrored network. That is a different pipeline, not a
 different checkpoint.
-
-**Speed.** The plugin logs which model each frame used, but v3 has not been
-timed against v2 in Resolve. Expect it to be slower; by how much is unmeasured.
