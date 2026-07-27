@@ -133,22 +133,32 @@ supports multiple resolutions, and Resolve's OFX host reports that it does not
 the plugin asked for a double-width output and Resolve declined, which the
 specification entitles it to do.
 
-Fusion's own nodes have no such limit, so build it there instead:
+Fusion has stereo tools of its own with no such limit, so build it there:
 
-  1. Add a Background node, set to your full output size -- 3840 x 1080 for
-     1920 x 1080 source footage.
-
-  2. Add two iw3 Stereo nodes fed from the same source and depth. Set one to
+  1. Add two iw3 Stereo nodes fed from the same Source and Depth. Set one to
      Output: Left eye and the other to Output: Right eye.
 
-  3. Merge each over the Background, using the Merge's Center to place them:
-     X = 0.25 for the left eye, X = 0.75 for the right.
+  2. Add a Combiner. Connect the left-eye node to Image1 and the right-eye
+     node to Image2. This makes a single stereo image.
 
-  4. Feed the result to MediaOut.
+  3. Add an Anaglyph node after it and switch on Horizontal Stack. Despite the
+     name, that is what writes the two views side by side at full width.
+
+  4. Feed it to MediaOut.
 
 Each eye stays at its native resolution, which is what Full SBS is for. The
 Half SBS option squeezes both into one frame instead, and is the right choice
 when your delivery expects that.
+
+Every setting on the two iw3 Stereo nodes must match except Output, or the eyes
+will not correspond. Rather than change both by hand each time, it is worth
+adding a controller: a Background node parked off to the side with user controls
+for divergence, convergence and the rest, and both iw3 nodes linked to it by
+simple expressions such as
+
+    iw3Control.Divergence
+
+Then one panel drives both, and the two cannot drift apart.
 
 
 ABOUT STEREO WIDTH
