@@ -44,7 +44,17 @@ Two honest caveats on those numbers:
 
 ### The first frame
 
-It used to cost **~450 ms**. Two things caused that, and both are fixed:
+It used to cost **447.92 ms**. It now costs **31.27 ms** — the same single frame
+at about 32 fps, which nobody notices. Steady state is unchanged, so nothing was
+traded for it.
+
+| | before | after |
+| --- | --- | --- |
+| warm-up, on a background thread | — | 217.38 ms |
+| first visible frame | 221.35 / 447.92 ms | 22.71 / **31.27 ms** |
+| steady state | 4.95 - 5.38 ms | 5.02 - 5.38 ms |
+
+Two things caused the original cost, and both are fixed:
 
 **`cudnn_conv_algo_search` defaults to EXHAUSTIVE**, which benchmarks every
 convolution algorithm the first time it meets a shape. It is now set to
@@ -58,6 +68,16 @@ creation *and* the first inference. It now starts on a background thread from
 the effect's constructor, and does a throwaway 128x128 inference there, so all
 of it overlaps with the user wiring the node up. No extra synchronisation was
 needed: the function-local static already blocks a render that arrives early.
+
+**What the numbers then showed.** The warm-up still takes 217 ms even under
+HEURISTIC, and the first real frame still costs 22.7 ms against 5 ms steady. So
+the split is roughly 217 ms of shape-independent kernel-module loading, which
+the warm-up now absorbs entirely, and ~18 ms of per-shape cuDNN work at the real
+938x392, which it cannot: the warm-up runs at 128x128 and the plugin has no way
+to know the frame size before its first render.
+
+Warming at a guessed set of common resolutions would trade certain waste for an
+uncertain 18 ms on one frame. Not worth it, and left alone deliberately.
 
 ## Why the arithmetic is not written twice
 
