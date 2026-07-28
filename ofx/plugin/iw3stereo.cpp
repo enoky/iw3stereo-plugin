@@ -670,6 +670,25 @@ bool Iw3StereoEffect::renderCuda(const OFX::RenderArguments& args, const iw3::Se
                 return false;
             }
             _video.markHeld(windowIndex, fingerprint);
+
+            // buildVideoWindow packs each of the twelve frames through _gpu in
+            // turn, so it leaves the last one there rather than the one being
+            // rendered. Everything below composites against the current frame's
+            // eye and mask, so the current frame has to go back.
+            //
+            // Without this the frame that builds a window -- one in every six --
+            // came out composited against slot eleven's warp, which is a glitch
+            // at a steady interval and was reported as exactly that.
+            _gpu.packSource(static_cast<const float*>(src->getPixelData()), sourcePitch,
+                            components, window.x1 - srcBounds.x1, window.y1 - srcBounds.y1,
+                            srcBounds.x2 - srcBounds.x1, srcBounds.y2 - srcBounds.y1, stream);
+            _gpu.packDepth(static_cast<const float*>(depth->getPixelData()), depthPitch,
+                           componentCount(depth->getPixelComponents()),
+                           window.x1 - depthBounds.x1, window.y1 - depthBounds.y1,
+                           depthBounds.x2 - depthBounds.x1, depthBounds.y2 - depthBounds.y1,
+                           settings.undoVideoRange, settings.depthInverted,
+                           mapper.params(), stream);
+            _gpu.resizeDepth(stream);
         }
 
         // The offset within the window's kept frames. The window starts kPad
