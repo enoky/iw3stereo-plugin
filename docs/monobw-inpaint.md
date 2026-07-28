@@ -235,12 +235,59 @@ it.
 
 ## Two things to get right
 
-**Only the image inpaint model fits Resolve.** There is also
-`light_video_inpaint_v1`, which `MonoBWInpaintVideo` drives through a frame
-queue with `pre_padding` and `post_padding`. Resolve renders frames out of
-order, with gaps and repeats — measured in `docs/phase0-findings.md` — so a
-temporal queue is a poor fit. `light_inpaint_v1` is per-frame and is the right
-target.
+**The image inpaint model flickers, and the video one is not ruled out.** This
+document used to say only the image model fits Resolve, on the grounds that
+`MonoBWInpaintVideo` drives `light_video_inpaint_v1` through a frame queue and
+Resolve renders with gaps and repeats. The second half of that is measured and
+still true; the conclusion drawn from it was too broad. It rules out iw3's
+*stateful queue*, which accumulates frames as they arrive and assumes they are
+consecutive. It does not rule out a stateless window that asks for the frames it
+wants.
+
+`light_inpaint_v1` has no temporal path at all, so every frame's fill is
+invented independently and the filled regions flicker. That is visible on real
+footage and it is the model's nature, not a bug in the port.
+
+**Resolve does give a plugin other frames.** Probed rather than assumed, with
+`ofx/probe/iw3temporal.cpp`, because the host also *advertises* things this
+project has caught it not delivering:
+
+```
+getFramesNeeded: CALLED, t=3152.000 range=[3146.000, 3158.000]
+render t=3152.000: fetched 8/8, 7 differ from t+0
+```
+
+8 of 8 offsets from t-6 to t+6 returned an image, in scrubbing and in playback.
+And they are the *right* frames, not merely different ones: the fingerprint
+45.898847 comes back as t-3 of frame 2225, t-5 of 2227 and t-6 of 2228 — all
+three of which are frame 2222. Correctly indexed from three different render
+times.
+
+Measured cost of the video model at HD, per eye, 2.31M parameters against the
+image model's 2.26M:
+
+| | |
+| --- | --- |
+| one 12-frame call | 178.3 ms |
+| amortised over all 12 outputs | **14.9 ms/frame** |
+| amortised over the middle 6 only | 29.7 ms/frame |
+| peak VRAM | 3.1 GB |
+
+Against the image model's 11.8 ms/eye, keeping all twelve outputs makes the
+temporal model **about a quarter more expensive per frame**, because the work
+amortises over the whole window. That is far cheaper than it looks from the
+178 ms, and it depends entirely on caching the window's outputs by frame number
+— which is what `docs/phase0-findings.md` already says any cache here must do.
+
+The twelve is not negotiable: `enc2.1` and `enc2.3` carry `proj_spatial`
+weights of shape `(12, 12, 1)`, a convolution over the frame axis, so the count
+is baked into the checkpoint.
+
+Two things the probe did not answer, and both should be settled before the port
+rather than during it: whether temporal fetch still works with **CUDA render
+enabled** (the probe deliberately stays on the host path so it can checksum
+pixels), and whether the **depth clip** can be fetched at other times too, which
+it must be — the probe used a single-input filter context.
 
 **The offset convention.** `LightInpaintV1` has `i2i_offset = 16`, so its
 `forward()` crops 16 pixels from each side; 256x448 in gives 224x416 out.
@@ -385,9 +432,21 @@ anyway.
 
 ## What is left
 
-Running it in Resolve. Everything here is checked against Python, but no test
-in this repo can drive an OFX host, so whether the node actually appears with
-three models and produces a picture is unverified until someone opens Resolve.
+It runs in Resolve. The first attempt failed on every frame with "GPU inpaint
+failed" and nothing else, which turned out to be an ONNX Runtime IO binding
+holding the output buffer it allocated for the 128x128 warm-up and refusing
+every differently-shaped run after it. `docs/` does not need to carry that; the
+commit does. Two things worth keeping: the warp path had the same latent bug
+and would have hit it on any resolution change, and there is now a
+`test_inpaint_ort.exe` that runs the production path without an OFX host, which
+is what found it.
 
-Still open, and now the only thing in the way: whether the occlusion quality is
-worth 6.7x at HD and render-only at 4K. That is a judgement on footage.
+What is left is temporal consistency. The image model flickers, the video model
+is the fix, the host will supply the frames, and the cost is about a quarter
+more per frame if the window's outputs are cached. The port is four pieces:
+`LightVideoInpaintV1` to standalone PyTorch at diff 0 (it brings `GMLP3DBlock`
+and `WindowGMLP3d` with it), an ONNX export at a fixed batch of twelve, a frame
+cache keyed by frame number, and `getFramesNeeded` in the plugin.
+
+Still open: whether the occlusion quality is worth the cost at all. That is a
+judgement on footage, and it is now answerable — the node works.

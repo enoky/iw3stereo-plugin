@@ -79,6 +79,11 @@ set(IW3_COMMON "${CMAKE_CURRENT_SOURCE_DIR}/common")
 ofx_bundle(iw3probe probe/iw3probe.cpp)
 target_include_directories(iw3probe PRIVATE "${IW3_COMMON}")
 
+# Asks whether Resolve hands a plugin frames other than the current one, which
+# is what light_video_inpaint_v1 would need. Instrumentation, not product.
+ofx_bundle(iw3temporal probe/iw3temporal.cpp)
+target_include_directories(iw3temporal PRIVATE "${IW3_COMMON}")
+
 # --- the ONNX Runtime probe --------------------------------------------------
 # There is deliberately no import library and no target_link_libraries for ONNX
 # Runtime: Resolve ships its own onnxruntime.dll (1.13, CPU-only) in the

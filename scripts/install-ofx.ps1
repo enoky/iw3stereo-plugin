@@ -17,7 +17,7 @@ param(
     [switch]$IncludeProbes
 )
 
-$ProbeBundles = @('iw3probe.ofx.bundle', 'iw3ort.ofx.bundle')
+$ProbeBundles = @('iw3probe.ofx.bundle', 'iw3ort.ofx.bundle', 'iw3temporal.ofx.bundle')
 
 $ErrorActionPreference = 'Stop'
 
