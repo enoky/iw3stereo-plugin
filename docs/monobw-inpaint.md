@@ -451,6 +451,69 @@ it, so the eye that has to survive a second inference is the one that gets
 copied on the way out — which is the left, because mirroring it back is a copy
 anyway.
 
+## The twelve-frame window does not fit in fp32
+
+The export succeeded first time at every size, within 1.1e-06. Then it ran at
+HD and took **twenty seconds a window**, with free VRAM at 0.0 GB.
+
+Not arithmetic: profiling put the nodes at 645 ms on CUDA and 1.3 ms on CPU. The
+other twenty-two seconds were allocation. Scaling was clean at ~205 ms/MP up to
+0.5 MP and collapsed at 1.99 MP.
+
+Things tried, in order, none of which fixed it:
+
+| | HD, 12 frames |
+| --- | --- |
+| as exported | 104 s |
+| `enable_mem_pattern = False` | 20 s |
+| + `arena_extend_strategy = kSameAsRequested` | 20 s |
+| + spatial chunking of the temporal blocks | 20 s |
+
+The spatial chunking is worth keeping anyway — it is exact (difference 0 on the
+CPU; the 1e-03 seen on CUDA is different matmul shapes picking different
+kernels) and it makes sub-HD faster. It is off by default so the golden test
+still sees iw3's arithmetic. But it does not address the problem: my reasoning
+about where the memory went was wrong, and the temporal blocks were not the
+dominant consumer.
+
+**How iw3 avoids all of this: it does not have to.** Its only structural measure
+is `micro_batch_size=2`, which chunks the 2D blocks along the frame axis and is
+already in the port, plus an `inpaint_max_width` control that defaults to *off*.
+PyTorch's allocator frees intermediates as refcounts drop and peaks at 3.1 GiB
+for the window ONNX Runtime cannot fit in 17.
+
+## fp16, which is what iw3 runs anyway
+
+The demand is simply twelve times one frame's, and one frame already uses a
+meaningful fraction of the card. Halving it fits:
+
+| | fp32 | fp16 |
+| --- | --- | --- |
+| video, HD, 12 frames | ~20,000 ms | **234 ms** |
+| video, per frame | 1670 ms | **19.5 ms** |
+| free VRAM | 0.0 GB | **6.7 GB** |
+| image, per eye at HD | 35.4 ms | **18.3 ms** |
+
+Accuracy against the fp32 PyTorch reference is max 2.4e-03, mean 9.1e-05, on an
+output in 0..1 — far below anything visible, in a region the model is inventing.
+And fp16 is what iw3 itself runs these models at: its inference path is under
+`torch.autocast` throughout. The fp32 graph was the anomaly.
+
+So the temporal model in fp16 costs about what the image model costs, and does
+not flicker. `models/light_video_inpaint_v1.onnx` is exported in half precision
+because it is the only form that works; the image graph is still fp32 and
+halving it is part of the plugin work, since the plugin's buffers are fp32 and
+feeding a half graph needs a cast either side.
+
+## A correction to the cost figures above
+
+The 6.7x and the 26 ms both eyes quoted earlier came from benchmarking PyTorch
+under `torch.autocast`, which is fp16, against an ONNX path that is fp32. Not
+like for like. Measured properly, per eye at HD: PyTorch fp16 12.0 ms, PyTorch
+fp32 23.1 ms, **ONNX fp32 35.4 ms** — so `monobw_inpaint` in the plugin costs
+about **71 ms a frame**, roughly 15x `row_flow_v3` rather than 6.7x. In fp16 it
+would be about 37 ms.
+
 ## What is left
 
 It runs in Resolve. The first attempt failed on every frame with "GPU inpaint
@@ -472,7 +535,7 @@ The port is five pieces:
 | | |
 | --- | --- |
 | ~~`LightVideoInpaintV1` to standalone PyTorch at diff 0~~ | **done** — six cases at difference 0, in `stereo_inpaint.py` beside the image model |
-| ~~ONNX export at a fixed batch of twelve~~ | **done** — first attempt, every size within 1.1e-06; `models/light_video_inpaint_v1.onnx`, 10.4 MiB |
+| ~~ONNX export at a fixed batch of twelve~~ | **done**, and in fp16 — see below |
 | `getFramesNeeded` plus per-frame fetch of both clips | measured to work |
 | a frame cache keyed by frame number | what makes it 14.9 ms rather than 178 ms, and what Phase 0 already required |
 | edge clamping on the window | the offsets before the first frame come back null |

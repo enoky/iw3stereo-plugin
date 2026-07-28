@@ -570,7 +570,12 @@ class LightInpaintV1(nn.Module):
         if closing:
             mask = _mask_closing(mask)
         else:
-            mask = mask.float()
+            # iw3 writes mask.float() here, meaning "make this bool numeric".
+            # Following the input's dtype says the same thing and is identical
+            # for an fp32 model, but it also lets the whole graph be exported in
+            # half precision -- a hard-coded .float() puts an fp32 tensor into
+            # an otherwise fp16 network and the first convolution refuses it.
+            mask = mask.to(x.dtype)
 
         mask = _dilate_inner(mask, n_iter=inner_dilation, base_width=base_width)
         mask = _dilate_outer(mask, n_iter=outer_dilation, base_width=base_width)
@@ -839,7 +844,12 @@ class LightVideoInpaintV1(nn.Module):
         if closing:
             mask = _mask_closing(mask)
         else:
-            mask = mask.float()
+            # iw3 writes mask.float() here, meaning "make this bool numeric".
+            # Following the input's dtype says the same thing and is identical
+            # for an fp32 model, but it also lets the whole graph be exported in
+            # half precision -- a hard-coded .float() puts an fp32 tensor into
+            # an otherwise fp16 network and the first convolution refuses it.
+            mask = mask.to(x.dtype)
 
         mask = _dilate_inner(mask, n_iter=inner_dilation, base_width=base_width)
         mask = _dilate_outer(mask, n_iter=outer_dilation, base_width=base_width)

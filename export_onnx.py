@@ -297,13 +297,27 @@ def export_light_video_inpaint_v1(model, path):
     twelve frames pads by repeating the first and last, which is what
     ``LightVideoInpaintV1.infer`` does and what a window running off the end of
     a clip needs anyway.
+
+    **Exported in half precision, and that is not an optimisation.** In fp32 the
+    twelve-frame window does not fit: ONNX Runtime exhausts all 17 GiB at HD and
+    thrashes, taking twenty seconds a window. The demand is simply twelve times
+    one frame's, and one frame already uses a meaningful fraction of the card.
+    Halving it fits with 6.7 GiB to spare and the same window takes 234 ms.
+
+    PyTorch survives the fp32 shapes only because its allocator frees eagerly --
+    3.1 GiB peak against ONNX Runtime's 17. Spatial chunking of the temporal
+    blocks and every ONNX Runtime memory option were tried first and none of
+    them fit; ``docs/monobw-inpaint.md`` records the measurements.
+
+    fp16 is also what iw3 itself runs these models at: its whole inference path
+    is under ``torch.autocast``. The fp32 graph was the anomaly, not this.
     """
-    graph = LightVideoInpaintGraph(model).eval()
+    graph = LightVideoInpaintGraph(model.half()).eval()
     generator = torch.Generator().manual_seed(0)
     coarse = torch.rand((stereo_inpaint.SEQ_LEN, 3, 12, 20), generator=generator)
     eyes = F.interpolate(coarse, size=(256, 448), mode="bilinear",
-                         align_corners=False).clamp(0, 1)
-    masks = torch.zeros((stereo_inpaint.SEQ_LEN, 1, 256, 448))
+                         align_corners=False).clamp(0, 1).half()
+    masks = torch.zeros((stereo_inpaint.SEQ_LEN, 1, 256, 448), dtype=torch.float16)
     masks[:, :, 64:128, 112:150] = 1.0
 
     height = torch.export.Dim("height", min=64, max=8192)

@@ -189,7 +189,17 @@ class VideoInpaintOnnxTest(unittest.TestCase):
     Its batch is fixed at twelve rather than dynamic, because the frame-axis
     convolution's weights are (12, 12, 1). So there is no batch axis to vary
     here and the shape tests are all about height and width.
+
+    It is also a half-precision graph, which is the only form that fits: in
+    fp32 the twelve-frame window exhausts 17 GiB at HD. The bar here is
+    therefore fp16's, not the 2e-5 the image graph is held to -- measured at
+    max 2.4e-03 against the fp32 reference, mean 9.1e-05, on an output in 0..1.
+    That is far below anything visible in a region the model is inventing
+    anyway, and fp16 is what iw3 runs these models at in the first place.
     """
+
+    # fp16 round-off against an fp32 reference, not a port error.
+    TOLERANCE = 5e-3
 
     GRAPH = os.path.join(MODELS_DIR, "light_video_inpaint_v1.onnx")
     CHECKPOINT = os.path.join(
@@ -218,7 +228,8 @@ class VideoInpaintOnnxTest(unittest.TestCase):
         return eyes, masks
 
     def run_graph(self, eyes, masks):
-        return self.session.run(["y"], {"eyes": eyes.numpy(), "masks": masks.numpy()})[0]
+        return self.session.run(["y"], {"eyes": eyes.numpy().astype(np.float16),
+                                        "masks": masks.numpy().astype(np.float16)})[0]
 
     def assert_close(self, height, width, seed=0):
         eyes, masks = self.make_window(height, width, seed)
@@ -226,8 +237,8 @@ class VideoInpaintOnnxTest(unittest.TestCase):
         with torch.inference_mode():
             want = self.model.infer(eyes, masks).numpy()
         self.assertEqual(want.shape, got.shape, f"{height}x{width}")
-        diff = np.abs(want - got).max()
-        self.assertLess(diff, TOLERANCE, f"{height}x{width}: max abs diff {diff:.3e}")
+        diff = np.abs(want - got.astype(np.float32)).max()
+        self.assertLess(diff, self.TOLERANCE, f"{height}x{width}: max abs diff {diff:.3e}")
 
     def test_shapes(self):
         for height, width in ((256, 448), (392, 938), (260, 452), (128, 192), (100, 200)):
@@ -255,7 +266,7 @@ class VideoInpaintOnnxTest(unittest.TestCase):
 
         self.assertEqual(np.abs(eyes[6].numpy() - altered[6].numpy()).max(), 0.0,
                          "the frame under test must be unchanged")
-        moved = np.abs(before[6] - after[6]).max()
+        moved = np.abs(before[6].astype(np.float32) - after[6].astype(np.float32)).max()
         self.assertGreater(moved, 1e-3,
                            f"frame 6 moved by only {moved} when its neighbours changed; "
                            "did the temporal axis survive the export?")
