@@ -141,10 +141,25 @@ add_custom_command(TARGET iw3stereo POST_BUILD
 
 # --- the numeric core's test, built as a plain executable --------------------
 add_executable(test_pipeline ../tests/cpp/test_pipeline.cpp plugin/stereo_pipeline.cpp)
-target_include_directories(test_pipeline PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/plugin")
+target_include_directories(test_pipeline PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/plugin"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../tests/cpp")
 set_target_properties(test_pipeline PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
     RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/tests")
+
+# The MonoBW kernels against the same reference data. The kernels share
+# monobw_math.h with the CPU, so this checks the wiring the header cannot.
+if(IW3_HAS_CUDA)
+    add_executable(test_monobw_gpu ../tests/cpp/test_monobw_gpu.cu plugin/monobw_gpu.cu)
+    target_include_directories(test_monobw_gpu PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/plugin"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../tests/cpp")
+    set_target_properties(test_monobw_gpu PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/tests"
+        CUDA_SEPARABLE_COMPILATION OFF)
+endif()
 
 # `cmake --install` copies the bundles next to Resolve's other OFX plugins.
 install(DIRECTORY "${CMAKE_BINARY_DIR}/bundles/" DESTINATION "${OFX_PLUGIN_DIR}")

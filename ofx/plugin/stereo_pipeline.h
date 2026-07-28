@@ -139,4 +139,43 @@ float deltaScale(int depthWidth);
 // coefficients, so a grey pair stays grey; that is the property the test checks.
 void duboisAnaglyph(const float* left, const float* right, size_t pixels, float* out);
 
+// --- monobw ------------------------------------------------------------------
+//
+// The forward-warp-and-fill pipeline's first half, from iw3's sbs.monobw. The
+// arithmetic is in monobw_math.h and shared with the CUDA kernels; this is the
+// CPU driver around it, and the one tests/cpp/test_pipeline.cpp can run.
+//
+//     stereo_inpaint.py  MonoBW.compute_backward_grid -> monobwGrid
+//     stereo_inpaint.py  MonoBW.forward               -> monobwForward
+
+// The sampling grid at the *depth's* resolution.
+//
+// `gridX` comes back as depthWidth * depthHeight. `gridY` is only depthHeight
+// long: it is the same linear ramp in every column, and bilinear interpolation
+// of a row-constant plane along x returns that value exactly, so carrying the
+// full plane would be a large buffer holding one number per row.
+//
+// `imageWidth` is the colour frame's, not the depth's -- preserve_screen_border
+// derives its ramp from the frame and then scales it back down.
+void monobwGrid(const float* depth, int depthWidth, int depthHeight,
+                double divergence, double convergence,
+                bool preserveScreenBorder, int imageWidth,
+                std::vector<float>& gridX, std::vector<float>& gridY);
+
+// The whole of MonoBW.forward: warped eye and hole mask, both at the frame's
+// resolution. `image` is three planes of width * height.
+//
+// `fixScreenBorderMask` is iw3's: 0 leaves the mask alone, 1 clears the
+// uninpaintable side, 2 clears both. It only applies when preserve_screen_border
+// is off, because with the parallax tapered there is no border stretch to
+// suppress. The image model uses 1.
+//
+// `mask` comes back as 0.0/1.0 floats rather than bytes so it can go straight
+// into the morphology, which is arithmetic on floats.
+void monobwForward(const float* image, int width, int height,
+                   const float* depth, int depthWidth, int depthHeight,
+                   double divergence, double convergence,
+                   bool preserveScreenBorder, int fixScreenBorderMask,
+                   std::vector<float>& eye, std::vector<float>& mask);
+
 }  // namespace iw3

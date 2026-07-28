@@ -22,6 +22,7 @@ builds it into a tool creators already use.
 | `tests/` | Golden test against stock iw3 at diff 0, and ONNX against PyTorch. |
 | `ofx/` | CMake build for OFX plugins, against the OpenFX SDK Resolve ships. |
 | `ofx/plugin/` | **The plugin.** `iw3stereo.cpp` is the OFX glue, `stereo_pipeline.cpp` the CPU core, `stereo_gpu.cu` the kernels, `numeric_math.h` the arithmetic both share. |
+| `ofx/plugin/monobw_*` | MonoBW's forward warp: `monobw_math.h` shared, `monobw_gpu.cu` the kernels. Built, not yet wired in. |
 | `ofx/common/` | ONNX Runtime loader (dynamic, never linked) and the log. |
 | `ofx/probe/` | Phase 0 probe plugins — instrumentation, not product. |
 | `tests/cpp/` | Checks the C++ numeric core against the Python implementation. |
@@ -61,11 +62,12 @@ matches that within **2e-4**; and the C++ numeric core matches the Python at
 
 `stereo_inpaint.py` is iw3's `monobw_inpaint` — forward warp, hole mask, then a
 2.26M-parameter inpaint network — matching stock iw3 at diff 0 across 22 cases,
-and costing about 6.7x the warp at HD. **Not in the plugin yet.** The network
-exports (`models/light_inpaint_v1.onnx`, within 2e-5); the warp cannot, because
-`cummax` and `searchsorted` have no ONNX operator, so it needs CUDA kernels like
-the rest of the arithmetic. `docs/monobw-inpaint.md` has the numbers and what is
-left.
+and costing about 6.7x the warp at HD. **Not wired into the plugin yet**, but
+the pieces are built: the network exports to ONNX within 2e-5, and the warp,
+which cannot (`cummax` and `searchsorted` have no ONNX operator), has CUDA
+kernels running at 0.172 ms an eye with a bit-exact hole mask. What is left is
+the mask morphology and the plugin's own plumbing; `docs/monobw-inpaint.md` has
+the numbers.
 
 Three constraints worth knowing before reading further, each with evidence in
 `docs/`:
@@ -107,6 +109,13 @@ reference data, then run the test:
 
 ```bash
 cd F:/_AI_PROJECTS_/resolve-iw3 && F:/_AI_PROJECTS_/nunif/venv/Scripts/python.exe tools/dump_pipeline_reference.py && ./ofx/build/tests/test_pipeline.exe tests/cpp/pipeline_reference.bin
+```
+
+The MonoBW CUDA kernels share their arithmetic with that CPU core, and run
+against the same reference data so the wiring is checked too:
+
+```bash
+cd F:/_AI_PROJECTS_/resolve-iw3 && ./ofx/build/tests/test_monobw_gpu.exe tests/cpp/pipeline_reference.bin
 ```
 
 ## Licence

@@ -1,5 +1,6 @@
 #include "stereo_pipeline.h"
 
+#include "monobw_math.h"
 #include "numeric_math.h"
 
 #include <algorithm>
@@ -257,6 +258,129 @@ void duboisAnaglyph(const float* left, const float* right, size_t pixels, float*
         out[i] = float(iw3::math::clamp01(r));
         out[pixels + i] = float(iw3::math::clamp01(g));
         out[2 * pixels + i] = float(iw3::math::clamp01(b));
+    }
+}
+
+void monobwGrid(const float* depth, int depthWidth, int depthHeight,
+                double divergence, double convergence,
+                bool preserveScreenBorder, int imageWidth,
+                std::vector<float>& gridX, std::vector<float>& gridY)
+{
+    gridX.resize(size_t(depthWidth) * size_t(depthHeight));
+    gridY.resize(size_t(depthHeight));
+
+    const float shiftPx = float(iw3::math::monobwShiftPx(divergence, depthWidth, depthHeight));
+    int borderPix = 0;
+    if (preserveScreenBorder)
+    {
+        borderPix = iw3::math::monobwBorderPix(divergence, imageWidth, depthWidth);
+        borderPix = std::min(borderPix, depthWidth);
+    }
+
+    // The same three stages the kernels run, in the same order and out of the
+    // same header.
+    std::vector<float> dest(size_t(depthWidth), 0.0f);
+    std::vector<float> moved(size_t(depthWidth), 0.0f);
+    std::vector<float> smoothed(size_t(depthWidth), 0.0f);
+    for (int y = 0; y < depthHeight; ++y)
+    {
+        const float* row = depth + size_t(y) * size_t(depthWidth);
+        iw3::math::monobwDestIndexRow(row, depthWidth, shiftPx, float(convergence), borderPix,
+                                      dest.data(), moved.data());
+        for (int x = 0; x < depthWidth; ++x)
+        {
+            smoothed[size_t(x)] = iw3::math::monobwSmoothAt(dest.data(), moved.data(),
+                                                            depthWidth, x);
+        }
+        float* out = gridX.data() + size_t(y) * size_t(depthWidth);
+        for (int x = 0; x < depthWidth; ++x)
+        {
+            out[x] = iw3::math::monobwInvertAt(smoothed.data(), depthWidth, x);
+        }
+    }
+
+    for (int y = 0; y < depthHeight; ++y)
+    {
+        gridY[size_t(y)] = iw3::math::linspaceAt(-1.0f, 1.0f, depthHeight, y);
+    }
+}
+
+void monobwForward(const float* image, int width, int height,
+                   const float* depth, int depthWidth, int depthHeight,
+                   double divergence, double convergence,
+                   bool preserveScreenBorder, int fixScreenBorderMask,
+                   std::vector<float>& eye, std::vector<float>& mask)
+{
+    std::vector<float> gridXSmall, gridYSmall;
+    monobwGrid(depth, depthWidth, depthHeight, divergence, convergence,
+               preserveScreenBorder, width, gridXSmall, gridYSmall);
+
+    const size_t pixels = size_t(width) * size_t(height);
+    eye.resize(pixels * 3);
+    mask.assign(pixels, 0.0f);
+
+    // The grid is lifted to the frame's resolution once. iw3 interpolates it
+    // twice -- its guard compares an int to a torch.Size and is always true, so
+    // the second call resizes to the size it already is. That was measured to
+    // be an exact no-op before it was dropped here.
+    std::vector<float> gridXFull(pixels);
+    for (int y = 0; y < height; ++y)
+    {
+        for (int x = 0; x < width; ++x)
+        {
+            gridXFull[size_t(y) * size_t(width) + size_t(x)] =
+                iw3::math::bilinearResizeAt(gridXSmall.data(), depthWidth, depthHeight,
+                                            width, height, x, y);
+        }
+    }
+    std::vector<float> gridYFull(size_t(height), 0.0f);
+    for (int y = 0; y < height; ++y)
+    {
+        // One column: the y grid is constant along x, and bilinear
+        // interpolation of equal taps returns the value exactly.
+        gridYFull[size_t(y)] = iw3::math::bilinearResizeAt(gridYSmall.data(), 1, depthHeight,
+                                                           1, height, 0, y);
+    }
+
+    for (int y = 0; y < height; ++y)
+    {
+        const float* gridRow = gridXFull.data() + size_t(y) * size_t(width);
+        const float gy = gridYFull[size_t(y)];
+        for (int x = 0; x < width; ++x)
+        {
+            const size_t index = size_t(y) * size_t(width) + size_t(x);
+            const float gx = gridRow[x];
+            for (int c = 0; c < 3; ++c)
+            {
+                eye[size_t(c) * pixels + index] =
+                    iw3::math::bilinearSampleBorder(image + size_t(c) * pixels,
+                                                    width, height, gx, gy);
+            }
+            mask[index] = iw3::math::monobwStretched(gridRow, width, x) ? 1.0f : 0.0f;
+        }
+    }
+
+    if (!preserveScreenBorder && fixScreenBorderMask > 0)
+    {
+        // The screen border stretches for a reason that is not an occlusion,
+        // and inpainting it makes it worse.
+        const int borderPix = std::min(
+            iw3::math::monobwMaskBorderPix(divergence, width, depthWidth), width);
+        for (int y = 0; y < height; ++y)
+        {
+            float* row = mask.data() + size_t(y) * size_t(width);
+            for (int x = 0; x < borderPix; ++x)
+            {
+                row[x] = 0.0f;
+            }
+            if (fixScreenBorderMask == 2)
+            {
+                for (int x = 0; x < borderPix; ++x)
+                {
+                    row[width - 1 - x] = 0.0f;
+                }
+            }
+        }
     }
 }
 

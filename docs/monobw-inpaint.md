@@ -1,13 +1,15 @@
 # monobw_inpaint + light_inpaint_v1
 
-Two stages done. **Standalone PyTorch**: `stereo_inpaint.py`, 22/22 at max
+Three stages done. **Standalone PyTorch**: `stereo_inpaint.py`, 22/22 at max
 absolute difference 0 against stock iw3. **ONNX**: the export blocker turned out
 to be one thing the port had already fixed, and `models/light_inpaint_v1.onnx`
-matches PyTorch within 2e-5 at every size tried.
+matches PyTorch within 2e-5 at every size tried. **CUDA**: the MonoBW kernels,
+matching the same Python reference the CPU core is held to, with a bit-exact
+hole mask, at 0.172 ms per eye at HD.
 
-What is left is CUDA and plugin plumbing. The warp half will not be a graph —
-its two defining operations have no ONNX operator — which settles the
-architecture rather than blocking it.
+What is left is the mask morphology and the plugin plumbing. The warp half will
+not be a graph — its two defining operations have no ONNX operator — which
+settles the architecture rather than blocking it.
 
 The cost also turned out to be about half what this document first predicted.
 
@@ -251,21 +253,80 @@ Also worth knowing: `_inpaint_single()` flips the left eye horizontally,
 inpaints, and flips back — the network is trained for one handedness only, the
 same trick `row_flow` uses.
 
-## What is left
+## The MonoBW kernels
 
-The ONNX half is done and the architecture is settled. What remains is CUDA and
-plumbing:
+Written, and covered by the same reference data as the CPU: `monobw_math.h` is
+the arithmetic, `stereo_pipeline.cpp` the CPU driver, `monobw_gpu.cu` the
+kernels. Both compile the one header, which is how `numeric_math.h` is already
+handled and for the same reason — a second transcription into `.cu` would be
+covered by nothing.
+
+There was no `grid_sample` kernel to reuse, contrary to what this document said
+before the work started. The warp's sampler is *inside* `stereo_warp.onnx`; the
+plugin's six kernels are packing, the depth resize, the input tensor and the
+compose. MonoBW cannot put its sampler in a graph, so `bilinearSampleBorder`
+and the align-corners resize are new.
+
+Correctness, against `stereo_inpaint.py` through `tools/dump_pipeline_reference.py`:
 
 | | |
 | --- | --- |
-| `MonoBW` kernels | the cummax scan, the searchsorted inverse, the gaussian smoothing of the index map, the grid build, the stretch mask |
+| CPU, warped eye | 1.6e-06 to 3.2e-06 over six geometries |
+| CPU, hole mask | **exact**, every pixel |
+| CUDA, warped eye | 1.6e-06 to 2.7e-06 |
+| CUDA, hole mask | **exact**, every pixel |
+
+The mask matters more than the eye here. It is a threshold on a difference, so
+it cannot be checked with a tolerance — a pixel is on the right side of the line
+or it is not — and it is what decides which pixels the inpaint model replaces.
+
+The grid itself is checked separately and holds to 5e-5, with one specific
+amplifier setting that bar: `interpolate_1d` divides by `(d1 - d0 + 1e-5)`, and
+where the index map is maximally stretched — inside a hole — that epsilon is the
+whole denominator, so a last-bit difference comes out multiplied by about 1e5.
+Narrow rows stay at 3.6e-7.
+
+## Splitting the scan, which was worth 11x
+
+The first version ran the whole row algorithm in one thread per row, on the
+reasoning that the scan is sequential and the rows are independent. That was
+correct and slow: **1.92 ms per eye** at HD.
+
+The measurement that explained it came from varying the two sizes separately,
+which is worth doing before optimising anything:
+
+| | per eye |
+| --- | --- |
+| 1920x1036 frame, 938x392 depth | 1.920 ms |
+| 384x216 frame, same depth | 1.847 ms |
+| same frame, 192x108 depth | 0.408 ms |
+
+Shrinking the frame 25x changed almost nothing; shrinking the depth 20x cut it
+by 4.7x, which is exactly the ratio of the row *lengths*. So the cost was not
+the per-pixel sampling and not the memory pattern — it was 392 threads failing
+to hide a scan of 938 dependent steps.
+
+Only the running maximum is actually sequential. The blur and the binary-search
+inversion read the previous stage's output and never their own, so they
+parallelise completely. Split into three stages — one thread per row for the
+scan, one thread per element for the other two — it is **0.172 ms per eye**,
+11x faster, with the mask still exact.
+
+The split is in the shared header, so the CPU driver runs the same three stages
+in the same order. It also reads better: each stage's inputs are now obviously
+the previous stage's outputs, which the fused version hid behind two in-place
+buffers and a comment about why they could not be fused.
+
+Both eyes now cost about 0.34 ms against the inpaint network's 23.6 ms. The warp
+is no longer worth optimising.
+
+## What is left
+
+| | |
+| --- | --- |
 | mask morphology kernels | `mask_closing` (four max-pool passes), `dilate_inner`, `dilate_outer` |
 | plugin | a Method parameter, a second branch in `stereo_pipeline.cpp`, a second ORT session, and the two dilation parameters |
 
-The warp's existing `grid_sample` kernel should carry over — MonoBW's sampling
-is the same bilinear-with-border-clamp the backward warp already does, only
-with a grid built a different way.
-
 Still open, and unchanged by any of this: whether the occlusion quality is worth
 6.7x at HD and render-only at 4K. That is a judgement on footage, and it is
-cheaper to make now than after the kernels are written.
+still cheaper to make before the plugin work than after.

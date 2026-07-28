@@ -8,68 +8,18 @@
 
 #include "stereo_pipeline.h"
 
+#include "reference_data.h"
+
 #include <cmath>
 #include <cstdio>
-#include <cstring>
-#include <fstream>
 #include <string>
 #include <vector>
 
 namespace
 {
 
-struct Case
-{
-    std::string name;
-    std::vector<int32_t> ints;
-    std::vector<float> inputs;
-    std::vector<float> outputs;
-};
-
-template <typename T>
-bool readVector(std::ifstream& stream, std::vector<T>& out)
-{
-    int32_t count = 0;
-    if (!stream.read(reinterpret_cast<char*>(&count), 4)) return false;
-    out.resize(size_t(count));
-    if (count > 0 && !stream.read(reinterpret_cast<char*>(out.data()), std::streamsize(count * sizeof(T))))
-    {
-        return false;
-    }
-    return true;
-}
-
-bool load(const std::string& path, std::vector<Case>& cases)
-{
-    std::ifstream stream(path, std::ios::binary);
-    if (!stream)
-    {
-        std::printf("cannot open %s\n", path.c_str());
-        return false;
-    }
-    char magic[4] = {};
-    stream.read(magic, 4);
-    if (std::memcmp(magic, "IW3P", 4) != 0)
-    {
-        std::printf("bad magic in %s\n", path.c_str());
-        return false;
-    }
-    int32_t count = 0;
-    stream.read(reinterpret_cast<char*>(&count), 4);
-    for (int32_t i = 0; i < count; ++i)
-    {
-        Case entry;
-        int32_t nameLength = 0;
-        stream.read(reinterpret_cast<char*>(&nameLength), 4);
-        entry.name.resize(size_t(nameLength));
-        stream.read(entry.name.data(), nameLength);
-        if (!readVector(stream, entry.ints)) return false;
-        if (!readVector(stream, entry.inputs)) return false;
-        if (!readVector(stream, entry.outputs)) return false;
-        cases.push_back(std::move(entry));
-    }
-    return true;
-}
+using iw3test::Case;
+using iw3test::load;
 
 int failures = 0;
 int checks = 0;
@@ -225,6 +175,79 @@ int main(int argc, char** argv)
             else
             {
                 std::printf("  ok   %-44s grey stays grey (%.1e)\n", "dubois_grey", worst);
+            }
+        }
+        else if (entry.name.rfind("monobw_grid_", 0) == 0)
+        {
+            const int depthWidth = entry.ints[0], depthHeight = entry.ints[1];
+            const int imageWidth = entry.ints[2];
+            const bool border = entry.ints[3] != 0;
+            const double divergence = double(entry.ints[4]) / 1000.0;
+            const double convergence = double(entry.ints[5]) / 1000.0;
+
+            std::vector<float> gridX, gridY;
+            iw3::monobwGrid(entry.inputs.data(), depthWidth, depthHeight,
+                            divergence, convergence, border, imageWidth, gridX, gridY);
+            // 5e-5 in normalised coordinates is 2.3e-2 of a pixel at this
+            // width, and the bar is set by one specific amplifier rather than
+            // by general float32 drift.
+            //
+            // interpolate_1d divides by (d1 - d0 + 1e-5). Where the index map
+            // is maximally stretched -- which is to say inside a hole -- d1 and
+            // d0 are nearly equal and that epsilon is the whole denominator, so
+            // a last-bit difference in d0 comes out multiplied by about 1e5.
+            // Narrow rows stay at 3.6e-7; 938 wide at divergence 10, which is
+            // the most stretching any sane setting produces, reaches 1.8e-5.
+            //
+            // It lands where the pixels are about to be replaced by the inpaint
+            // model, and the mask check below is exact, which is the property
+            // that would actually be visible if this drifted.
+            expectClose(entry.name, gridX, entry.outputs, 5e-5);
+        }
+        else if (entry.name.rfind("monobw_forward_", 0) == 0)
+        {
+            const int width = entry.ints[0], height = entry.ints[1];
+            const int depthWidth = entry.ints[2], depthHeight = entry.ints[3];
+            const bool border = entry.ints[4] != 0;
+            const int fixMask = entry.ints[5];
+            const double divergence = double(entry.ints[6]) / 1000.0;
+            const double convergence = double(entry.ints[7]) / 1000.0;
+
+            const size_t pixels = size_t(width) * size_t(height);
+            const float* image = entry.inputs.data();
+            const float* depth = entry.inputs.data() + pixels * 3;
+
+            std::vector<float> eye, mask;
+            iw3::monobwForward(image, width, height, depth, depthWidth, depthHeight,
+                               divergence, convergence, border, fixMask, eye, mask);
+
+            std::vector<float> wantEye(entry.outputs.begin(),
+                                       entry.outputs.begin() + ptrdiff_t(pixels * 3));
+            std::vector<float> wantMask(entry.outputs.begin() + ptrdiff_t(pixels * 3),
+                                        entry.outputs.end());
+            expectClose(entry.name + "/eye", eye, wantEye, 1e-5);
+
+            // The mask is a threshold on a difference, so it cannot be compared
+            // with a tolerance: a pixel either matches or it is on the wrong
+            // side of the line. Count disagreements instead.
+            ++checks;
+            size_t wrong = 0;
+            for (size_t i = 0; i < mask.size() && i < wantMask.size(); ++i)
+            {
+                if (mask[i] != wantMask[i]) ++wrong;
+            }
+            if (mask.size() != wantMask.size() || wrong != 0)
+            {
+                std::printf("  FAIL %-44s %zu of %zu mask pixels differ\n",
+                            (entry.name + "/mask").c_str(), wrong, wantMask.size());
+                ++failures;
+            }
+            else
+            {
+                size_t set = 0;
+                for (float value : wantMask) if (value != 0.0f) ++set;
+                std::printf("  ok   %-44s %zu of %zu mask pixels, exact\n",
+                            (entry.name + "/mask").c_str(), set, wantMask.size());
             }
         }
         else
