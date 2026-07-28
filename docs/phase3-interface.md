@@ -43,9 +43,13 @@ the plugin — a 960x384 file arrives as 1920x800.
 
 | Parameter | Type | Range | Default | Meaning |
 | --- | --- | --- | --- | --- |
-| **Model** | choice | row_flow_v2 / row_flow_v3 / monobw_inpaint | **row_flow_v2** | Which pipeline runs. All three graphs ship in the bundle and each gets its own ONNX Runtime session, built once at start-up. |
+| **Model** | choice | row_flow_v2 / row_flow_v3 / monobw_inpaint / monobw_inpaint_video | **row_flow_v2** | Which pipeline runs. All four graphs ship in the bundle and each gets its own ONNX Runtime session, built once at start-up. |
 
-The first two are the same backward warp with a different network. **monobw_inpaint
+The first two are the same backward warp with a different network.
+**monobw_inpaint_video** is monobw_inpaint with a temporal model: it sees twelve
+frames at once, so the fills stop flickering. It asks the host for the frames
+either side of the one being rendered, keeps a window's worth of results, and
+costs about twice what monobw_inpaint does. **monobw_inpaint
 is a different pipeline**: it warps forwards, finds the holes that opens, and
 fills them with a 2.26M-parameter network rather than smearing an edge into
 them. Better at occlusions, about seven times slower at HD, and **NVIDIA only** —

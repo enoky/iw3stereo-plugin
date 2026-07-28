@@ -528,11 +528,22 @@ The port is five pieces:
 
 | | |
 | --- | --- |
-| ~~`LightVideoInpaintV1` to standalone PyTorch at diff 0~~ | **done** — six cases at difference 0, in `stereo_inpaint.py` beside the image model |
-| ~~ONNX export at a fixed batch of twelve~~ | **done**, and in fp16 — see below |
-| `getFramesNeeded` plus per-frame fetch of both clips | measured to work |
-| a frame cache keyed by frame number | what makes it 14.9 ms rather than 178 ms, and what Phase 0 already required |
-| edge clamping on the window | the offsets before the first frame come back null |
+| ~~`LightVideoInpaintV1` to standalone PyTorch at diff 0~~ | **done** — six cases at difference 0 |
+| ~~ONNX export at a fixed batch of twelve~~ | **done**, in fp16 |
+| ~~`getFramesNeeded` plus per-frame fetch of both clips~~ | **done** |
+| ~~a frame cache keyed by frame number~~ | **done** — six frames a window, keyed by window index and a settings fingerprint |
+| ~~edge clamping on the window~~ | **done** — repeat the nearest frame, which is what iw3's padding does |
+
+All of it builds and is staged. **None of it has run in Resolve**, which is the
+only thing left.
+
+The window is derived from the frame number alone — `frame / 6` picks it — so
+Resolve's gaps and repeats all land on the same window and the cache is hit
+whatever order frames arrive in. Six of the twelve outputs are kept, matching
+iw3's three-either-side padding: consecutive output frames then come from window
+positions 3 to 8, which weight their neighbours similarly. Keeping all twelve
+would halve the cost and make every twelfth frame jump from position 11 to
+position 0, trading per-frame flicker for a periodic one.
 
 Still open: whether the occlusion quality is worth the cost at all. That is a
 judgement on footage, and it is now answerable — the node works.

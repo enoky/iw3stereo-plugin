@@ -51,7 +51,11 @@ enum class Method
 {
     RowFlowV2,
     RowFlowV3,
-    MonoBwInpaint
+    MonoBwInpaint,
+    // The same pipeline with the temporal inpaint model. The image one has no
+    // temporal path at all, so each frame's fill is invented independently and
+    // the filled regions crawl; this one mixes along a twelve-frame axis.
+    MonoBwInpaintVideo
 };
 
 struct Settings

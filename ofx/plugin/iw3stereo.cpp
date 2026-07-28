@@ -23,6 +23,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -152,6 +154,7 @@ private:
     iw3::DepthResizer _resizer;
     iw3::GpuPipeline _gpu;
     iw3::MonoBwGpu _monobw;
+    iw3::MonoBwVideoGpu _video;
     std::string _lastMessage;
     unsigned _frameCounter = 0;
 
@@ -160,6 +163,19 @@ private:
     bool renderCuda(const OFX::RenderArguments& args, const iw3::Settings& settings,
                     OFX::Image* dst, OFX::Image* src, OFX::Image* depth,
                     int components, const OfxRectI& window);
+
+    // Warp twelve frames and run the temporal graph over them, filling the
+    // cache. Only called when the cache does not already hold this window.
+    bool buildVideoWindow(const OFX::RenderArguments& args, const iw3::Settings& settings,
+                          long long firstFrame, const OfxRectI& window, int depthWidth,
+                          int depthHeight, void* stream);
+
+public:
+    // The frames this output frame needs. Declaring the range is the documented
+    // way to ask a host for other frames, and Resolve honours it -- probed in
+    // ofx/probe/iw3temporal.cpp, for both clips and with CUDA render on.
+    virtual void getFramesNeeded(const OFX::FramesNeededArguments& args,
+                                 OFX::FramesNeededSetter& frames) override;
 };
 
 // One session for the process. Bring-up costs 60-240 ms for the CUDA provider
@@ -181,7 +197,8 @@ static iw3::OrtRuntime& sharedRuntime()
         const std::vector<std::wstring> graphs = {
             directory + L"\\stereo_warp.onnx",        // 0: row_flow_v2
             directory + L"\\stereo_warp_v3.onnx",     // 1: row_flow_v3
-            directory + L"\\light_inpaint_v1.onnx",   // 2: monobw_inpaint
+            directory + L"\\light_inpaint_v1.onnx",         // 2: monobw_inpaint
+            directory + L"\\light_video_inpaint_v1.onnx",   // 3: monobw_inpaint_video
         };
         const bool ok = runtime->open(directory + L"\\ort", graphs, true);
         probe::logf("---- iw3 Stereo: ONNX Runtime bring-up (%s) ----", ok ? "OK" : "FAILED");
@@ -245,8 +262,9 @@ iw3::Settings Iw3StereoEffect::readSettings(double time) const
     _modelChoice->getValueAtTime(time, choice);
     settings.method = choice == 1 ? iw3::Method::RowFlowV3
                     : choice == 2 ? iw3::Method::MonoBwInpaint
+                    : choice == 3 ? iw3::Method::MonoBwInpaintVideo
                                   : iw3::Method::RowFlowV2;
-    settings.model = size_t(choice == 1 ? 1 : choice == 2 ? 2 : 0);
+    settings.model = size_t(choice >= 1 && choice <= 3 ? choice : 0);
     _maskInnerDilation->getValueAtTime(time, settings.maskInnerDilation);
     _maskOuterDilation->getValueAtTime(time, settings.maskOuterDilation);
     _output->getValueAtTime(time, choice);
@@ -355,6 +373,163 @@ void Iw3StereoEffect::passthroughHost(OFX::Image* dst, OFX::Image* src, const Of
 //
 // Returns false without touching the output if the GPU path is unavailable, so
 // the caller can fall through to the CPU implementation.
+namespace
+{
+
+// A stand-in for "have any of the settings that affect the picture changed".
+// The window cache holds twelve frames' worth of work, so it has to be dropped
+// when any of them moves, and comparing a fingerprint is cheaper and less
+// error-prone than comparing the struct field by field.
+unsigned long long settingsFingerprint(const iw3::Settings& settings, int width, int height)
+{
+    unsigned long long hash = 1469598103934665603ull;
+    const auto mix = [&hash](unsigned long long value)
+    {
+        hash ^= value;
+        hash *= 1099511628211ull;
+    };
+    const auto mixDouble = [&mix](double value)
+    {
+        unsigned long long bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        mix(bits);
+    };
+    mixDouble(settings.divergence);
+    mixDouble(settings.convergence);
+    mixDouble(settings.foregroundScale);
+    mix(unsigned(settings.preserveScreenBorder));
+    mix(unsigned(settings.depthInverted));
+    mix(unsigned(settings.undoVideoRange));
+    mix(unsigned(settings.mapperType == iw3::MapperType::Shift));
+    mix(unsigned(settings.stereoWidth));
+    mix(unsigned(settings.maskInnerDilation));
+    mix(unsigned(settings.maskOuterDilation));
+    mix(unsigned(width));
+    mix(unsigned(height));
+    return hash;
+}
+
+}  // namespace
+
+void Iw3StereoEffect::getFramesNeeded(const OFX::FramesNeededArguments& args,
+                                      OFX::FramesNeededSetter& frames)
+{
+    const iw3::Settings settings = readSettings(args.time);
+    if (settings.method != iw3::Method::MonoBwInpaintVideo)
+    {
+        return;  // the default is the current frame, which is all the rest need
+    }
+
+    const long long frame = (long long)std::llround(args.time);
+    const long long first = iw3::MonoBwVideoGpu::windowFirstFrame(frame);
+    OfxRangeD range;
+    range.min = double(first);
+    range.max = double(first + iw3::MonoBwVideoGpu::kSequence - 1);
+
+    // Both clips: the temporal model needs twelve frames of depth as much as
+    // twelve of colour, and the probe confirmed Resolve supplies both.
+    if (_srcClip)
+    {
+        frames.setFramesNeeded(*_srcClip, range);
+    }
+    if (_depthClip && _depthClip->isConnected())
+    {
+        frames.setFramesNeeded(*_depthClip, range);
+    }
+}
+
+bool Iw3StereoEffect::buildVideoWindow(const OFX::RenderArguments& args,
+                                       const iw3::Settings& settings,
+                                       long long firstFrame, const OfxRectI& window,
+                                       int depthWidth, int depthHeight, void* stream)
+{
+    iw3::OrtRuntime& ort = sharedRuntime();
+    const int width = window.x2 - window.x1;
+    const int height = window.y2 - window.y1;
+    const iw3::Mapper mapper(settings.foregroundScale, settings.mapperType);
+    const int64_t shape[4] = {iw3::MonoBwVideoGpu::kSequence, 3, height, width};
+
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        const bool rightEye = pass == 1;
+
+        for (int slot = 0; slot < iw3::MonoBwVideoGpu::kSequence; ++slot)
+        {
+            // Clip boundaries: a window centred near the start or end runs off
+            // the material, and the probe showed those fetches come back null.
+            // Repeating the nearest frame is what iw3's own padding does.
+            std::unique_ptr<OFX::Image> frameSrc;
+            std::unique_ptr<OFX::Image> frameDepth;
+            for (int back = 0; back <= slot && !frameSrc; ++back)
+            {
+                const double time = double(firstFrame + slot - back);
+                frameSrc.reset(_srcClip->fetchImage(time));
+                if (frameSrc && _depthClip && _depthClip->isConnected())
+                {
+                    frameDepth.reset(_depthClip->fetchImage(time));
+                    if (!frameDepth)
+                    {
+                        frameSrc.reset();
+                    }
+                }
+            }
+            if (!frameSrc || !frameDepth)
+            {
+                report("Could not fetch the frames the temporal model needs.", true);
+                return false;
+            }
+
+            const OfxRectI& srcBounds = frameSrc->getBounds();
+            const OfxRectI& depthBounds = frameDepth->getBounds();
+            _gpu.packSource(static_cast<const float*>(frameSrc->getPixelData()),
+                            size_t(frameSrc->getRowBytes()) / sizeof(float),
+                            componentCount(frameSrc->getPixelComponents()),
+                            window.x1 - srcBounds.x1, window.y1 - srcBounds.y1,
+                            srcBounds.x2 - srcBounds.x1, srcBounds.y2 - srcBounds.y1, stream);
+            _gpu.packDepth(static_cast<const float*>(frameDepth->getPixelData()),
+                           size_t(frameDepth->getRowBytes()) / sizeof(float),
+                           componentCount(frameDepth->getPixelComponents()),
+                           window.x1 - depthBounds.x1, window.y1 - depthBounds.y1,
+                           depthBounds.x2 - depthBounds.x1, depthBounds.y2 - depthBounds.y1,
+                           settings.undoVideoRange, settings.depthInverted,
+                           mapper.params(), stream);
+            _gpu.resizeDepth(stream);
+
+            if (!_monobw.prepareEye(_gpu.imageDevice(), _gpu.depthDevice(), rightEye,
+                                    settings.divergence, settings.convergence,
+                                    settings.preserveScreenBorder,
+                                    settings.maskInnerDilation, settings.maskOuterDilation,
+                                    depthWidth, stream))
+            {
+                report("monobw warp failed: " + _monobw.error(), true);
+                return false;
+            }
+            _monobw.castEyeAndMaskToHalf(stream);
+            _video.storeFrame(slot, _monobw.inpaintEyeHalfDevice(),
+                              _monobw.processedMaskHalfDevice(), stream);
+        }
+
+        if (cudaStreamSynchronize(static_cast<cudaStream_t>(stream)) != cudaSuccess)
+        {
+            report("CUDA stream sync failed -- falling back to the CPU.", true);
+            return false;
+        }
+
+        const float* filled = nullptr;
+        if (!ort.runInpaintDevice(3, reinterpret_cast<const float*>(_video.eyesDevice()),
+                                  reinterpret_cast<const float*>(_video.masksDevice()),
+                                  shape, &filled))
+        {
+            logRuntimeReport("video inpaint inference");
+            report("GPU temporal inpaint failed; see the log.", true);
+            return false;
+        }
+        _video.cacheOutput(rightEye, filled, stream);
+    }
+
+    return _video.ok();
+}
+
 bool Iw3StereoEffect::renderCuda(const OFX::RenderArguments& args, const iw3::Settings& settings,
                                  OFX::Image* dst, OFX::Image* src, OFX::Image* depth,
                                  int components, const OfxRectI& window)
@@ -410,7 +585,8 @@ bool Iw3StereoEffect::renderCuda(const OFX::RenderArguments& args, const iw3::Se
                    depthBounds.x2 - depthBounds.x1, depthBounds.y2 - depthBounds.y1,
                    settings.undoVideoRange, settings.depthInverted, mapper.params(), stream);
     _gpu.resizeDepth(stream);
-    if (settings.method != iw3::Method::MonoBwInpaint)
+    if (settings.method != iw3::Method::MonoBwInpaint &&
+        settings.method != iw3::Method::MonoBwInpaintVideo)
     {
         // monobw takes the depth directly; the three-channel input tensor with
         // its divergence and convergence planes is the row_flow contract.
@@ -434,7 +610,49 @@ bool Iw3StereoEffect::renderCuda(const OFX::RenderArguments& args, const iw3::Se
     const float* right = nullptr;
     const size_t model = std::min(settings.model, ort.modelCount() - 1);
 
-    if (settings.method == iw3::Method::MonoBwInpaint)
+    if (settings.method == iw3::Method::MonoBwInpaintVideo)
+    {
+        if (model != settings.model || ort.outputCount(model) != 1)
+        {
+            logRuntimeReport("video inpaint graph");
+            report("The temporal inpaint graph did not load; see the log.", true);
+            return false;
+        }
+        if (!_monobw.prepare(width, height, depthWidth, depthHeight) ||
+            !_video.prepare(width, height))
+        {
+            report("GPU setup failed: " + _monobw.error() + _video.error(), true);
+            return false;
+        }
+
+        // Which window this frame belongs to is derived from the frame number
+        // alone, so Resolve's gaps and repeats all land on the same window and
+        // the cache is hit whatever order frames arrive in.
+        const long long frame = (long long)std::llround(args.time);
+        const long long windowIndex = iw3::MonoBwVideoGpu::windowIndex(frame);
+        const long long firstFrame = iw3::MonoBwVideoGpu::windowFirstFrame(frame);
+        const unsigned long long fingerprint = settingsFingerprint(settings, width, height);
+
+        if (!_video.holds(windowIndex, fingerprint))
+        {
+            _video.invalidate();
+            if (!buildVideoWindow(args, settings, firstFrame, window,
+                                  depthWidth, depthHeight, stream))
+            {
+                return false;
+            }
+            _video.markHeld(windowIndex, fingerprint);
+        }
+
+        // The offset within the window's kept frames. The window starts kPad
+        // before the first frame it emits, so this is simply the position
+        // within the stride.
+        const int offset = int(frame - windowIndex * iw3::MonoBwVideoGpu::kStride);
+        // The left eye was inpainted mirrored, so it comes back mirrored.
+        left = _video.cachedEye(false, offset, true, stream);
+        right = _video.cachedEye(true, offset, false, stream);
+    }
+    else if (settings.method == iw3::Method::MonoBwInpaint)
     {
         if (model != settings.model || ort.outputCount(model) != 1)
         {
@@ -625,14 +843,15 @@ void Iw3StereoEffect::render(const OFX::RenderArguments& args)
         return;
     }
 
-    if (settings.method == iw3::Method::MonoBwInpaint)
+    if (settings.method == iw3::Method::MonoBwInpaint ||
+        settings.method == iw3::Method::MonoBwInpaintVideo)
     {
         // Deliberately GPU-only. The CPU path below implements the backward
         // warp, not this pipeline, and the missing half is a 2.26M-parameter
         // network at full frame resolution -- on CPU ONNX Runtime that is
         // seconds a frame, which is not a fallback anyone would choose over
         // switching the Model parameter back.
-        report("The monobw_inpaint model needs the GPU render path (NVIDIA, "
+        report("The monobw_inpaint models need the GPU render path (NVIDIA, "
                "and Fusion's GPU processing enabled). Pick row_flow_v2 or "
                "row_flow_v3 for the CPU.", true);
         passSourceThrough(args, dst.get(), src.get(), window, components);
@@ -894,10 +1113,14 @@ void Iw3StereoFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OFX::
                    "row_flow_v3 is a windowed-attention model, roughly four times the parameters. "
                    "monobw_inpaint is a different pipeline: it warps forwards, finds the holes "
                    "that opens, and fills them with a network instead of smearing an edge into "
-                   "them. Better at occlusions, about seven times slower, and NVIDIA only.");
+                   "them. Better at occlusions, several times slower, and NVIDIA only. "
+                   "monobw_inpaint_video is the same pipeline with a temporal model that sees "
+                   "twelve frames at once, so the fills stop flickering; it costs about twice "
+                   "as much again and needs frames either side of the one being rendered.");
     model->appendOption("row_flow_v2");
     model->appendOption("row_flow_v3");
     model->appendOption("monobw_inpaint");
+    model->appendOption("monobw_inpaint_video");
     model->setDefault(0);
     page->addChild(*model);
 

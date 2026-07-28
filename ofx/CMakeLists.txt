@@ -123,6 +123,9 @@ function(stage_runtime TARGET)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${CMAKE_CURRENT_SOURCE_DIR}/../models/light_inpaint_v1.onnx"
                 "${BUNDLE}/light_inpaint_v1.onnx"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_CURRENT_SOURCE_DIR}/../models/light_video_inpaint_v1.onnx"
+                "${BUNDLE}/light_video_inpaint_v1.onnx"
         COMMENT "Staging ONNX Runtime and the models into the ${TARGET} bundle")
 endfunction()
 

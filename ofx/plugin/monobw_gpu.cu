@@ -449,4 +449,146 @@ const float* MonoBwGpu::finishEye(const float* filled, bool rightEye, void* stre
     return _final;
 }
 
+
+
+// ---------------------------------------------------------------------------
+// MonoBwVideoGpu
+
+namespace
+{
+
+// Widen one frame of a half sequence into float, optionally mirroring it back
+// into frame orientation on the way. The mirror is the same one prepareEye
+// applied on the way in, undone: only the left eye needs it.
+__global__ void widenFrameKernel(const __half* __restrict__ source, int width, int height,
+                                 int mirror, float* __restrict__ destination)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    const size_t pixels = size_t(width) * size_t(height);
+    const size_t from = size_t(y) * size_t(width) + size_t(x);
+    const size_t to = size_t(y) * size_t(width) + size_t(mirror ? (width - 1 - x) : x);
+    for (int plane = 0; plane < 3; ++plane)
+    {
+        destination[size_t(plane) * pixels + to] =
+            __half2float(source[size_t(plane) * pixels + from]);
+    }
+}
+
+}  // namespace
+
+MonoBwVideoGpu::~MonoBwVideoGpu()
+{
+    for (void* pointer : {_eyes, _masks, _cache[0], _cache[1]})
+    {
+        if (pointer) cudaFree(pointer);
+    }
+    if (_scratch) cudaFree(_scratch);
+    if (_mirror) cudaFree(_mirror);
+}
+
+bool MonoBwVideoGpu::allocate(void** pointer, size_t bytes, size_t& held)
+{
+    if (held >= bytes && *pointer)
+    {
+        return true;
+    }
+    if (*pointer)
+    {
+        cudaFree(*pointer);
+        *pointer = nullptr;
+    }
+    const cudaError_t status = cudaMalloc(pointer, bytes);
+    if (status != cudaSuccess)
+    {
+        _error = std::string("cudaMalloc failed: ") + cudaGetErrorString(status);
+        held = 0;
+        return false;
+    }
+    held = bytes;
+    return true;
+}
+
+long long MonoBwVideoGpu::windowIndex(long long frame)
+{
+    // Floor division, so negative frame numbers land in the window below rather
+    // than being truncated towards zero into the one above.
+    return (frame >= 0) ? (frame / kStride)
+                        : -(((-frame) + kStride - 1) / kStride);
+}
+
+long long MonoBwVideoGpu::windowFirstFrame(long long frame)
+{
+    return windowIndex(frame) * kStride - kPad;
+}
+
+bool MonoBwVideoGpu::prepare(int width, int height)
+{
+    _error.clear();
+    if (width != _width || height != _height)
+    {
+        _valid = false;
+    }
+    _width = width;
+    _height = height;
+
+    const size_t pixels = size_t(width) * size_t(height);
+    const size_t half = sizeof(unsigned short);
+
+    if (!allocate(&_eyes, pixels * 3 * kSequence * half, _eyesHeld)) return false;
+    if (!allocate(&_masks, pixels * kSequence * half, _masksHeld)) return false;
+    for (int eye = 0; eye < 2; ++eye)
+    {
+        if (!allocate(&_cache[eye], pixels * 3 * kStride * half, _cacheHeld[eye])) return false;
+    }
+    if (!allocate(reinterpret_cast<void**>(&_scratch), pixels * 3 * sizeof(float), _scratchHeld))
+        return false;
+    if (!allocate(reinterpret_cast<void**>(&_mirror), pixels * 3 * sizeof(float), _mirrorHeld))
+        return false;
+
+    return _error.empty();
+}
+
+void MonoBwVideoGpu::storeFrame(int index, const void* eyeHalf, const void* maskHalf, void* stream)
+{
+    const size_t pixels = size_t(_width) * size_t(_height);
+    const size_t half = sizeof(unsigned short);
+    cudaStream_t cudaStream = static_cast<cudaStream_t>(stream);
+
+    cudaMemcpyAsync(static_cast<char*>(_eyes) + size_t(index) * pixels * 3 * half,
+                    eyeHalf, pixels * 3 * half, cudaMemcpyDeviceToDevice, cudaStream);
+    cudaMemcpyAsync(static_cast<char*>(_masks) + size_t(index) * pixels * half,
+                    maskHalf, pixels * half, cudaMemcpyDeviceToDevice, cudaStream);
+}
+
+void MonoBwVideoGpu::cacheOutput(bool rightEye, const void* filledHalf, void* stream)
+{
+    // Only the middle kStride frames are kept; the padding at each end exists
+    // to give those frames neighbours, not to be used itself.
+    const size_t pixels = size_t(_width) * size_t(_height);
+    const size_t half = sizeof(unsigned short);
+    const size_t frameBytes = pixels * 3 * half;
+
+    cudaMemcpyAsync(_cache[rightEye ? 1 : 0],
+                    static_cast<const char*>(filledHalf) + size_t(kPad) * frameBytes,
+                    frameBytes * kStride, cudaMemcpyDeviceToDevice,
+                    static_cast<cudaStream_t>(stream));
+}
+
+const float* MonoBwVideoGpu::cachedEye(bool rightEye, int offset, bool mirrorBack, void* stream)
+{
+    const size_t pixels = size_t(_width) * size_t(_height);
+    const size_t half = sizeof(unsigned short);
+    const __half* frame = reinterpret_cast<const __half*>(
+        static_cast<const char*>(_cache[rightEye ? 1 : 0]) + size_t(offset) * pixels * 3 * half);
+
+    float* destination = mirrorBack ? _mirror : _scratch;
+    widenFrameKernel<<<grid2d(_width, _height), dim3(kBlock, kBlock), 0,
+                       static_cast<cudaStream_t>(stream)>>>(
+        frame, _width, _height, mirrorBack ? 1 : 0, destination);
+    return destination;
+}
+
 }  // namespace iw3

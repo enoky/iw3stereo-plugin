@@ -138,4 +138,89 @@ private:
     std::string _error;
 };
 
+// The twelve-frame window for light_video_inpaint_v1: the sequence buffers the
+// graph reads, and the cache of finished frames that makes it affordable.
+//
+// The graph costs 234 ms a call at HD and produces twelve frames, so the whole
+// economics of the temporal model rest on keeping what it produced. Phase 0
+// measured Resolve rendering in order but with gaps and repeats, so the cache
+// is keyed by frame number and the window each frame belongs to is derived from
+// the frame number alone -- any render order hits the same window.
+class MonoBwVideoGpu
+{
+public:
+    // Baked into the checkpoint: enc2.1 and enc2.3 convolve the frame axis with
+    // (12, 12, 1) weights, so the window is twelve and not a preference.
+    static constexpr int kSequence = 12;
+    // How many of the twelve are kept. iw3 pads three at each end and emits the
+    // middle six, and the reason to copy that is continuity: consecutive output
+    // frames then come from window positions 3..8, which weight their
+    // neighbours similarly. Emitting all twelve would halve the cost and make
+    // every twelfth frame jump from position 11 to position 0, trading
+    // per-frame flicker for a periodic one.
+    static constexpr int kStride = 6;
+    static constexpr int kPad = (kSequence - kStride) / 2;
+
+    MonoBwVideoGpu() = default;
+    ~MonoBwVideoGpu();
+
+    MonoBwVideoGpu(const MonoBwVideoGpu&) = delete;
+    MonoBwVideoGpu& operator=(const MonoBwVideoGpu&) = delete;
+
+    bool prepare(int width, int height);
+
+    // Which window a frame belongs to, and which frame that window starts at.
+    static long long windowIndex(long long frame);
+    static long long windowFirstFrame(long long frame);
+
+    // True when the cache already holds this window under these settings.
+    bool holds(long long window, unsigned long long fingerprint) const
+    {
+        return _valid && _window == window && _fingerprint == fingerprint;
+    }
+    void markHeld(long long window, unsigned long long fingerprint)
+    {
+        _window = window;
+        _fingerprint = fingerprint;
+        _valid = true;
+    }
+    void invalidate() { _valid = false; }
+
+    // Half-precision sequence buffers, laid out (frame, plane, y, x), which is
+    // what the graph's (12, 3, H, W) input wants.
+    void* eyesDevice() const { return _eyes; }
+    void* masksDevice() const { return _masks; }
+
+    // Copy one prepared frame into slot `index` of the sequence.
+    void storeFrame(int index, const void* eyeHalf, const void* maskHalf, void* stream);
+
+    // Keep the middle `kStride` frames of the graph's output for one eye.
+    void cacheOutput(bool rightEye, const void* filledHalf, void* stream);
+    // A cached frame in frame orientation, ready for compose(). `offset` is
+    // 0..kStride-1 within the window.
+    const float* cachedEye(bool rightEye, int offset, bool mirrorBack, void* stream);
+
+    bool ok() const { return _error.empty(); }
+    const std::string& error() const { return _error; }
+
+private:
+    bool allocate(void** pointer, size_t bytes, size_t& held);
+
+    int _width = 0, _height = 0;
+    void* _eyes = nullptr;    // kSequence * 3 * width * height, __half
+    void* _masks = nullptr;   // kSequence * width * height, __half
+    void* _cache[2] = {nullptr, nullptr};  // [eye] kStride * 3 * w * h, __half
+    float* _scratch = nullptr;             // one frame widened, and mirrored
+    float* _mirror = nullptr;
+
+    size_t _eyesHeld = 0, _masksHeld = 0, _cacheHeld[2] = {0, 0};
+    size_t _scratchHeld = 0, _mirrorHeld = 0;
+
+    long long _window = -1;
+    unsigned long long _fingerprint = 0;
+    bool _valid = false;
+
+    std::string _error;
+};
+
 }  // namespace iw3

@@ -78,8 +78,17 @@ PARAMETERS
                       much: about 26 ms a frame at HD against 4 ms, and 4K is
                       render-only.
 
-                      It needs the GPU path -- NVIDIA, with Fusion's GPU
-                      processing on. On the CPU it declines and passes the
+                      monobw_inpaint_video is the same pipeline with a model
+                      that sees twelve frames at once instead of one. The
+                      per-frame model invents each fill independently, so the
+                      filled regions crawl from frame to frame; this one does
+                      not. It asks Resolve for the frames either side of the
+                      one being rendered and keeps a window's worth of results,
+                      so it costs about twice what monobw_inpaint does rather
+                      than twelve times.
+
+                      Both need the GPU path -- NVIDIA, with Fusion's GPU
+                      processing on. On the CPU they decline and pass the
                       source through with a message.
 
   Mask Inner          monobw_inpaint only. Grows the hole mask towards the
