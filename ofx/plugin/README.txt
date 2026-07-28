@@ -109,8 +109,9 @@ PARAMETERS
                       means the same thing whatever resolution you render at.
                       Both do nothing when another Model is selected.
 
-  Inpaint Max        Caps the width the inpaint network runs at. 0 uses the
-  Width              frame's own width.
+  Inpaint Max        Caps the width the inpaint network runs at: Full, 1920,
+  Width              1280, 960 or 720. Full is the frame's own width, which on
+                     a 4K timeline is not the same as picking 1920.
 
                       This is the setting to reach for if you run out of VRAM.
                       The network's memory scales with area: at HD the temporal

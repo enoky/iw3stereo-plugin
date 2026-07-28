@@ -115,7 +115,7 @@ public:
         _modelChoice = fetchChoiceParam("model");
         _maskInnerDilation = fetchIntParam("maskInnerDilation");
         _maskOuterDilation = fetchIntParam("maskOuterDilation");
-        _inpaintMaxWidth = fetchIntParam("inpaintMaxWidth");
+        _inpaintMaxWidth = fetchChoiceParam("inpaintMaxWidth");
 
         startRuntimeBringUp();
     }
@@ -150,7 +150,7 @@ private:
     OFX::ChoiceParam* _modelChoice = nullptr;
     OFX::IntParam* _maskInnerDilation = nullptr;
     OFX::IntParam* _maskOuterDilation = nullptr;
-    OFX::IntParam* _inpaintMaxWidth = nullptr;
+    OFX::ChoiceParam* _inpaintMaxWidth = nullptr;
 
     // Reused across frames; resized only when the frame size changes.
     std::vector<float> _image, _depthFull, _depthSmall, _x, _left, _right, _composed;
@@ -274,7 +274,15 @@ iw3::Settings Iw3StereoEffect::readSettings(double time) const
     settings.model = size_t(choice >= 1 && choice <= 3 ? choice : 0);
     _maskInnerDilation->getValueAtTime(time, settings.maskInnerDilation);
     _maskOuterDilation->getValueAtTime(time, settings.maskOuterDilation);
-    _inpaintMaxWidth->getValueAtTime(time, settings.inpaintMaxWidth);
+    _inpaintMaxWidth->getValueAtTime(time, choice);
+    // Index order is the saved meaning, so Full stays at 0 and new widths go on
+    // the end. 0 as a width means "the frame's own", which is not the same as
+    // 1920: on a 4K timeline 1920 is a real reduction.
+    settings.inpaintMaxWidth = choice == 1 ? 1920
+                             : choice == 2 ? 1280
+                             : choice == 3 ? 960
+                             : choice == 4 ? 720
+                                           : 0;
     _output->getValueAtTime(time, choice);
     settings.output = choice == 1 ? iw3::OutputMode::LeftEye
                     : choice == 2 ? iw3::OutputMode::RightEye
@@ -1214,16 +1222,19 @@ void Iw3StereoFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OFX::
     outerDilation->setDefault(0);
     page->addChild(*outerDilation);
 
-    OFX::IntParamDescriptor* inpaintWidth = desc.defineIntParam("inpaintMaxWidth");
+    OFX::ChoiceParamDescriptor* inpaintWidth = desc.defineChoiceParam("inpaintMaxWidth");
     inpaintWidth->setLabels("Inpaint Max Width", "Inpaint Width", "Inpaint Max Width");
-    inpaintWidth->setHint("Both monobw models only. Caps the width the inpaint network runs at, "
-                          "0 for the frame's own. Its memory scales with area -- at HD the "
-                          "temporal model needs about 9 GB, 4.5 at 1280 wide and 3.4 at 960 -- "
-                          "so this is the setting that fits it on a smaller card. The output "
-                          "stays full resolution either way: only the invented pixels are "
-                          "computed small, and everything outside a hole keeps its own detail.");
-    inpaintWidth->setRange(0, 8192);
-    inpaintWidth->setDisplayRange(0, 3840);
+    inpaintWidth->setHint("Both monobw models only, and the setting to reach for if you run out "
+                          "of VRAM. The inpaint network's memory scales with area: at HD the "
+                          "temporal model wants about 9 GB, 4.5 at 1280 wide, 3.4 at 960. It "
+                          "gets faster in the same proportion. The output stays full resolution "
+                          "either way -- only the invented pixels are computed small, and "
+                          "everything outside a hole keeps its own detail.");
+    inpaintWidth->appendOption("Full", "The frame's own width");
+    inpaintWidth->appendOption("1920", "about 9 GB for the temporal model");
+    inpaintWidth->appendOption("1280", "about 4.5 GB");
+    inpaintWidth->appendOption("960", "about 3.4 GB");
+    inpaintWidth->appendOption("720", "the smallest offered");
     inpaintWidth->setDefault(0);
     page->addChild(*inpaintWidth);
 
