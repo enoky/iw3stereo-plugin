@@ -476,10 +476,32 @@ already in the port, plus an `inpaint_max_width` control that defaults to *off*.
 PyTorch's allocator frees intermediates as refcounts drop and peaks at 3.1 GiB
 for the window ONNX Runtime cannot fit in 17.
 
-## fp16, which is what iw3 runs anyway
+## fp16 and one session flag, neither of which is sufficient alone
 
 The demand is simply twelve times one frame's, and one frame already uses a
-meaningful fraction of the card. Halving it fits:
+meaningful fraction of the card. Halving it helps -- but only with memory
+pattern planning switched off, and that was measured with the flag already set
+without noticing it was doing the work:
+
+| twelve-frame window at HD, fp16 | time | VRAM |
+| --- | --- | --- |
+| ONNX Runtime defaults | 16.4 s | **15.71 GiB** |
+| `arena_extend_strategy = kSameAsRequested` | 16.4 s | 15.71 GiB |
+| **`enable_mem_pattern = false`** | 0.32 s | 10.08 GiB |
+| that plus the temporal blocks chunked | 0.24 s | **9.01 GiB** |
+
+So fp16 is necessary and not sufficient, and the flag is not a tuning knob. Its
+planner reserves from the first run's shapes and never gives it back, which for
+a graph with dynamic shapes and gigabyte intermediates is most of the card. The
+per-frame graph benefits too, 2.26 GiB down to 1.19 for four hundred
+microseconds an eye, and the warp graphs are left on the defaults because they
+are small and run at one shape per session.
+
+The spatial chunking earns its place here after all. It bought nothing in fp32,
+where the problem was too big for it to matter, and it is worth a gigabyte once
+the rest is in order.
+
+With all three:
 
 | | fp32 | fp16 |
 | --- | --- | --- |

@@ -105,7 +105,12 @@ int main(int argc, char** argv)
         models + L"\\light_inpaint_v1.onnx",
         models + L"\\light_video_inpaint_v1.onnx",
     };
-    const bool opened = ort.open(runtimeDir + L"\\ort", graphs, true);
+    // The same per-graph session options the plugin uses. Without them the
+    // twelve-frame graph takes 15.7 GiB and sixteen seconds instead of 9.0 and
+    // a quarter of a second, and a reproduction that does not reproduce the
+    // configuration is not one.
+    const std::vector<bool> conserve = {false, false, true, true};
+    const bool opened = ort.open(runtimeDir + L"\\ort", graphs, true, conserve);
     dump(ort, "bring-up");
     if (!opened || ort.modelCount() < 4)
     {

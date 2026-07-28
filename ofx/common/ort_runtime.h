@@ -46,8 +46,13 @@ public:
     // Several models share one environment and one loaded library on purpose:
     // ORT expects a single OrtEnv per process, and the sessions are small next
     // to the provider's own start-up cost.
+    // `conserveMemory` marks, per model, the graphs whose sessions should be
+    // built to use as little VRAM as they can. It is not a tuning knob: with it
+    // off, the twelve-frame inpaint graph takes 15.7 GiB and sixteen seconds a
+    // window at HD, and with it on, 9.0 GiB and a quarter of a second. Pass an
+    // empty vector to leave every session on ORT's defaults.
     bool open(const std::wstring& directory, const std::vector<std::wstring>& modelPaths,
-              bool preferCuda);
+              bool preferCuda, const std::vector<bool>& conserveMemory = {});
 
     // Runs one of the graphs, by index into the modelPaths given to open().
     // Shapes are NCHW; `left` and `right` need room for imageCount floats each.

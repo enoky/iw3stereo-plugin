@@ -66,7 +66,7 @@ bool OrtRuntime::failed(OrtStatus* status, const char* what)
 }
 
 bool OrtRuntime::open(const std::wstring& directory, const std::vector<std::wstring>& modelPaths,
-                      bool preferCuda)
+                      bool preferCuda, const std::vector<bool>& conserveMemory)
 {
     const std::wstring dllPath = directory + L"\\onnxruntime.dll";
     note("loading " + narrow(dllPath));
@@ -132,6 +132,22 @@ bool OrtRuntime::open(const std::wstring& directory, const std::vector<std::wstr
         if (failed(_api->CreateSessionOptions(&options), "CreateSessionOptions"))
         {
             return false;
+        }
+
+        const bool conserve = index < conserveMemory.size() && conserveMemory[index];
+        if (conserve)
+        {
+            // Memory pattern planning pre-allocates from the shapes of the
+            // first run, and for a graph with dynamic shapes and very large
+            // intermediates it reserves far more than the run needs and never
+            // gives it back. Measured on the twelve-frame inpaint graph at HD:
+            // 15.71 GiB and 16.4 s a window with it on, 10.08 GiB and 0.32 s
+            // with it off. On the per-frame graph, 2.26 GiB against 1.19 GiB
+            // for four hundred microseconds an eye.
+            //
+            // Left on for the warp graphs, which are small and run at one shape
+            // per session, where it is a help rather than a hindrance.
+            failed(_api->DisableMemPattern(options), "DisableMemPattern");
         }
 
         bool wantCuda = false;

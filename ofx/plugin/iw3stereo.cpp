@@ -200,7 +200,10 @@ static iw3::OrtRuntime& sharedRuntime()
             directory + L"\\light_inpaint_v1.onnx",         // 2: monobw_inpaint
             directory + L"\\light_video_inpaint_v1.onnx",   // 3: monobw_inpaint_video
         };
-        const bool ok = runtime->open(directory + L"\\ort", graphs, true);
+        // The two inpaint graphs get the memory-conservative session options;
+        // the warp graphs neither need them nor benefit.
+        const std::vector<bool> conserve = {false, false, true, true};
+        const bool ok = runtime->open(directory + L"\\ort", graphs, true, conserve);
         probe::logf("---- iw3 Stereo: ONNX Runtime bring-up (%s) ----", ok ? "OK" : "FAILED");
         for (const std::string& line : runtime->report())
         {

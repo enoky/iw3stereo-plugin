@@ -310,9 +310,12 @@ def export_light_video_inpaint_v1(model, path):
     Halving it fits with 6.7 GiB to spare and the same window takes 234 ms.
 
     PyTorch survives the fp32 shapes only because its allocator frees eagerly --
-    3.1 GiB peak against ONNX Runtime's 17. Spatial chunking of the temporal
-    blocks and every ONNX Runtime memory option were tried first and none of
-    them fit; ``docs/monobw-inpaint.md`` records the measurements.
+    3.1 GiB peak against ONNX Runtime's 17.
+
+    Half precision is necessary and not sufficient. The session also has to be
+    built with memory pattern planning disabled, or the fp16 graph still takes
+    15.7 GiB and sixteen seconds a window -- see ``OrtRuntime::open``. With both,
+    and with the temporal blocks chunked, it is 9.0 GiB and 0.24 s.
 
     fp16 is also what iw3 itself runs these models at: its whole inference path
     is under ``torch.autocast``. The fp32 graph was the anomaly, not this.
@@ -408,8 +411,9 @@ def main():
         print(f"wrote {inpaint_path} ({os.path.getsize(inpaint_path) / 1024:.0f} KiB)")
 
     if not args.skip_inpaint and os.path.exists(CHECKPOINTS["light_video_inpaint_v1"]):
+        # Chunked: exact, and worth about a gigabyte. See the export's docstring.
         video = stereo_inpaint.load_light_video_inpaint_v1(
-            CHECKPOINTS["light_video_inpaint_v1"], device="cpu")
+            CHECKPOINTS["light_video_inpaint_v1"], device="cpu", spatial_chunks=4)
         video_path = export_light_video_inpaint_v1(
             video, os.path.join(args.output_dir, "light_video_inpaint_v1.onnx"))
         print(f"wrote {video_path} ({os.path.getsize(video_path) / 1024:.0f} KiB)")
