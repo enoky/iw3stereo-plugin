@@ -714,11 +714,43 @@ class _GMLP3DBlock(nn.Module):
         self.norm1 = _FastLayerNorm(in_channels, bias=False)
         self.norm2 = _FastLayerNorm(in_channels * mlp_ratio, bias=False)
         self.glu_conv = _GLUConvMLP(in_channels, in_channels, mlp_ratio=1, kernel_size=3)
+        # 0 or 1 runs the whole plane at once, which is what iw3 does and what
+        # the golden test compares against. See spatial_chunks in
+        # LightVideoInpaintV1 for why anything else exists.
+        self.spatial_chunks = 0
 
     def forward(self, x):
         B, C, H, W = x.shape
         x = x.permute(1, 0, 2, 3).reshape(1, C, B, H, W)
-        x = x + self.gmlp(x, self.norm1, self.norm2)
+
+        if self.spatial_chunks > 1:
+            # Exactly equivalent, not an approximation. The window is
+            # (SEQ_LEN, 1, 1), so every spatial position becomes its own row of
+            # the token batch and nothing in _GMLP mixes across rows -- the
+            # norms are per token, proj_in and proj_out are per token, and
+            # proj_spatial convolves the twelve-frame axis within a position.
+            # Splitting the plane and concatenating is therefore the same
+            # arithmetic on the same values, in smaller pieces.
+            # Explicit slices rather than torch.chunk. chunk() derives its
+            # piece count from the size, and doing that to a symbolic dimension
+            # specialises it -- the exported graph came out with height baked to
+            # whatever it was traced at. Slicing at computed offsets keeps the
+            # count static (it is a Python int) and the offsets symbolic, which
+            # is the shape torch.export wants.
+            rows = H // self.spatial_chunks
+            pieces = []
+            for index in range(self.spatial_chunks):
+                start = index * rows
+                # The last piece runs to the end, so nothing depends on H
+                # dividing evenly even though at these resolutions it always
+                # does.
+                piece = (x[:, :, :, start:, :] if index == self.spatial_chunks - 1
+                         else x[:, :, :, start:start + rows, :])
+                pieces.append(self.gmlp(piece, self.norm1, self.norm2))
+            x = x + torch.cat(pieces, dim=3)
+        else:
+            x = x + self.gmlp(x, self.norm1, self.norm2)
+
         x = x.permute(0, 2, 1, 3, 4).reshape(B, C, H, W)
         return x + self.glu_conv(x)
 
@@ -754,7 +786,26 @@ class LightVideoInpaintV1(nn.Module):
     DOWNSCALING_FACTOR = 4
     MOD = 16
 
-    def __init__(self, base_dim=96, lv2_mlp_ratio=1):
+    def __init__(self, base_dim=96, lv2_mlp_ratio=1, spatial_chunks=0):
+        """``spatial_chunks`` splits the temporal blocks' plane into pieces.
+
+        Off by default, because iw3 does not do it and the golden test wants
+        difference 0. It exists for the ONNX export, where the whole plane at
+        once does not fit: at HD one temporal window's widest intermediate is
+        (33728, 12, 768), which is 1.24 GiB on its own, and there are two such
+        blocks. The exported graph held every one of them alive and exhausted
+        17 GiB of VRAM; PyTorch survives the same shapes only because it frees
+        eagerly.
+
+        Eight divides evenly at every resolution this model sees. ``forward``
+        pads to a multiple of 64, ``patch`` takes a quarter of that and ``down``
+        a half again, so the plane the temporal blocks work on is always a
+        multiple of 8 rows.
+
+        The same shape of fix as ``row_flow_v3``'s export-safe attention: the
+        default path stays bit-identical for the golden test, and the
+        restructured one is used only where it has to be.
+        """
         super().__init__()
         pack = self.DOWNSCALING_FACTOR ** 2
         C = base_dim
@@ -777,6 +828,11 @@ class LightVideoInpaintV1(nn.Module):
         self.dec1 = _GMLPBlock(C, window_size=16, mlp_ratio=2, shift=False)
         self.to_image = nn.Conv2d(C, 3 * pack, kernel_size=1, stride=1, padding=0)
         self.mask_blur = _SeparableGaussianFilter2d(1, kernel_size=15, padding=15 // 2)
+
+        self.spatial_chunks = spatial_chunks
+        for block in self.enc2:
+            if isinstance(block, _GMLP3DBlock):
+                block.spatial_chunks = spatial_chunks
 
     def preprocess(self, x, mask, closing=False, inner_dilation=0, outer_dilation=0,
                    base_width=None):
@@ -880,8 +936,11 @@ class LightVideoInpaintV1(nn.Module):
         return src.clamp(0, 1)
 
 
-def load_light_video_inpaint_v1(path=None, device="cpu"):
-    """Load the published ``light_video_inpaint_v1`` checkpoint."""
+def load_light_video_inpaint_v1(path=None, device="cpu", spatial_chunks=0):
+    """Load the published ``light_video_inpaint_v1`` checkpoint.
+
+    ``spatial_chunks`` is for the ONNX export; see the model's docstring.
+    """
     if path is None:
         data = torch.hub.load_state_dict_from_url(LIGHT_VIDEO_INPAINT_V1_URL,
                                                   weights_only=True, map_location="cpu")
@@ -893,7 +952,7 @@ def load_light_video_inpaint_v1(path=None, device="cpu"):
     if data.get("name") != VIDEO_MODEL_NAME:
         raise ValueError(f"expected {VIDEO_MODEL_NAME}, got {data.get('name')!r}")
 
-    model = LightVideoInpaintV1(**data.get("kwargs", {}))
+    model = LightVideoInpaintV1(**data.get("kwargs", {}), spatial_chunks=spatial_chunks)
     model.load_state_dict(data["state_dict"], strict=True)
     return model.eval().to(device)
 
