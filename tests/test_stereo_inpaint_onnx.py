@@ -183,5 +183,83 @@ class InpaintOnnxTest(unittest.TestCase):
                         f"the fill reached {untouched} beyond the mask blur's support")
 
 
+class VideoInpaintOnnxTest(unittest.TestCase):
+    """The temporal graph against the PyTorch one.
+
+    Its batch is fixed at twelve rather than dynamic, because the frame-axis
+    convolution's weights are (12, 12, 1). So there is no batch axis to vary
+    here and the shape tests are all about height and width.
+    """
+
+    GRAPH = os.path.join(MODELS_DIR, "light_video_inpaint_v1.onnx")
+    CHECKPOINT = os.path.join(
+        os.environ.get("NUNIF_ROOT", r"F:\_AI_PROJECTS_\nunif"),
+        "iw3", "pretrained_models", "hub", "checkpoints",
+        "iw3_light_video_inpaint_v1_20250919.pth")
+
+    @classmethod
+    def setUpClass(cls):
+        if not os.path.exists(cls.GRAPH):
+            raise unittest.SkipTest("light_video_inpaint_v1.onnx not exported; run export_onnx.py")
+        if not os.path.exists(cls.CHECKPOINT):
+            raise unittest.SkipTest(f"checkpoint not found: {cls.CHECKPOINT}")
+        cls.session = ort.InferenceSession(cls.GRAPH, providers=["CPUExecutionProvider"])
+        cls.model = stereo_inpaint.load_light_video_inpaint_v1(cls.CHECKPOINT, device="cpu")
+
+    @staticmethod
+    def make_window(height, width, seed=0):
+        generator = torch.Generator().manual_seed(seed)
+        coarse = torch.rand((stereo_inpaint.SEQ_LEN, 3, 12, 20), generator=generator)
+        eyes = torch.nn.functional.interpolate(
+            coarse, size=(height, width), mode="bilinear", align_corners=False).clamp(0, 1)
+        masks = torch.zeros((stereo_inpaint.SEQ_LEN, 1, height, width))
+        masks[:, :, :, width // 4:width // 4 + 3] = 1.0
+        masks[:, :, height // 3:, width // 2:width // 2 + 5] = 1.0
+        return eyes, masks
+
+    def run_graph(self, eyes, masks):
+        return self.session.run(["y"], {"eyes": eyes.numpy(), "masks": masks.numpy()})[0]
+
+    def assert_close(self, height, width, seed=0):
+        eyes, masks = self.make_window(height, width, seed)
+        got = self.run_graph(eyes, masks)
+        with torch.inference_mode():
+            want = self.model.infer(eyes, masks).numpy()
+        self.assertEqual(want.shape, got.shape, f"{height}x{width}")
+        diff = np.abs(want - got).max()
+        self.assertLess(diff, TOLERANCE, f"{height}x{width}: max abs diff {diff:.3e}")
+
+    def test_shapes(self):
+        for height, width in ((256, 448), (392, 938), (260, 452), (128, 192), (100, 200)):
+            with self.subTest(size=(height, width)):
+                self.assert_close(height, width, seed=height)
+
+    def test_hd(self):
+        self.assert_close(1036, 1920, seed=7)
+
+    def test_the_temporal_axis_survives_the_export(self):
+        """Change a frame's neighbours, leave it alone, and its output must move.
+
+        The property the whole second model exists for, checked on the graph
+        rather than on PyTorch. An export that quietly dropped the frame-axis
+        mixing would still pass every tolerance above, because the fixtures
+        above use the same twelve frames on both sides.
+        """
+        eyes, masks = self.make_window(256, 448, seed=11)
+        generator = torch.Generator().manual_seed(99)
+        altered = torch.rand(eyes.shape, generator=generator)
+        altered[6:7] = eyes[6:7]
+
+        before = self.run_graph(eyes, masks)
+        after = self.run_graph(altered, masks)
+
+        self.assertEqual(np.abs(eyes[6].numpy() - altered[6].numpy()).max(), 0.0,
+                         "the frame under test must be unchanged")
+        moved = np.abs(before[6] - after[6]).max()
+        self.assertGreater(moved, 1e-3,
+                           f"frame 6 moved by only {moved} when its neighbours changed; "
+                           "did the temporal axis survive the export?")
+
+
 if __name__ == "__main__":
     unittest.main()

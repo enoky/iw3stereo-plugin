@@ -9,6 +9,9 @@ Writes to models/:
     stereo_warp_v3.onnx     the same, with row_flow_v3
     light_inpaint_v1.onnx   the inpaint half of monobw_inpaint: eye + hole
                             mask -> filled eye
+    light_video_inpaint_v1.onnx
+                            the same, twelve frames at a time, with a temporal
+                            axis so the fills do not flicker
     reference.npz           inputs and PyTorch outputs, so any environment can
                             check an execution provider without needing torch
 
@@ -73,6 +76,8 @@ CHECKPOINTS = {
     "row_flow_v2": os.path.join(CHECKPOINT_DIR, "iw3_row_flow_v2_20240130.pth"),
     "row_flow_v3": os.path.join(CHECKPOINT_DIR, "iw3_row_flow_v3_20250627.pth"),
     "light_inpaint_v1": os.path.join(CHECKPOINT_DIR, "iw3_light_inpaint_v1_20250919.pth"),
+    "light_video_inpaint_v1": os.path.join(CHECKPOINT_DIR,
+                                           "iw3_light_video_inpaint_v1_20250919.pth"),
 }
 DEFAULT_CHECKPOINT = CHECKPOINTS["row_flow_v2"]
 
@@ -263,6 +268,56 @@ def export_light_inpaint_v1(model, path):
     return path
 
 
+class LightVideoInpaintGraph(torch.nn.Module):
+    """The temporal inpaint model as one graph: twelve eyes in, twelve out.
+
+    Same boundary as the image graph -- blank, blur, network, composite -- and
+    the same reason for it: the mask morphology's counts are plugin parameters.
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, eyes, masks):
+        return self.model.infer(eyes, masks)
+
+
+def export_light_video_inpaint_v1(model, path):
+    """``light_video_inpaint_v1``, twelve frames at a fixed batch.
+
+    Easier than the image model's export rather than harder, and for a reason
+    worth stating: the batch is *not* dynamic. ``enc2.1`` and ``enc2.3`` mix
+    along the frame axis with a Conv1d whose weights are (12, 12, 1), so twelve
+    is baked into the checkpoint and there is nothing to keep dynamic. Only
+    height and width are declared, and the export succeeded first time at every
+    size tried.
+
+    The graph therefore has a fixed first dimension. A caller with fewer than
+    twelve frames pads by repeating the first and last, which is what
+    ``LightVideoInpaintV1.infer`` does and what a window running off the end of
+    a clip needs anyway.
+    """
+    graph = LightVideoInpaintGraph(model).eval()
+    generator = torch.Generator().manual_seed(0)
+    coarse = torch.rand((stereo_inpaint.SEQ_LEN, 3, 12, 20), generator=generator)
+    eyes = F.interpolate(coarse, size=(256, 448), mode="bilinear",
+                         align_corners=False).clamp(0, 1)
+    masks = torch.zeros((stereo_inpaint.SEQ_LEN, 1, 256, 448))
+    masks[:, :, 64:128, 112:150] = 1.0
+
+    height = torch.export.Dim("height", min=64, max=8192)
+    width = torch.export.Dim("width", min=64, max=8192)
+
+    torch.onnx.export(
+        graph, (eyes, masks), path,
+        input_names=["eyes", "masks"], output_names=["y"],
+        dynamic_shapes={"eyes": {2: height, 3: width},
+                        "masks": {2: height, 3: width}},
+        opset_version=OPSET_INPAINT, dynamo=True, external_data=False)
+    return path
+
+
 def write_reference(model, path):
     """Reference IO at several shapes, so a provider can be checked without torch."""
     graph = StereoWarpGraph(model).eval()
@@ -332,6 +387,13 @@ def main():
         inpaint_path = export_light_inpaint_v1(
             inpaint, os.path.join(args.output_dir, "light_inpaint_v1.onnx"))
         print(f"wrote {inpaint_path} ({os.path.getsize(inpaint_path) / 1024:.0f} KiB)")
+
+    if not args.skip_inpaint and os.path.exists(CHECKPOINTS["light_video_inpaint_v1"]):
+        video = stereo_inpaint.load_light_video_inpaint_v1(
+            CHECKPOINTS["light_video_inpaint_v1"], device="cpu")
+        video_path = export_light_video_inpaint_v1(
+            video, os.path.join(args.output_dir, "light_video_inpaint_v1.onnx"))
+        print(f"wrote {video_path} ({os.path.getsize(video_path) / 1024:.0f} KiB)")
 
     reference_path = os.path.join(args.output_dir, "reference.npz")
     cases = write_reference(model, reference_path)

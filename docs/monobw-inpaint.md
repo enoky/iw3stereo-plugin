@@ -472,7 +472,7 @@ The port is five pieces:
 | | |
 | --- | --- |
 | ~~`LightVideoInpaintV1` to standalone PyTorch at diff 0~~ | **done** — six cases at difference 0, in `stereo_inpaint.py` beside the image model |
-| ONNX export at a fixed batch of twelve | the batch is baked into the weights, which makes this easier than the dynamic one |
+| ~~ONNX export at a fixed batch of twelve~~ | **done** — first attempt, every size within 1.1e-06; `models/light_video_inpaint_v1.onnx`, 10.4 MiB |
 | `getFramesNeeded` plus per-frame fetch of both clips | measured to work |
 | a frame cache keyed by frame number | what makes it 14.9 ms rather than 178 ms, and what Phase 0 already required |
 | edge clamping on the window | the offsets before the first frame come back null |
