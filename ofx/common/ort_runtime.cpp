@@ -43,6 +43,17 @@ OrtRuntime::~OrtRuntime()
     // sharedRuntime() in plugin/iw3stereo.cpp.
 }
 
+std::vector<std::string> OrtRuntime::takeNewReport()
+{
+    std::vector<std::string> lines;
+    if (_reportCursor < _report.size())
+    {
+        lines.assign(_report.begin() + ptrdiff_t(_reportCursor), _report.end());
+        _reportCursor = _report.size();
+    }
+    return lines;
+}
+
 bool OrtRuntime::failed(OrtStatus* status, const char* what)
 {
     if (!status)
@@ -283,16 +294,39 @@ bool OrtRuntime::bindOutputs(Model& model)
         model.binding = nullptr;
         return false;
     }
+    if (!rebindOutputs(model))
+    {
+        _api->ReleaseIoBinding(model.binding);
+        model.binding = nullptr;
+        return false;
+    }
+    return true;
+}
+
+bool OrtRuntime::rebindOutputs(Model& model)
+{
     // Outputs land in device memory rather than being copied back. Bound by
     // the names the graph actually declares, so the warp's two and the
     // inpaint's one both work without this knowing which is which.
+    //
+    // Cleared and rebound before *every* run, which is not belt and braces. A
+    // binding keeps the buffer ORT allocated for it on the previous run and
+    // offers it back as a pre-allocated output; ORT then refuses any run whose
+    // computed output shape differs, with "the output OrtValue provided for
+    // output 'y' has shape {1,3,128,128} but the computed output shape for this
+    // run is {1,3,1036,1920}". Binding to the device again drops that buffer and
+    // lets ORT size the next one itself.
+    //
+    // This bit the inpaint graph immediately, because its warm-up is the only
+    // one that goes through the binding, at 128x128. The warp graphs were one
+    // timeline resolution change away from the same failure and had simply
+    // never been asked to do it.
+    _api->ClearBoundOutputs(model.binding);
     for (const std::string& name : model.outputNames)
     {
         if (failed(_api->BindOutputToDevice(model.binding, name.c_str(), _cudaMemoryInfo),
                    "BindOutputToDevice"))
         {
-            _api->ReleaseIoBinding(model.binding);
-            model.binding = nullptr;
             return false;
         }
     }
@@ -454,6 +488,10 @@ bool OrtRuntime::runInpaintWith(size_t index, OrtMemoryInfo* memoryInfo,
 
     // The previous frame's outputs are only valid until here.
     releaseBoundOutputs(model);
+    if (!rebindOutputs(model))
+    {
+        return false;
+    }
 
     const size_t eyeElements = size_t(shape[0] * shape[1] * shape[2] * shape[3]);
     // Same geometry, one channel: the mask is per pixel, not per plane.
@@ -516,6 +554,10 @@ bool OrtRuntime::runDevice(size_t index,
 
     // The previous frame's outputs are only valid until here.
     releaseBoundOutputs(model);
+    if (!rebindOutputs(model))
+    {
+        return false;
+    }
 
     const size_t imageElements = size_t(imageShape[0] * imageShape[1] * imageShape[2] * imageShape[3]);
     const size_t xElements = size_t(xShape[0] * xShape[1] * xShape[2] * xShape[3]);

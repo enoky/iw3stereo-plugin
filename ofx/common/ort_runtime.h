@@ -90,6 +90,14 @@ public:
     const std::string& provider() const { return _provider; }
     const std::string& version() const { return _version; }
     const std::vector<std::string>& report() const { return _report; }
+
+    // Report lines added since the last call to this.
+    //
+    // Without it a render-time failure says nothing: open() dumps the report
+    // once at bring-up and nothing ever reads it again, so every ORT error
+    // message after that went into the vector and stayed there. That is how a
+    // "GPU inpaint failed" with no cause attached happens.
+    std::vector<std::string> takeNewReport();
     double lastRunMilliseconds() const { return _lastRunMs; }
 
 private:
@@ -108,6 +116,7 @@ private:
     bool failed(OrtStatus* status, const char* what);
     void releaseBoundOutputs(Model& model);
     bool bindOutputs(Model& model);
+    bool rebindOutputs(Model& model);
     bool readOutputNames(Model& model);
 
     // The inpaint run, with the memory the inputs live in left open: the render
@@ -131,6 +140,7 @@ private:
     std::string _provider = "none";
     std::string _version;
     std::vector<std::string> _report;
+    size_t _reportCursor = 0;
     double _lastRunMs = 0.0;
 };
 

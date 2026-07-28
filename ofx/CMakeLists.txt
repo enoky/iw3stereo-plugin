@@ -162,6 +162,21 @@ if(IW3_HAS_CUDA)
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
         RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/tests"
         CUDA_SEPARABLE_COMPILATION OFF)
+
+    # The plugin's monobw render path without an OFX host: real OrtRuntime, real
+    # kernels, real device pointers. It is what localises a failure in Resolve to
+    # either the glue or the pipeline.
+    add_executable(test_inpaint_ort ../tests/cpp/test_inpaint_ort.cu
+                   plugin/monobw_gpu.cu common/ort_runtime.cpp)
+    target_include_directories(test_inpaint_ort PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/plugin"
+        "${IW3_COMMON}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnxruntime")
+    target_compile_definitions(test_inpaint_ort PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    set_target_properties(test_inpaint_ort PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/tests"
+        CUDA_SEPARABLE_COMPILATION OFF)
 endif()
 
 # `cmake --install` copies the bundles next to Resolve's other OFX plugins.

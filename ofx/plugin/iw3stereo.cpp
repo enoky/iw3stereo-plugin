@@ -194,6 +194,21 @@ static iw3::OrtRuntime& sharedRuntime()
     return *instance;
 }
 
+// Drain whatever ONNX Runtime has said since the last time anyone asked, into
+// the log.
+//
+// open() dumps the report once at bring-up and nothing read it again, so every
+// render-time ORT error went into a vector and stayed there -- which is how a
+// "GPU inpaint failed" with no cause attached happened. Called on every failure
+// path that touches the runtime.
+static void logRuntimeReport(const char* context)
+{
+    for (const std::string& line : sharedRuntime().takeNewReport())
+    {
+        probe::logf("iw3 Stereo: %s: %s", context, line.c_str());
+    }
+}
+
 // Bring the runtime up as soon as a node exists, rather than on the first
 // render. Provider start-up, session creation and the warm-up run together
 // cost a few hundred milliseconds; spending them while the user is still
@@ -423,6 +438,7 @@ bool Iw3StereoEffect::renderCuda(const OFX::RenderArguments& args, const iw3::Se
     {
         if (model != settings.model || ort.outputCount(model) != 1)
         {
+            logRuntimeReport("inpaint graph");
             report("The inpaint graph did not load; see the log.", true);
             return false;
         }
@@ -460,6 +476,7 @@ bool Iw3StereoEffect::renderCuda(const OFX::RenderArguments& args, const iw3::Se
             if (!ort.runInpaintDevice(model, _monobw.inpaintEyeDevice(),
                                       _monobw.processedMaskDevice(), imageShape, &filled))
             {
+                logRuntimeReport("inpaint inference");
                 report("GPU inpaint failed; see the log.", true);
                 return false;
             }
@@ -477,6 +494,7 @@ bool Iw3StereoEffect::renderCuda(const OFX::RenderArguments& args, const iw3::Se
     else if (!ort.runDevice(model, _gpu.imageDevice(), imageShape, _gpu.inputTensorDevice(), xShape,
                             iw3::deltaScale(depthWidth), &left, &right))
     {
+        logRuntimeReport("warp inference");
         report("GPU inference failed; see the log. Falling back to the CPU.", true);
         return false;
     }
