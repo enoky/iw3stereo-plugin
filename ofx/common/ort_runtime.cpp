@@ -221,9 +221,9 @@ bool OrtRuntime::open(const std::wstring& directory, const std::vector<std::wstr
         }
 
         _models.push_back(model);
-        if (!readOutputNames(_models.back()))
+        if (!readInputNames(_models.back()) || !readOutputNames(_models.back()))
         {
-            note("could not read output names for " + narrow(path));
+            note("could not read input/output names for " + narrow(path));
         }
         else
         {
@@ -248,6 +248,32 @@ bool OrtRuntime::open(const std::wstring& directory, const std::vector<std::wstr
     for (size_t index = 0; index < _models.size(); ++index)
     {
         warmUp(index);
+    }
+    return true;
+}
+
+bool OrtRuntime::readInputNames(Model& model)
+{
+    size_t count = 0;
+    if (failed(_api->SessionGetInputCount(model.session, &count), "SessionGetInputCount"))
+    {
+        return false;
+    }
+    OrtAllocator* allocator = nullptr;
+    if (failed(_api->GetAllocatorWithDefaultOptions(&allocator), "GetAllocatorWithDefaultOptions"))
+    {
+        return false;
+    }
+    for (size_t i = 0; i < count; ++i)
+    {
+        char* name = nullptr;
+        if (failed(_api->SessionGetInputName(model.session, i, allocator, &name),
+                   "SessionGetInputName"))
+        {
+            return false;
+        }
+        model.inputNames.push_back(name);
+        allocator->Free(allocator, name);
     }
     return true;
 }
@@ -509,8 +535,13 @@ bool OrtRuntime::runInpaintWith(size_t index, OrtMemoryInfo* memoryInfo,
             memoryInfo, const_cast<float*>(mask), maskElements * sizeof(float),
             maskShape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &maskValue), "inpaint mask tensor"))
     {
-        if (!failed(_api->BindInput(model.binding, "eye", eyeValue), "BindInput(eye)") &&
-            !failed(_api->BindInput(model.binding, "mask", maskValue), "BindInput(mask)"))
+        // By position, not by literal name: the per-frame graph calls them
+        // eye/mask and the twelve-frame one eyes/masks.
+        if (model.inputNames.size() == 2 &&
+            !failed(_api->BindInput(model.binding, model.inputNames[0].c_str(), eyeValue),
+                    "BindInput(eye)") &&
+            !failed(_api->BindInput(model.binding, model.inputNames[1].c_str(), maskValue),
+                    "BindInput(mask)"))
         {
             const auto started = std::chrono::steady_clock::now();
             OrtStatus* status = _api->RunWithBinding(model.session, nullptr, model.binding);

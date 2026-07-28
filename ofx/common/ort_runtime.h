@@ -108,7 +108,11 @@ private:
         OrtValue** boundOutputs = nullptr;
         size_t boundOutputCount = 0;
         // Read from the graph rather than assumed, so binding does not have to
-        // know which kind of graph it is looking at.
+        // know which kind of graph it is looking at. The two inpaint graphs
+        // name their inputs differently -- eye/mask for one frame, eyes/masks
+        // for a twelve-frame window -- and binding by position rather than by
+        // literal name is what lets one code path drive both.
+        std::vector<std::string> inputNames;
         std::vector<std::string> outputNames;
     };
 
@@ -118,6 +122,7 @@ private:
     bool bindOutputs(Model& model);
     bool rebindOutputs(Model& model);
     bool readOutputNames(Model& model);
+    bool readInputNames(Model& model);
 
     // The inpaint run, with the memory the inputs live in left open: the render
     // path passes device memory, the warm-up passes host memory and lets ORT

@@ -6,7 +6,11 @@
 // plugin fails in Resolve and this passes, the fault is in the OFX glue; if
 // this fails too, the fault is here and can be found without a host.
 //
-//     ofx\build\tests\test_inpaint_ort.exe [bundle-Win64-dir]
+//     ofx\build\tests\test_inpaint_ort.exe [ort-dir] [model-dir]
+//
+// The two directories are separate because the graphs under test are not
+// always staged into a bundle yet -- the ONNX Runtime comes from an installed
+// bundle, the graphs from models/.
 
 #include "monobw_gpu.h"
 #include "ort_runtime.h"
@@ -61,19 +65,22 @@ int main(int argc, char** argv)
         return 0;
     }
 
-    const std::string bundle = argc > 1 ? argv[1]
+    const std::string ortDir = argc > 1 ? argv[1]
         : "C:\\Program Files\\Common Files\\OFX\\Plugins\\iw3stereo.ofx.bundle\\Contents\\Win64";
-    const std::wstring directory = widen(bundle);
+    const std::string modelDir = argc > 2 ? argv[2] : "models";
+    const std::wstring runtimeDir = widen(ortDir);
+    const std::wstring models = widen(modelDir);
 
     iw3::OrtRuntime ort;
     const std::vector<std::wstring> graphs = {
-        directory + L"\\stereo_warp.onnx",
-        directory + L"\\stereo_warp_v3.onnx",
-        directory + L"\\light_inpaint_v1.onnx",
+        models + L"\\stereo_warp.onnx",
+        models + L"\\stereo_warp_v3.onnx",
+        models + L"\\light_inpaint_v1.onnx",
+        models + L"\\light_video_inpaint_v1.onnx",
     };
-    const bool opened = ort.open(directory + L"\\ort", graphs, true);
+    const bool opened = ort.open(runtimeDir + L"\\ort", graphs, true);
     dump(ort, "bring-up");
-    if (!opened || ort.modelCount() < 3)
+    if (!opened || ort.modelCount() < 4)
     {
         std::printf("FAIL: only %zu graph(s) opened\n", ort.modelCount());
         return 2;
@@ -153,6 +160,83 @@ int main(int argc, char** argv)
             cudaDeviceSynchronize();
         }
 
+        cudaFree(deviceImage);
+        cudaFree(deviceDepth);
+    }
+
+    // The twelve-frame window. Same call shape the plugin will make: one warp
+    // per frame into a slice of a sequence buffer, then one inference over the
+    // whole window.
+    {
+        const int width = 1920, height = 1036;
+        const int depthWidth = 714, depthHeight = 392;
+        const size_t pixels = size_t(width) * size_t(height);
+        const int seq = 12;
+
+        std::vector<float> image(pixels * 3, 0.5f);
+        std::vector<float> depth(size_t(depthWidth) * size_t(depthHeight));
+        for (size_t i = 0; i < depth.size(); ++i)
+        {
+            depth[i] = float((i * 37) % 1000) / 1000.0f;
+        }
+        float* deviceImage = upload(image);
+        float* deviceDepth = upload(depth);
+
+        float* eyes = nullptr;
+        float* masks = nullptr;
+        cudaMalloc(reinterpret_cast<void**>(&eyes), pixels * 3 * size_t(seq) * sizeof(float));
+        cudaMalloc(reinterpret_cast<void**>(&masks), pixels * size_t(seq) * sizeof(float));
+
+        iw3::MonoBwGpu gpu;
+        if (deviceImage && deviceDepth && eyes && masks &&
+            gpu.prepare(width, height, depthWidth, depthHeight))
+        {
+            for (int frame = 0; frame < seq; ++frame)
+            {
+                gpu.prepareEye(deviceImage, deviceDepth, false, 2.0, 0.5, false,
+                               0, 0, depthWidth, nullptr);
+                cudaMemcpy(eyes + size_t(frame) * pixels * 3, gpu.inpaintEyeDevice(),
+                           pixels * 3 * sizeof(float), cudaMemcpyDeviceToDevice);
+                cudaMemcpy(masks + size_t(frame) * pixels, gpu.processedMaskDevice(),
+                           pixels * sizeof(float), cudaMemcpyDeviceToDevice);
+            }
+            cudaDeviceSynchronize();
+
+            const int64_t shape[4] = {seq, 3, height, width};
+            const float* filled = nullptr;
+            const bool ok = ort.runInpaintDevice(3, eyes, masks, shape, &filled);
+            std::printf("%s video window %dx%d x%d frames: %s (%.2f ms, %.2f ms/frame)\n",
+                        ok ? "ok  " : "FAIL", width, height, seq,
+                        ok ? "returned a buffer" : "FAILED",
+                        ort.lastRunMilliseconds(), ort.lastRunMilliseconds() / seq);
+            dump(ort, "ort");
+            if (!ok)
+            {
+                ++failures;
+            }
+            else
+            {
+                float sample[3] = {-1.0f, -1.0f, -1.0f};
+                if (cudaMemcpy(sample, filled, sizeof(sample), cudaMemcpyDeviceToHost) != cudaSuccess)
+                {
+                    std::printf("FAIL: video output is not readable device memory\n");
+                    ++failures;
+                }
+                else
+                {
+                    std::printf("     first pixel %.4f %.4f %.4f\n",
+                                sample[0], sample[1], sample[2]);
+                }
+            }
+        }
+        else
+        {
+            std::printf("FAIL: video window setup failed\n");
+            ++failures;
+        }
+
+        if (eyes) cudaFree(eyes);
+        if (masks) cudaFree(masks);
         cudaFree(deviceImage);
         cudaFree(deviceDepth);
     }
