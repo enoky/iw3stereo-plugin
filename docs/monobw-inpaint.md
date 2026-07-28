@@ -1,17 +1,18 @@
 # monobw_inpaint + light_inpaint_v1
 
-Three stages done. **Standalone PyTorch**: `stereo_inpaint.py`, 22/22 at max
-absolute difference 0 against stock iw3. **ONNX**: the export blocker turned out
-to be one thing the port had already fixed, and `models/light_inpaint_v1.onnx`
-matches PyTorch within 2e-5 at every size tried. **CUDA**: the MonoBW kernels
-and the mask morphology, matching the same Python reference the CPU core is held
-to, with a bit-exact hole mask, at 0.297 ms per eye at HD.
+`monobw_inpaint` runs in the plugin as a third Model option. It warps forwards,
+finds the holes that opens, and fills them with a network rather than smearing
+an edge into them.
 
-What is left is the plugin plumbing. The warp half will not be a graph — its two
-defining operations have no ONNX operator — which settles the architecture
-rather than blocking it.
+It costs about **71 ms a frame at HD**, roughly **15x** `row_flow_v3`. Earlier
+revisions of this document said 6.7x and 26 ms; that was PyTorch under autocast
+measured against an ONNX path that is fp32, and the correction is at the bottom.
 
-The cost also turned out to be about half what this document first predicted.
+The image model has no temporal path, so every frame's fill is invented
+independently and the filled regions flicker on real footage.
+`light_video_inpaint_v1` fixes that and is ported, exported and measured — in
+fp16, which is the only form that fits. What is left is wiring it into the
+plugin.
 
 ## What it is, and why it is not a model swap
 
@@ -51,31 +52,24 @@ That is what makes it expensive.
 
 ## The number that decides it
 
-Measured on an RTX 5080, PyTorch, both eyes, end to end — warp, mask
-morphology, and inpaint — against `row_flow_v3` on the same input:
+Per eye at HD, so the effect of precision and of runtime is visible separately.
+The plugin's figure is the ONNX one, because that is what it runs:
 
-| | monobw_inpaint | row_flow_v3 | ratio |
-| --- | --- | --- | --- |
-| 1920x1036, depth 392x938 | **25.9 - 26.2 ms** | 3.7 - 4.2 ms | **~6.7x** |
-| 4K, depth 518x910 | ~124 ms | 6.7 ms | ~19x |
+| inpaint model, one eye at 1920x1036 | |
+| --- | --- |
+| PyTorch fp16 | 12.0 ms |
+| PyTorch fp32 | 23.1 ms |
+| **ONNX fp32 — what the plugin runs today** | **35.4 ms** |
+| ONNX fp16 | 18.3 ms |
 
-So HD is about **38 fps** rather than 250, and 4K stays render-only. Of the
-26 ms, 23.6 is the inpaint network and the rest is the warp and the mask work.
+Both eyes plus the warp and mask work comes to about **71 ms a frame** at HD
+against `row_flow_v3`'s 4 - 5 ms, so roughly **15x**, and 4K is render-only.
+Halving it with an fp16 graph is available and is part of the plugin work.
 
-An earlier draft of this document put HD at 48.4 ms and called it 10x. That
-table was measured **without autocast**, and the model is almost exactly twice
-as fast in half precision — which is what iw3 runs by default:
-
-| inpaint model, one eye | fp16 | fp32 |
-| --- | --- | --- |
-| 1920x1036 | 11.8 ms | 22.6 ms |
-| 4K | 57.5 ms | 105.3 ms |
-
-The trade is still real, just cheaper than feared: inpainting fixes occlusion
-artifacts that backward warping cannot, because it has something to put in the
-holes rather than smearing an edge. Whether that is worth 6.7x is a judgement to
-make on real footage, not on a benchmark — and now there is something to make it
-with.
+The trade is real either way: inpainting fixes occlusion artifacts that backward
+warping cannot, because it has something to put in the holes rather than
+smearing an edge. Whether it is worth 15x is a judgement to make on footage, not
+on a benchmark — and the node runs, so it can be made.
 
 ## What got ported
 
@@ -99,7 +93,7 @@ The non-square pixel shuffle/unshuffle, the window partition and merge, the
 autocast rule and `get_mapper` all come from `stereo_warp.py` unchanged — they
 were already written and already exercised by the `row_flow_v3` export.
 
-Deliberately not ported: the video model, `basic_module_init`/`icnr_init` (an
+Deliberately not ported: `basic_module_init`/`icnr_init` (an
 inference port loads weights rather than initialising them), and
 `shift_mask_token` (`LightInpaintV1` never enables it, and the checkpoint
 confirms it — there are no `shift_mask_bias` keys).
