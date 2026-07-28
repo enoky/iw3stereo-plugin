@@ -472,13 +472,37 @@ bool Iw3StereoEffect::renderCuda(const OFX::RenderArguments& args, const iw3::Se
                 return false;
             }
 
+            // The graph is half precision, because in fp32 the twelve-frame
+            // video window does not fit in 17 GiB and the per-frame one costs
+            // twice as much for nothing. Everything this plugin computes is
+            // fp32, so the conversion is a pass either side rather than a
+            // change of type throughout.
+            const bool half = ort.inputIsHalf(model);
             const float* filled = nullptr;
-            if (!ort.runInpaintDevice(model, _monobw.inpaintEyeDevice(),
-                                      _monobw.processedMaskDevice(), imageShape, &filled))
+            if (half)
+            {
+                _monobw.castEyeAndMaskToHalf(stream);
+                if (cudaStreamSynchronize(static_cast<cudaStream_t>(stream)) != cudaSuccess)
+                {
+                    report("CUDA stream sync failed -- falling back to the CPU.", true);
+                    return false;
+                }
+            }
+            const float* eyeIn = half
+                ? reinterpret_cast<const float*>(_monobw.inpaintEyeHalfDevice())
+                : _monobw.inpaintEyeDevice();
+            const float* maskIn = half
+                ? reinterpret_cast<const float*>(_monobw.processedMaskHalfDevice())
+                : _monobw.processedMaskDevice();
+            if (!ort.runInpaintDevice(model, eyeIn, maskIn, imageShape, &filled))
             {
                 logRuntimeReport("inpaint inference");
                 report("GPU inpaint failed; see the log.", true);
                 return false;
+            }
+            if (half)
+            {
+                filled = _monobw.halfToFloat(filled, stream);
             }
             const float* eye = _monobw.finishEye(filled, rightEye, stream);
             if (rightEye)

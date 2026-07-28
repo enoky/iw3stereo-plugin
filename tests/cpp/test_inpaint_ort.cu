@@ -18,6 +18,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -52,6 +53,32 @@ float* upload(const std::vector<float>& data)
 std::wstring widen(const std::string& text)
 {
     return std::wstring(text.begin(), text.end());
+}
+
+// IEEE half to float, on the host. Written out rather than borrowed from
+// cuda_fp16 because whether __half2float is host-callable varies by version,
+// and this is a dozen lines.
+float halfToFloat(unsigned short bits)
+{
+    const unsigned sign = unsigned(bits >> 15) << 31;
+    const unsigned exponent = (bits >> 10) & 0x1fu;
+    const unsigned mantissa = bits & 0x3ffu;
+    unsigned out = 0;
+    if (exponent == 0)
+    {
+        out = mantissa ? sign | ((127u - 15u + 1u) << 23) | (mantissa << 13) : sign;
+    }
+    else if (exponent == 31)
+    {
+        out = sign | 0x7f800000u | (mantissa << 13);
+    }
+    else
+    {
+        out = sign | ((exponent + 127u - 15u) << 23) | (mantissa << 13);
+    }
+    float value = 0.0f;
+    std::memcpy(&value, &out, sizeof(value));
+    return value;
 }
 
 }  // namespace
@@ -132,8 +159,24 @@ int main(int argc, char** argv)
 
             const int64_t shape[4] = {1, 3, c.height, c.width};
             const float* filled = nullptr;
-            const bool ok = ort.runInpaintDevice(2, gpu.inpaintEyeDevice(),
-                                                 gpu.processedMaskDevice(), shape, &filled);
+            const bool half = ort.inputIsHalf(2);
+            if (half)
+            {
+                gpu.castEyeAndMaskToHalf(nullptr);
+                cudaDeviceSynchronize();
+            }
+            const bool ok = ort.runInpaintDevice(
+                2,
+                half ? reinterpret_cast<const float*>(gpu.inpaintEyeHalfDevice())
+                     : gpu.inpaintEyeDevice(),
+                half ? reinterpret_cast<const float*>(gpu.processedMaskHalfDevice())
+                     : gpu.processedMaskDevice(),
+                shape, &filled);
+            if (ok && half)
+            {
+                filled = gpu.halfToFloat(filled, nullptr);
+                cudaDeviceSynchronize();
+            }
             std::printf("%s %dx%d %s eye: runInpaintDevice %s (%.2f ms)\n",
                         ok ? "ok  " : "FAIL", c.width, c.height,
                         rightEye ? "right" : "left ",
@@ -186,19 +229,26 @@ int main(int argc, char** argv)
         float* masks = nullptr;
         cudaMalloc(reinterpret_cast<void**>(&eyes), pixels * 3 * size_t(seq) * sizeof(float));
         cudaMalloc(reinterpret_cast<void**>(&masks), pixels * size_t(seq) * sizeof(float));
+        // Allocated at float width, which is more than a half window needs.
 
         iw3::MonoBwGpu gpu;
         if (deviceImage && deviceDepth && eyes && masks &&
             gpu.prepare(width, height, depthWidth, depthHeight))
         {
+            // Half, so the sequence buffers are half-width too.
+            const size_t element = ort.inputIsHalf(3) ? sizeof(uint16_t) : sizeof(float);
             for (int frame = 0; frame < seq; ++frame)
             {
                 gpu.prepareEye(deviceImage, deviceDepth, false, 2.0, 0.5, false,
                                0, 0, depthWidth, nullptr);
-                cudaMemcpy(eyes + size_t(frame) * pixels * 3, gpu.inpaintEyeDevice(),
-                           pixels * 3 * sizeof(float), cudaMemcpyDeviceToDevice);
-                cudaMemcpy(masks + size_t(frame) * pixels, gpu.processedMaskDevice(),
-                           pixels * sizeof(float), cudaMemcpyDeviceToDevice);
+                gpu.castEyeAndMaskToHalf(nullptr);
+                cudaDeviceSynchronize();
+                cudaMemcpy(reinterpret_cast<char*>(eyes) + size_t(frame) * pixels * 3 * element,
+                           gpu.inpaintEyeHalfDevice(), pixels * 3 * element,
+                           cudaMemcpyDeviceToDevice);
+                cudaMemcpy(reinterpret_cast<char*>(masks) + size_t(frame) * pixels * element,
+                           gpu.processedMaskHalfDevice(), pixels * element,
+                           cudaMemcpyDeviceToDevice);
             }
             cudaDeviceSynchronize();
 
@@ -216,16 +266,43 @@ int main(int argc, char** argv)
             }
             else
             {
-                float sample[3] = {-1.0f, -1.0f, -1.0f};
-                if (cudaMemcpy(sample, filled, sizeof(sample), cudaMemcpyDeviceToHost) != cudaSuccess)
+                // The graph is half, so this reads halves. Printing them as
+                // floats showed 0.0001 for an input that was 0.5 everywhere,
+                // which looked like a pipeline fault and was a decoding one.
+                // Worth a real check rather than a decorative print.
+                // A row's mean rather than one pixel. The input is 0.5
+                // everywhere, so most of the frame is passed straight through
+                // and the mean lands near 0.5 whatever the filled pixels do --
+                // whereas reading these halves as floats, which is what this
+                // did at first, gives about 1e-4 and would be caught.
+                //
+                // Not a single pixel: prepareEye mirrors its output, so pixel
+                // zero of this buffer is the far edge of the warp, which is
+                // exactly where the holes are. It reads 0.588 and that is
+                // correct.
+                const size_t sampled = 512;
+                std::vector<unsigned short> bits(sampled, 0);
+                if (cudaMemcpy(bits.data(), filled, sampled * sizeof(unsigned short),
+                               cudaMemcpyDeviceToHost) != cudaSuccess)
                 {
                     std::printf("FAIL: video output is not readable device memory\n");
                     ++failures;
                 }
                 else
                 {
-                    std::printf("     first pixel %.4f %.4f %.4f\n",
-                                sample[0], sample[1], sample[2]);
+                    double total = 0.0;
+                    for (unsigned short value : bits)
+                    {
+                        total += double(halfToFloat(value));
+                    }
+                    const double mean = total / double(sampled);
+                    std::printf("     first %zu samples mean %.4f (input was 0.5)\n",
+                                sampled, mean);
+                    if (!(mean > 0.4 && mean < 0.6))
+                    {
+                        std::printf("FAIL: mean %.4f is not near the 0.5 that went in\n", mean);
+                        ++failures;
+                    }
                 }
             }
         }

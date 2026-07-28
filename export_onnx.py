@@ -248,11 +248,16 @@ def export_light_inpaint_v1(model, path):
     mixes tokens with a Conv1d and has no head permute to lower -- nor the
     batch-2 example, which was checked and is not required here. The example is
     batch 2 anyway, to keep the two exports the same shape.
+
+    Exported in half precision, like the video graph beside it. Here it is a
+    speed choice rather than a necessity -- 35.4 ms an eye at HD becomes 18.3 --
+    but it is also the precision iw3 runs the model at, since its inference path
+    is under ``torch.autocast`` throughout.
     """
-    graph = LightInpaintGraph(model).eval()
+    graph = LightInpaintGraph(model.half()).eval()
     generator = torch.Generator().manual_seed(0)
-    eye = torch.rand((2, 3, 256, 448), generator=generator)
-    mask = torch.zeros((2, 1, 256, 448))
+    eye = torch.rand((2, 3, 256, 448), generator=generator).half()
+    mask = torch.zeros((2, 1, 256, 448), dtype=torch.float16)
     mask[:, :, 64:128, 112:150] = 1.0
 
     batch = torch.export.Dim("batch", min=1, max=64)

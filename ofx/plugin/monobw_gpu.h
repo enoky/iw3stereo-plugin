@@ -69,6 +69,21 @@ public:
     // itself for the right eye, which is already there.
     const float* finishEye(const float* filled, bool rightEye, void* stream);
 
+    // Half-precision copies of what prepareEye() produced, for a graph that
+    // wants them. The inpaint graphs do: in fp32 the twelve-frame window does
+    // not fit in 17 GiB, and halving it also halves the time.
+    //
+    // Everything this class computes stays fp32 -- the warp's coordinate
+    // arithmetic needs it -- so the conversion is a pass at the boundary rather
+    // than a change of type throughout.
+    void castEyeAndMaskToHalf(void* stream);
+    const void* inpaintEyeHalfDevice() const { return _eyeHalf; }
+    const void* processedMaskHalfDevice() const { return _maskHalf; }
+
+    // The graph's half output back to float, into a buffer this owns, so
+    // finishEye() and the compose kernel see what they expect.
+    const float* halfToFloat(const void* filled, void* stream);
+
     const float* inpaintEyeDevice() const { return _eye; }
 
     // preprocess_mask on the mask forward() produced: mask_closing, then the
@@ -111,10 +126,14 @@ private:
     float* _flipImage = nullptr;  // 3 * width * height, the right eye's mirrored source
     float* _flipDepth = nullptr;  // depthWidth * depthHeight, likewise
     float* _final = nullptr;      // 3 * width * height, the left eye mirrored back
+    void* _eyeHalf = nullptr;     // 3 * width * height, __half
+    void* _maskHalf = nullptr;    // width * height, __half
+    float* _fromHalf = nullptr;   // 3 * width * height, the graph's output widened
 
     size_t _gridXHeld = 0, _gridYHeld = 0, _scratchHeld = 0, _eyeHeld = 0, _maskHeld = 0;
     size_t _maskAHeld = 0, _maskBHeld = 0;
     size_t _flipImageHeld = 0, _flipDepthHeld = 0, _finalHeld = 0;
+    size_t _eyeHalfHeld = 0, _maskHalfHeld = 0, _fromHalfHeld = 0;
 
     std::string _error;
 };

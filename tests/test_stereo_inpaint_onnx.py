@@ -32,8 +32,14 @@ CHECKPOINT = os.path.join(
     os.environ.get("NUNIF_ROOT", r"F:\_AI_PROJECTS_\nunif"),
     "iw3", "pretrained_models", "hub", "checkpoints", "iw3_light_inpaint_v1_20250919.pth")
 
-# Measured 1.0e-6 to 3.6e-6 across every size tried, up to full HD.
-TOLERANCE = 2e-5
+# Both inpaint graphs are exported in half precision. For the video one that is
+# the only form that fits -- in fp32 the twelve-frame window exhausts 17 GiB at
+# HD -- and the image one follows because it halves 35.4 ms an eye to 18.3 and
+# because fp16 is what iw3 runs these models at anyway.
+#
+# So the bar here is fp16 round-off against an fp32 reference, not a port error.
+# Measured max 2.4e-03 on an output in 0..1, in regions the model is inventing.
+TOLERANCE = 5e-3
 
 
 def make_pair(height, width, batch=1, seed=0):
@@ -63,10 +69,11 @@ class InpaintOnnxTest(unittest.TestCase):
         cls.model = stereo_inpaint.load_light_inpaint_v1(CHECKPOINT, device="cpu")
 
     def run_graph(self, eye, mask):
-        return self.session.run(["y"], {"eye": eye.numpy(), "mask": mask.numpy()})[0]
+        return self.session.run(["y"], {"eye": eye.numpy().astype(np.float16),
+                                        "mask": mask.numpy().astype(np.float16)})[0]
 
     def assert_close(self, eye, mask, label=""):
-        got = self.run_graph(eye, mask)
+        got = self.run_graph(eye, mask).astype(np.float32)
         with torch.inference_mode():
             want = self.model.infer(eye, mask).numpy()
         self.assertEqual(want.shape, got.shape, f"shape {label}")
@@ -99,15 +106,16 @@ class InpaintOnnxTest(unittest.TestCase):
         """Nothing to fill means nothing changes -- the composite is by the mask."""
         eye, _ = make_pair(256, 448)
         mask = torch.zeros((1, 1, 256, 448))
-        got = self.run_graph(eye, mask)
-        self.assertLess(np.abs(eye.numpy() - got).max(), 1e-6,
+        got = self.run_graph(eye, mask).astype(np.float32)
+        # Half precision, so the passthrough is exact only to fp16's spacing.
+        self.assertLess(np.abs(eye.numpy() - got).max(), 1e-3,
                         "an empty mask must leave the eye untouched")
 
     def test_full_mask_replaces_everything(self):
         """The opposite end: the network's own output, no source left."""
         eye, _ = make_pair(256, 448)
         mask = torch.ones((1, 1, 256, 448))
-        got = self.run_graph(eye, mask)
+        got = self.run_graph(eye, mask).astype(np.float32)
         self.assertGreater(np.abs(eye.numpy() - got).max(), 0.05,
                            "a full mask must not return the source")
         self.assert_close(eye, mask, "full mask")
@@ -122,9 +130,9 @@ class InpaintOnnxTest(unittest.TestCase):
         the boundary were drawn in the wrong place -- a preprocessing step left
         on the wrong side of it -- this is what would catch it.
 
-        Run without autocast on both sides. The graph is fp32 throughout and
-        the torch pipeline is fp16 under autocast, and that gap is far wider
-        than anything this test is trying to measure.
+        Run without autocast on the torch side. The graph is fp16, so the gap
+        being measured is precision plus the boundary, and enabling autocast as
+        well would add a third variable to it.
         """
         pipeline = stereo_inpaint.MonoBWInpaintImage(self.model, device="cpu")
 
@@ -146,9 +154,10 @@ class InpaintOnnxTest(unittest.TestCase):
             """Stands in for LightInpaintV1, calling the graph instead."""
 
             def infer(self, eye, mask):
-                y = session.run(["y"], {"eye": eye.contiguous().numpy(),
-                                        "mask": mask.contiguous().numpy()})[0]
-                return torch.from_numpy(y)
+                y = session.run(["y"], {
+                    "eye": eye.contiguous().numpy().astype(np.float16),
+                    "mask": mask.contiguous().numpy().astype(np.float16)})[0]
+                return torch.from_numpy(y.astype(np.float32))
 
         hybrid = stereo_inpaint.MonoBWInpaintImage(OnnxNetwork(), device="cpu")
         with torch.inference_mode():
@@ -166,7 +175,7 @@ class InpaintOnnxTest(unittest.TestCase):
         input. It must not: with a mask, the result has to move.
         """
         eye, mask = make_pair(256, 448)
-        got = self.run_graph(eye, mask)
+        got = self.run_graph(eye, mask).astype(np.float32)
         difference = np.abs(eye.numpy() - got).max()
         self.assertGreater(difference, 0.01,
                            f"graph changed the eye by only {difference}; is it running?")
@@ -179,7 +188,11 @@ class InpaintOnnxTest(unittest.TestCase):
         support = torch.nn.functional.max_pool2d(mask, kernel_size=17, stride=1, padding=8)
         outside = np.broadcast_to(support.numpy() == 0, eye.shape)
         untouched = np.abs(eye.numpy() - got)[outside].max()
-        self.assertLess(untouched, 1e-5,
+        # One fp16 ULP near 0.5 is 2**-12, about 2.4e-04, and that is what this
+        # measures: outside the support the composite returns the source
+        # exactly, but the source has been round-tripped through a half-precision
+        # graph. Anything materially larger would mean the fill is leaking.
+        self.assertLess(untouched, 1e-3,
                         f"the fill reached {untouched} beyond the mask blur's support")
 
 
@@ -198,7 +211,7 @@ class VideoInpaintOnnxTest(unittest.TestCase):
     anyway, and fp16 is what iw3 runs these models at in the first place.
     """
 
-    # fp16 round-off against an fp32 reference, not a port error.
+    # Same bar as the image graph beside it, and for the same reason.
     TOLERANCE = 5e-3
 
     GRAPH = os.path.join(MODELS_DIR, "light_video_inpaint_v1.onnx")

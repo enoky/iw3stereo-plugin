@@ -2,6 +2,7 @@
 
 #include "monobw_math.h"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -161,6 +162,22 @@ __global__ void flipKernel(const float* __restrict__ source, int width, int heig
     }
 }
 
+__global__ void toHalfKernel(const float* __restrict__ source, size_t count,
+                             __half* __restrict__ destination)
+{
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    destination[i] = __float2half(source[i]);
+}
+
+__global__ void fromHalfKernel(const __half* __restrict__ source, size_t count,
+                               float* __restrict__ destination)
+{
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    destination[i] = __half2float(source[i]);
+}
+
 // mask_closing's four passes. One kernel with a flag rather than two, because
 // the only difference is which way the reduction goes and the launch pattern is
 // identical.
@@ -196,7 +213,11 @@ __global__ void maskFinishKernel(const float* __restrict__ closed,
 MonoBwGpu::~MonoBwGpu()
 {
     for (float* pointer : {_gridX, _gridY, _scratch, _eye, _mask, _maskA, _maskB,
-                           _flipImage, _flipDepth, _final})
+                           _flipImage, _flipDepth, _final, _fromHalf})
+    {
+        if (pointer) cudaFree(pointer);
+    }
+    for (void* pointer : {_eyeHalf, _maskHalf})
     {
         if (pointer) cudaFree(pointer);
     }
@@ -248,6 +269,13 @@ bool MonoBwGpu::prepare(int width, int height, int depthWidth, int depthHeight)
     if (!allocate(&_flipImage, pixels * 3, _flipImageHeld)) return false;
     if (!allocate(&_flipDepth, depthPixels, _flipDepthHeld)) return false;
     if (!allocate(&_final, pixels * 3, _finalHeld)) return false;
+    // Half buffers are allocated as floats of half the count, which is the same
+    // number of bytes and saves a second allocator.
+    if (!allocate(reinterpret_cast<float**>(&_eyeHalf), (pixels * 3 + 1) / 2, _eyeHalfHeld))
+        return false;
+    if (!allocate(reinterpret_cast<float**>(&_maskHalf), (pixels + 1) / 2, _maskHalfHeld))
+        return false;
+    if (!allocate(&_fromHalf, pixels * 3, _fromHalfHeld)) return false;
 
     return _error.empty();
 }
@@ -377,6 +405,35 @@ bool MonoBwGpu::prepareEye(const float* image, const float* depth, bool rightEye
     // dilate_inner and dilate_outer are directional.
     preprocessMask(_mask, innerDilation, outerDilation, baseWidth, stream);
     return ok();
+}
+
+void MonoBwGpu::castEyeAndMaskToHalf(void* stream)
+{
+    cudaStream_t cudaStream = static_cast<cudaStream_t>(stream);
+    const size_t pixels = size_t(_width) * size_t(_height);
+    constexpr int kThreads = 256;
+
+    const size_t eyeCount = pixels * 3;
+    toHalfKernel<<<unsigned((eyeCount + kThreads - 1) / kThreads), kThreads, 0, cudaStream>>>(
+        _eye, eyeCount, static_cast<__half*>(_eyeHalf));
+    toHalfKernel<<<unsigned((pixels + kThreads - 1) / kThreads), kThreads, 0, cudaStream>>>(
+        _processedMask, pixels, static_cast<__half*>(_maskHalf));
+
+    const cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess)
+    {
+        _error = std::string("half cast failed: ") + cudaGetErrorString(status);
+    }
+}
+
+const float* MonoBwGpu::halfToFloat(const void* filled, void* stream)
+{
+    const size_t count = size_t(_width) * size_t(_height) * 3;
+    constexpr int kThreads = 256;
+    fromHalfKernel<<<unsigned((count + kThreads - 1) / kThreads), kThreads, 0,
+                     static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const __half*>(filled), count, _fromHalf);
+    return _fromHalf;
 }
 
 const float* MonoBwGpu::finishEye(const float* filled, bool rightEye, void* stream)

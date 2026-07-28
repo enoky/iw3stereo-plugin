@@ -83,6 +83,11 @@ public:
     // returns left and right, the inpaint one filled eye.
     size_t outputCount(size_t model) const;
 
+    // True when the graph wants half-precision input, which the inpaint graphs
+    // do. Everything the plugin computes is fp32, so this decides whether a
+    // cast has to happen either side of the call.
+    bool inputIsHalf(size_t model) const;
+
     bool deviceCapable() const { return ready() && _provider == "CUDA" && _cudaMemoryInfo; }
 
     bool ready() const { return !_models.empty() && _models[0].session != nullptr; }
@@ -114,6 +119,10 @@ private:
         // literal name is what lets one code path drive both.
         std::vector<std::string> inputNames;
         std::vector<std::string> outputNames;
+        // Read from the graph too. The inpaint graphs are exported in half
+        // precision -- in fp32 the twelve-frame window does not fit in 17 GiB
+        // -- and the caller has to know which kind of buffer to hand over.
+        ONNXTensorElementDataType inputType = ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
     };
 
     void note(const std::string& line) { _report.push_back(line); }

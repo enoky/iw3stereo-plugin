@@ -275,7 +275,28 @@ bool OrtRuntime::readInputNames(Model& model)
         model.inputNames.push_back(name);
         allocator->Free(allocator, name);
     }
+
+    // The element type of input 0 stands for the graph: every input of these
+    // graphs has the same precision.
+    OrtTypeInfo* info = nullptr;
+    if (count > 0 && !failed(_api->SessionGetInputTypeInfo(model.session, 0, &info),
+                             "SessionGetInputTypeInfo"))
+    {
+        const OrtTensorTypeAndShapeInfo* tensor = nullptr;
+        if (!failed(_api->CastTypeInfoToTensorInfo(info, &tensor), "CastTypeInfoToTensorInfo") &&
+            tensor)
+        {
+            failed(_api->GetTensorElementType(tensor, &model.inputType), "GetTensorElementType");
+        }
+        _api->ReleaseTypeInfo(info);
+    }
     return true;
+}
+
+bool OrtRuntime::inputIsHalf(size_t model) const
+{
+    return model < _models.size() &&
+           _models[model].inputType == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16;
 }
 
 bool OrtRuntime::readOutputNames(Model& model)
@@ -392,10 +413,14 @@ void OrtRuntime::warmUp(size_t index)
                  "]: no device binding (the inpaint graph is GPU-only)");
             return;
         }
-        std::vector<float> eye(kElements, 0.5f);
-        std::vector<float> mask(size_t(kSize) * kSize, 0.0f);
+        // Sized in bytes rather than floats, because the graph may be half.
+        const size_t width = inputIsHalf(index) ? sizeof(uint16_t) : sizeof(float);
+        std::vector<char> eye(kElements * width, 0);
+        std::vector<char> mask(size_t(kSize) * kSize * width, 0);
         const float* filled = nullptr;
-        ok = runInpaintWith(index, _memoryInfo, eye.data(), mask.data(), shape, &filled);
+        ok = runInpaintWith(index, _memoryInfo,
+                            reinterpret_cast<const float*>(eye.data()),
+                            reinterpret_cast<const float*>(mask.data()), shape, &filled);
     }
     else
     {
@@ -524,16 +549,23 @@ bool OrtRuntime::runInpaintWith(size_t index, OrtMemoryInfo* memoryInfo,
     const int64_t maskShape[4] = {shape[0], 1, shape[2], shape[3]};
     const size_t maskElements = size_t(shape[0] * shape[2] * shape[3]);
 
+    // The graph's own element type, not an assumption. Both inpaint graphs are
+    // half; the caller has already cast its buffers to match, and passing the
+    // wrong width here would be read as garbage rather than rejected.
+    const ONNXTensorElementDataType type = model.inputType;
+    const size_t elementSize =
+        (type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) ? sizeof(uint16_t) : sizeof(float);
+
     OrtValue* eyeValue = nullptr;
     OrtValue* maskValue = nullptr;
     bool ok = false;
 
     if (!failed(_api->CreateTensorWithDataAsOrtValue(
-            memoryInfo, const_cast<float*>(eye), eyeElements * sizeof(float),
-            shape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &eyeValue), "inpaint eye tensor") &&
+            memoryInfo, const_cast<float*>(eye), eyeElements * elementSize,
+            shape, 4, type, &eyeValue), "inpaint eye tensor") &&
         !failed(_api->CreateTensorWithDataAsOrtValue(
-            memoryInfo, const_cast<float*>(mask), maskElements * sizeof(float),
-            maskShape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &maskValue), "inpaint mask tensor"))
+            memoryInfo, const_cast<float*>(mask), maskElements * elementSize,
+            maskShape, 4, type, &maskValue), "inpaint mask tensor"))
     {
         // By position, not by literal name: the per-frame graph calls them
         // eye/mask and the twelve-frame one eyes/masks.
