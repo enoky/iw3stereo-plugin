@@ -14,6 +14,7 @@
 #include "ofxsProcessing.h"
 
 #include "monobw_gpu.h"
+#include "monobw_math.h"
 #include "ort_runtime.h"
 #include "probe_log.h"
 #include "stereo_gpu.h"
@@ -114,6 +115,7 @@ public:
         _modelChoice = fetchChoiceParam("model");
         _maskInnerDilation = fetchIntParam("maskInnerDilation");
         _maskOuterDilation = fetchIntParam("maskOuterDilation");
+        _inpaintMaxWidth = fetchIntParam("inpaintMaxWidth");
 
         startRuntimeBringUp();
     }
@@ -148,6 +150,7 @@ private:
     OFX::ChoiceParam* _modelChoice = nullptr;
     OFX::IntParam* _maskInnerDilation = nullptr;
     OFX::IntParam* _maskOuterDilation = nullptr;
+    OFX::IntParam* _inpaintMaxWidth = nullptr;
 
     // Reused across frames; resized only when the frame size changes.
     std::vector<float> _image, _depthFull, _depthSmall, _x, _left, _right, _composed;
@@ -271,6 +274,7 @@ iw3::Settings Iw3StereoEffect::readSettings(double time) const
     settings.model = size_t(choice >= 1 && choice <= 3 ? choice : 0);
     _maskInnerDilation->getValueAtTime(time, settings.maskInnerDilation);
     _maskOuterDilation->getValueAtTime(time, settings.maskOuterDilation);
+    _inpaintMaxWidth->getValueAtTime(time, settings.inpaintMaxWidth);
     _output->getValueAtTime(time, choice);
     settings.output = choice == 1 ? iw3::OutputMode::LeftEye
                     : choice == 2 ? iw3::OutputMode::RightEye
@@ -408,6 +412,7 @@ unsigned long long settingsFingerprint(const iw3::Settings& settings, int width,
     mix(unsigned(settings.stereoWidth));
     mix(unsigned(settings.maskInnerDilation));
     mix(unsigned(settings.maskOuterDilation));
+    mix(unsigned(settings.inpaintMaxWidth));
     mix(unsigned(width));
     mix(unsigned(height));
     return hash;
@@ -452,7 +457,10 @@ bool Iw3StereoEffect::buildVideoWindow(const OFX::RenderArguments& args,
     const int width = window.x2 - window.x1;
     const int height = window.y2 - window.y1;
     const iw3::Mapper mapper(settings.foregroundScale, settings.mapperType);
-    const int64_t shape[4] = {iw3::MonoBwVideoGpu::kSequence, 3, height, width};
+    int workWidth = 0, workHeight = 0;
+    iw3::math::inpaintWorkingSize(width, height, settings.inpaintMaxWidth,
+                                  workWidth, workHeight);
+    const int64_t shape[4] = {iw3::MonoBwVideoGpu::kSequence, 3, workHeight, workWidth};
 
     for (int pass = 0; pass < 2; ++pass)
     {
@@ -521,7 +529,7 @@ bool Iw3StereoEffect::buildVideoWindow(const OFX::RenderArguments& args,
                 report("monobw warp failed: " + _monobw.error(), true);
                 return false;
             }
-            _monobw.castEyeAndMaskToHalf(stream);
+            _monobw.prepareInpaintInput(settings.inpaintMaxWidth, stream);
             _video.storeFrame(slot, _monobw.inpaintEyeHalfDevice(),
                               _monobw.processedMaskHalfDevice(), stream);
         }
@@ -635,8 +643,11 @@ bool Iw3StereoEffect::renderCuda(const OFX::RenderArguments& args, const iw3::Se
             report("The temporal inpaint graph did not load; see the log.", true);
             return false;
         }
+        int workWidth = 0, workHeight = 0;
+        iw3::math::inpaintWorkingSize(width, height, settings.inpaintMaxWidth,
+                                      workWidth, workHeight);
         if (!_monobw.prepare(width, height, depthWidth, depthHeight) ||
-            !_video.prepare(width, height))
+            !_video.prepare(workWidth, workHeight))
         {
             report("GPU setup failed: " + _monobw.error() + _video.error(), true);
             return false;
@@ -665,9 +676,32 @@ bool Iw3StereoEffect::renderCuda(const OFX::RenderArguments& args, const iw3::Se
         // before the first frame it emits, so this is simply the position
         // within the stride.
         const int offset = int(frame - windowIndex * iw3::MonoBwVideoGpu::kStride);
-        // The left eye was inpainted mirrored, so it comes back mirrored.
-        left = _video.cachedEye(false, offset, true, stream);
-        right = _video.cachedEye(true, offset, false, stream);
+        // The cache holds the graph's output, still half and still at the
+        // working resolution; this widens it, composites it back into the
+        // full-resolution eye, and undoes the mirror the left eye went in with.
+        //
+        // The right eye is computed second on purpose: finishInpaintOutput and
+        // finishEye each return a buffer the next call reuses, and mirroring
+        // the left eye back copies it out of the way.
+        _monobw.prepareEye(_gpu.imageDevice(), _gpu.depthDevice(), false,
+                           settings.divergence, settings.convergence,
+                           settings.preserveScreenBorder,
+                           settings.maskInnerDilation, settings.maskOuterDilation,
+                           depthWidth, stream);
+        _monobw.prepareInpaintInput(settings.inpaintMaxWidth, stream);
+        left = _monobw.finishEye(
+            _monobw.finishInpaintOutput(_video.cachedFrame(false, offset), stream),
+            false, stream);
+
+        _monobw.prepareEye(_gpu.imageDevice(), _gpu.depthDevice(), true,
+                           settings.divergence, settings.convergence,
+                           settings.preserveScreenBorder,
+                           settings.maskInnerDilation, settings.maskOuterDilation,
+                           depthWidth, stream);
+        _monobw.prepareInpaintInput(settings.inpaintMaxWidth, stream);
+        right = _monobw.finishEye(
+            _monobw.finishInpaintOutput(_video.cachedFrame(true, offset), stream),
+            true, stream);
     }
     else if (settings.method == iw3::Method::MonoBwInpaint)
     {
@@ -714,31 +748,27 @@ bool Iw3StereoEffect::renderCuda(const OFX::RenderArguments& args, const iw3::Se
             // change of type throughout.
             const bool half = ort.inputIsHalf(model);
             const float* filled = nullptr;
-            if (half)
+            _monobw.prepareInpaintInput(half ? settings.inpaintMaxWidth : 0, stream);
+            if (cudaStreamSynchronize(static_cast<cudaStream_t>(stream)) != cudaSuccess)
             {
-                _monobw.castEyeAndMaskToHalf(stream);
-                if (cudaStreamSynchronize(static_cast<cudaStream_t>(stream)) != cudaSuccess)
-                {
-                    report("CUDA stream sync failed -- falling back to the CPU.", true);
-                    return false;
-                }
+                report("CUDA stream sync failed -- falling back to the CPU.", true);
+                return false;
             }
+            const int64_t inpaintShape[4] = {1, 3, _monobw.inpaintHeight(),
+                                             _monobw.inpaintWidth()};
             const float* eyeIn = half
                 ? reinterpret_cast<const float*>(_monobw.inpaintEyeHalfDevice())
                 : _monobw.inpaintEyeDevice();
             const float* maskIn = half
                 ? reinterpret_cast<const float*>(_monobw.processedMaskHalfDevice())
                 : _monobw.processedMaskDevice();
-            if (!ort.runInpaintDevice(model, eyeIn, maskIn, imageShape, &filled))
+            if (!ort.runInpaintDevice(model, eyeIn, maskIn, inpaintShape, &filled))
             {
                 logRuntimeReport("inpaint inference");
                 report("GPU inpaint failed; see the log.", true);
                 return false;
             }
-            if (half)
-            {
-                filled = _monobw.halfToFloat(filled, stream);
-            }
+            filled = _monobw.finishInpaintOutput(filled, stream);
             const float* eye = _monobw.finishEye(filled, rightEye, stream);
             if (rightEye)
             {
@@ -1164,6 +1194,19 @@ void Iw3StereoFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OFX::
     outerDilation->setDisplayRange(0, 8);
     outerDilation->setDefault(0);
     page->addChild(*outerDilation);
+
+    OFX::IntParamDescriptor* inpaintWidth = desc.defineIntParam("inpaintMaxWidth");
+    inpaintWidth->setLabels("Inpaint Max Width", "Inpaint Width", "Inpaint Max Width");
+    inpaintWidth->setHint("Both monobw models only. Caps the width the inpaint network runs at, "
+                          "0 for the frame's own. Its memory scales with area -- at HD the "
+                          "temporal model needs about 9 GB, 4.5 at 1280 wide and 3.4 at 960 -- "
+                          "so this is the setting that fits it on a smaller card. The output "
+                          "stays full resolution either way: only the invented pixels are "
+                          "computed small, and everything outside a hole keeps its own detail.");
+    inpaintWidth->setRange(0, 8192);
+    inpaintWidth->setDisplayRange(0, 3840);
+    inpaintWidth->setDefault(0);
+    page->addChild(*inpaintWidth);
 
     // -- Stereo ------------------------------------------------------------
     OFX::GroupParamDescriptor* stereo = desc.defineGroupParam("stereoGroup");

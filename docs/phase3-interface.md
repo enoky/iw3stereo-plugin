@@ -60,6 +60,14 @@ running a full-resolution network on the CPU at seconds a frame.
 | --- | --- | --- | --- | --- |
 | **Mask Inner Dilation** | int | 0 – 16, slider 0 – 8 | **0** | monobw_inpaint only. Grows the hole mask towards the occluding edge before filling, which helps when the depth map's edge sits slightly inside the object's. |
 | **Mask Outer Dilation** | int | 0 – 16, slider 0 – 8 | **0** | monobw_inpaint only. Grows it the other way, giving the network more room to invent into. |
+| **Inpaint Max Width** | int | 0 – 8192, slider 0 – 3840 | **0 = frame width** | Both monobw models. Caps the width the inpaint network runs at. Its memory scales with area, so this is what fits the temporal model on a smaller card: about 9 GB at HD, 4.5 at 1280, 3.4 at 960. |
+
+Reducing it does **not** reduce the output. The warp and the hole mask stay at
+full resolution; only the network runs small, and its fill is composited back
+into the full-resolution eye through the same feathered mask the network uses
+internally. Everything outside a hole keeps its own detail, and only the
+invented pixels are the ones computed small — which is the right place to spend
+the quality, since those pixels are guesses either way.
 
 Both are counted against the depth's width rather than the frame's, so a setting
 means the same thing at any output resolution. They stay visible when another

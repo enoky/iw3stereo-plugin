@@ -123,9 +123,13 @@ int main(int argc, char** argv)
 
     // The geometry from the user's log: an HD frame with depth at the model
     // working size.
-    const struct { int width, height, depthWidth, depthHeight; } cases[] = {
-        {1920, 1036, 714, 392},
-        {384, 216, 192, 108},
+    // The last case exercises Inpaint Max Width: the graph runs at 960 wide and
+    // the fill is composited back into the full-resolution eye, so the output
+    // is still 1920 and everything outside a hole is untouched.
+    const struct { int width, height, depthWidth, depthHeight, maxWidth; } cases[] = {
+        {1920, 1036, 714, 392, 0},
+        {384, 216, 192, 108, 0},
+        {1920, 1036, 714, 392, 960},
     };
 
     int failures = 0;
@@ -162,28 +166,26 @@ int main(int argc, char** argv)
             }
             cudaDeviceSynchronize();
 
-            const int64_t shape[4] = {1, 3, c.height, c.width};
             const float* filled = nullptr;
             const bool half = ort.inputIsHalf(2);
-            if (half)
-            {
-                gpu.castEyeAndMaskToHalf(nullptr);
-                cudaDeviceSynchronize();
-            }
+            gpu.prepareInpaintInput(c.maxWidth, nullptr);
+            cudaDeviceSynchronize();
+            const int64_t reduced[4] = {1, 3, gpu.inpaintHeight(), gpu.inpaintWidth()};
             const bool ok = ort.runInpaintDevice(
                 2,
                 half ? reinterpret_cast<const float*>(gpu.inpaintEyeHalfDevice())
                      : gpu.inpaintEyeDevice(),
                 half ? reinterpret_cast<const float*>(gpu.processedMaskHalfDevice())
                      : gpu.processedMaskDevice(),
-                shape, &filled);
-            if (ok && half)
+                reduced, &filled);
+            if (ok)
             {
-                filled = gpu.halfToFloat(filled, nullptr);
+                filled = gpu.finishInpaintOutput(filled, nullptr);
                 cudaDeviceSynchronize();
             }
-            std::printf("%s %dx%d %s eye: runInpaintDevice %s (%.2f ms)\n",
+            std::printf("%s frame %dx%d, inpaint %dx%d, %s eye: %s (%.2f ms)\n",
                         ok ? "ok  " : "FAIL", c.width, c.height,
+                        gpu.inpaintWidth(), gpu.inpaintHeight(),
                         rightEye ? "right" : "left ",
                         ok ? "returned a buffer" : "FAILED",
                         ort.lastRunMilliseconds());
@@ -246,7 +248,7 @@ int main(int argc, char** argv)
             {
                 gpu.prepareEye(deviceImage, deviceDepth, false, 2.0, 0.5, false,
                                0, 0, depthWidth, nullptr);
-                gpu.castEyeAndMaskToHalf(nullptr);
+                gpu.prepareInpaintInput(0, nullptr);
                 cudaDeviceSynchronize();
                 cudaMemcpy(reinterpret_cast<char*>(eyes) + size_t(frame) * pixels * 3 * element,
                            gpu.inpaintEyeHalfDevice(), pixels * 3 * element,

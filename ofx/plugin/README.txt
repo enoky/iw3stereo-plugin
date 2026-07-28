@@ -109,6 +109,21 @@ PARAMETERS
                       means the same thing whatever resolution you render at.
                       Both do nothing when another Model is selected.
 
+  Inpaint Max        Caps the width the inpaint network runs at. 0 uses the
+  Width              frame's own width.
+
+                      This is the setting to reach for if you run out of VRAM.
+                      The network's memory scales with area: at HD the temporal
+                      model wants about 9 GB, at 1280 wide about 4.5, at 960
+                      about 3.4. It gets faster in the same proportion.
+
+                      It does not shrink your output. The warp and the hole
+                      detection stay at full resolution; only the network runs
+                      small, and what it invents is blended back into the
+                      full-resolution frame. Everything outside a hole keeps its
+                      own detail. Since the filled pixels are invented anyway,
+                      this is a cheap place to save.
+
 Stereo
 
   Divergence          Strength of the 3D effect, as a percentage of image

@@ -69,20 +69,35 @@ public:
     // itself for the right eye, which is already there.
     const float* finishEye(const float* filled, bool rightEye, void* stream);
 
-    // Half-precision copies of what prepareEye() produced, for a graph that
-    // wants them. The inpaint graphs do: in fp32 the twelve-frame window does
-    // not fit in 17 GiB, and halving it also halves the time.
+    // What the inpaint graph is fed: half precision, and optionally at a
+    // reduced resolution.
     //
-    // Everything this class computes stays fp32 -- the warp's coordinate
-    // arithmetic needs it -- so the conversion is a pass at the boundary rather
-    // than a change of type throughout.
-    void castEyeAndMaskToHalf(void* stream);
+    // Half because in fp32 the twelve-frame window does not fit in 17 GiB and
+    // the per-frame one costs twice as much for nothing. Reduced because the
+    // graph's memory scales with area -- 9.0 GiB at HD, 4.5 at 1280 wide, 3.4
+    // at 960 -- and that is the only lever that brings the temporal model onto
+    // a smaller card.
+    //
+    // Everything this class computes stays fp32 at full resolution; the warp's
+    // coordinate arithmetic needs the range and the frame has to come out at
+    // the size Resolve asked for. Both conversions are passes at the boundary.
+    //
+    // `maxWidth` of 0, or anything at least the frame's width, leaves the
+    // resolution alone and the path is exactly what it was.
+    void prepareInpaintInput(int maxWidth, void* stream);
+    int inpaintWidth() const { return _workWidth; }
+    int inpaintHeight() const { return _workHeight; }
     const void* inpaintEyeHalfDevice() const { return _eyeHalf; }
     const void* processedMaskHalfDevice() const { return _maskHalf; }
 
-    // The graph's half output back to float, into a buffer this owns, so
-    // finishEye() and the compose kernel see what they expect.
-    const float* halfToFloat(const void* filled, void* stream);
+    // The graph's output back to a full-resolution float frame.
+    //
+    // At full resolution that is just a widening: the graph already composited
+    // against the eye it was given. Reduced, it is a widening, an upscale and a
+    // composite against the *full* eye by a feathered full-resolution mask, so
+    // everything outside a hole keeps its original detail and only the invented
+    // pixels are the ones that were computed small.
+    const float* finishInpaintOutput(const void* filled, void* stream);
 
     const float* inpaintEyeDevice() const { return _eye; }
 
@@ -126,14 +141,18 @@ private:
     float* _flipImage = nullptr;  // 3 * width * height, the right eye's mirrored source
     float* _flipDepth = nullptr;  // depthWidth * depthHeight, likewise
     float* _final = nullptr;      // 3 * width * height, the left eye mirrored back
-    void* _eyeHalf = nullptr;     // 3 * width * height, __half
-    void* _maskHalf = nullptr;    // width * height, __half
+    void* _eyeHalf = nullptr;     // 3 * workWidth * workHeight, __half
+    void* _maskHalf = nullptr;    // workWidth * workHeight, __half
     float* _fromHalf = nullptr;   // 3 * width * height, the graph's output widened
+    float* _maskBlur = nullptr;   // width * height, the feather for the composite
+    float* _maskBlurTmp = nullptr;
+    int _workWidth = 0, _workHeight = 0;
 
     size_t _gridXHeld = 0, _gridYHeld = 0, _scratchHeld = 0, _eyeHeld = 0, _maskHeld = 0;
     size_t _maskAHeld = 0, _maskBHeld = 0;
     size_t _flipImageHeld = 0, _flipDepthHeld = 0, _finalHeld = 0;
     size_t _eyeHalfHeld = 0, _maskHalfHeld = 0, _fromHalfHeld = 0;
+    size_t _maskBlurHeld = 0, _maskBlurTmpHeld = 0;
 
     std::string _error;
 };
@@ -167,6 +186,10 @@ public:
     MonoBwVideoGpu(const MonoBwVideoGpu&) = delete;
     MonoBwVideoGpu& operator=(const MonoBwVideoGpu&) = delete;
 
+    // `width`/`height` are the *inpaint working* size, which is the frame's
+    // unless Inpaint Max Width has reduced it. The cache holds the graph's
+    // output, so it is that size too, and the composite back up to the frame
+    // happens per output frame in MonoBwGpu.
     bool prepare(int width, int height);
 
     // Which window a frame belongs to, and which frame that window starts at.
@@ -196,9 +219,9 @@ public:
 
     // Keep the middle `kStride` frames of the graph's output for one eye.
     void cacheOutput(bool rightEye, const void* filledHalf, void* stream);
-    // A cached frame in frame orientation, ready for compose(). `offset` is
-    // 0..kStride-1 within the window.
-    const float* cachedEye(bool rightEye, int offset, bool mirrorBack, void* stream);
+    // One cached frame of the window, still half and still at the working
+    // resolution. MonoBwGpu::finishInpaintOutput takes it from here.
+    const void* cachedFrame(bool rightEye, int offset) const;
 
     bool ok() const { return _error.empty(); }
     const std::string& error() const { return _error; }
@@ -210,11 +233,8 @@ private:
     void* _eyes = nullptr;    // kSequence * 3 * width * height, __half
     void* _masks = nullptr;   // kSequence * width * height, __half
     void* _cache[2] = {nullptr, nullptr};  // [eye] kStride * 3 * w * h, __half
-    float* _scratch = nullptr;             // one frame widened, and mirrored
-    float* _mirror = nullptr;
 
     size_t _eyesHeld = 0, _masksHeld = 0, _cacheHeld[2] = {0, 0};
-    size_t _scratchHeld = 0, _mirrorHeld = 0;
 
     long long _window = -1;
     unsigned long long _fingerprint = 0;

@@ -52,21 +52,59 @@ constexpr float kStretchThreshold = 0.5f;
 // Computed rather than tabulated so the formula is the thing under review. The
 // intermediate is double because Python's is -- 9 * 0.15 + 0.35 is not 1.7 in
 // binary, and rounding it early moves the last bit of every tap.
-IW3_HD inline void smoothKernel(float* weights)
+IW3_HD inline void gaussianKernel(float* weights, int size)
 {
-    const float sigma = float(double(kSmoothKernel) * 0.15 + 0.35);
-    const float half = float(kSmoothKernel - 1) * 0.5f;
+    const float sigma = float(double(size) * 0.15 + 0.35);
+    const float half = float(size - 1) * 0.5f;
     float total = 0.0f;
-    for (int i = 0; i < kSmoothKernel; ++i)
+    for (int i = 0; i < size; ++i)
     {
         const float x = float(i) - half;
         const float value = expf(-0.5f * (x / sigma) * (x / sigma));
         weights[i] = value;
         total += value;
     }
-    for (int i = 0; i < kSmoothKernel; ++i)
+    for (int i = 0; i < size; ++i)
     {
         weights[i] /= total;
+    }
+}
+
+IW3_HD inline void smoothKernel(float* weights)
+{
+    gaussianKernel(weights, kSmoothKernel);
+}
+
+// The mask feather. LightInpaintV1 blurs the hole mask with a separable 15-tap
+// gaussian and composites by the result, so the fill fades in rather than
+// meeting the original at a hard edge. The graph does that for itself at
+// whatever resolution it ran at; when it has run at a reduced one, the
+// full-resolution composite has to reproduce it here.
+constexpr int kMaskBlurKernel = 15;
+constexpr int kMaskBlurRadius = kMaskBlurKernel / 2;
+
+// iw3's inpaint_max_width sizing, from BaseImageInpaint._resize. Both
+// dimensions come out even, and the height is derived from the rounded-up width
+// against the *original* width, which is iw3's arithmetic rather than a
+// simplification of it.
+inline void inpaintWorkingSize(int width, int height, int maxWidth,
+                               int& outWidth, int& outHeight)
+{
+    if (maxWidth <= 0 || width <= maxWidth)
+    {
+        outWidth = width;
+        outHeight = height;
+        return;
+    }
+    if (maxWidth % 2 != 0)
+    {
+        maxWidth += 1;
+    }
+    outWidth = maxWidth;
+    outHeight = int((double(maxWidth) / double(width)) * double(height));
+    if (outHeight % 2 != 0)
+    {
+        outHeight += 1;
     }
 }
 

@@ -76,6 +76,10 @@ struct Settings
     // output resolution.
     int maskInnerDilation = 0;
     int maskOuterDilation = 0;
+    // Cap the width the inpaint network runs at, 0 for the frame's own. Its
+    // memory scales with area, so this is the lever for a smaller card; the
+    // fill is composited back at full resolution either way.
+    int inpaintMaxWidth = 0;
 };
 
 // iw3's depth mappers, for relative depth only.
