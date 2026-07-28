@@ -1,10 +1,15 @@
 # monobw_inpaint + light_inpaint_v1
 
-The standalone PyTorch stage is **done**: `stereo_inpaint.py`, 22/22 at max
-absolute difference 0 against stock iw3. Nothing past that is built — no CUDA
-kernels, no ONNX, no plugin parameter. The decision that gate was waiting on is
-below, and the cost turned out to be about half what this document first
-predicted.
+Two stages done. **Standalone PyTorch**: `stereo_inpaint.py`, 22/22 at max
+absolute difference 0 against stock iw3. **ONNX**: the export blocker turned out
+to be one thing the port had already fixed, and `models/light_inpaint_v1.onnx`
+matches PyTorch within 2e-5 at every size tried.
+
+What is left is CUDA and plugin plumbing. The warp half will not be a graph —
+its two defining operations have no ONNX operator — which settles the
+architecture rather than blocking it.
+
+The cost also turned out to be about half what this document first predicted.
 
 ## What it is, and why it is not a model swap
 
@@ -141,9 +146,9 @@ a no-op, it is kept only for faithfulness), and moving the packed-token mask
 threshold from 0.99 to 0.5 (the blur radius against the 4x4 pack size leaves no
 token in that band).
 
-## The export blocker, still there
+## The export blocker was the padding, and it is gone
 
-Untouched by this stage, and the same class of problem as `row_flow_v3`:
+The investigation recorded this as the open risk:
 
 ```
 dynamo export: OK
@@ -152,12 +157,79 @@ dynamo export: OK
   260x452: FAILED  Expand node ...
 ```
 
-It exports and is accurate where it was traced, and fails everywhere else on an
-`Expand` node with a baked dimension. `row_flow_v3` needed three separate fixes
-to clear this class of problem — the attention head merge, the padding, and a
-batch-1 specialisation. One of those three, the padding, is already in this port
-because it was written that way from the start. How many more this needs is
-unknown; `_WindowGMLP2d`'s shifted window partitioning is the obvious suspect.
+It turned out to be one thing, and the port had already fixed it before the
+export was ever attempted. `row_flow_v3` needed three changes to clear this
+class of problem; **only the padding one applies here**, and it went into
+`stereo_inpaint.py` from the first line because that was the known lesson.
+
+Confirmed rather than assumed. Putting iw3's `replication_pad2d_naive` back
+reproduces the failure at exactly the sizes first reported:
+
+| | traced 256x448 | 392x938 | 260x452 |
+| --- | --- | --- | --- |
+| the port as committed | 3.6e-06 | 1.7e-06 | 1.4e-06 |
+| iw3's tuple-repetition padding | 3.6e-06 | **Expand node** | **Expand node** |
+
+The other two v3 fixes are not needed. The attention rewrite has nothing to
+apply to — gMLP mixes tokens with a `Conv1d` over the sequence and never builds
+the `(B, heads, tokens, dim)` layout whose permute could not be lowered. And the
+batch-1 specialisation was tested for and does not occur: a graph traced at
+batch 1 runs correctly at batch 3.
+
+`models/light_inpaint_v1.onnx` is 9.2 MiB, against `stereo_warp_v3.onnx`'s
+866 KiB. Verified 1.0e-06 to 3.6e-06 at six sizes including 1036x1920.
+
+## MonoBW cannot be a graph, and should not be
+
+The other half went the other way, and this is the finding that sets the shape
+of the plugin work.
+
+`torch.export` handles it after one change — `base_size = max(H, W)` is a Python
+`max()` over symbolic dimensions, which guards and specialises the depth height,
+so the scalar it feeds gets hoisted out and passed in. That is the same hoist
+`export_onnx.py` already does for `delta_scale`, and it makes divergence dynamic
+for free.
+
+ONNX conversion then fails, and not for a fixable reason:
+
+| operator | in the ONNX registry |
+| --- | --- |
+| `aten::cummax` | **missing** |
+| `aten::searchsorted` | **missing** |
+| `aten::grid_sampler_2d`, `max_pool2d`, `gather`, `index_put`, `cumsum` | registered |
+
+The two that are missing are not incidental to MonoBW — they *are* its
+algorithm. The cummax is the monotonisation that makes the mapping invertible;
+the searchsorted is the inversion. Everything else it needs is available.
+
+Both could be emulated — a log-step Hillis-Steele scan for the cummax, a
+fixed-depth binary search for the searchsorted, each a bounded number of ONNX
+ops and each exact, since a maximum involves no arithmetic. But that is writing
+the algorithm by hand either way, and the plugin already does its arithmetic in
+CUDA next to six kernels that do the same kind of work. A native scan is simpler
+than an emulated one.
+
+So the split is settled, and it is the same split the plugin already uses:
+**CUDA for the arithmetic, ONNX for the network.**
+
+```
+depth ─> MonoBW ────────┐   CUDA
+         mask morphology┤   CUDA
+         blur, network, ┘
+         composite          ONNX  (light_inpaint_v1.onnx)
+```
+
+The graph boundary follows the rule the warp export already set: fixed
+arithmetic goes in, anything whose *amount* is a runtime parameter stays out.
+So the mask blur, the blanking, the pad to a multiple of 64, the network and the
+composite are inside; `mask_closing`, the two dilations and the left-eye flip
+are outside, because their iteration counts are plugin parameters.
+
+`tests/test_stereo_inpaint_onnx.py` checks the graph against PyTorch at eight
+cases within 2e-5, and — the one that matters — runs the real pipeline with the
+ONNX graph substituted for the network, which is the arrangement the plugin will
+have. If the boundary were drawn in the wrong place, that is what would catch
+it.
 
 ## Two things to get right
 
@@ -179,10 +251,21 @@ Also worth knowing: `_inpaint_single()` flips the left eye horizontally,
 inpaints, and flips back — the network is trained for one handedness only, the
 same trick `row_flow` uses.
 
-## Not decided
+## What is left
 
-Whether to build it past the standalone stage. The staged plan was: PyTorch
-first with a golden test at difference 0, judge the quality against the cost on
-real footage, then decide about CUDA and ONNX. The first step is done and the
-cost is 6.7x, not 10x. The judgement is the next step, and it needs footage
-rather than another benchmark.
+The ONNX half is done and the architecture is settled. What remains is CUDA and
+plumbing:
+
+| | |
+| --- | --- |
+| `MonoBW` kernels | the cummax scan, the searchsorted inverse, the gaussian smoothing of the index map, the grid build, the stretch mask |
+| mask morphology kernels | `mask_closing` (four max-pool passes), `dilate_inner`, `dilate_outer` |
+| plugin | a Method parameter, a second branch in `stereo_pipeline.cpp`, a second ORT session, and the two dilation parameters |
+
+The warp's existing `grid_sample` kernel should carry over — MonoBW's sampling
+is the same bilinear-with-border-clamp the backward warp already does, only
+with a grid built a different way.
+
+Still open, and unchanged by any of this: whether the occlusion quality is worth
+6.7x at HD and render-only at 4K. That is a judgement on footage, and it is
+cheaper to make now than after the kernels are written.

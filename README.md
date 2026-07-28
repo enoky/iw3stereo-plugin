@@ -17,6 +17,7 @@ builds it into a tool creators already use.
 | `stereo_inpaint.py` | The other pipeline: forward warp plus inpainting, standalone PyTorch. |
 | `stereo_warp_onnx.py` | Phase 2. The same thing on ONNX Runtime and numpy, no PyTorch. |
 | `export_onnx.py` | Builds `models/*.onnx` and the reference data. |
+| `tests/test_stereo_inpaint*.py` | The inpaint pipeline vs stock iw3 at diff 0, and its ONNX graph vs PyTorch. |
 | `tools/check_ort.py` | Validates and times any execution provider; needs only ORT and numpy. |
 | `tests/` | Golden test against stock iw3 at diff 0, and ONNX against PyTorch. |
 | `ofx/` | CMake build for OFX plugins, against the OpenFX SDK Resolve ships. |
@@ -58,11 +59,13 @@ Correctness carries across three hops, each measured rather than assumed:
 matches that within **2e-4**; and the C++ numeric core matches the Python at
 **float32 epsilon**.
 
-`stereo_inpaint.py` is a **standalone stage only**, not in the plugin. It is
-iw3's `monobw_inpaint` — forward warp, hole mask, then a 2.26M-parameter
-inpaint network — matching stock iw3 at diff 0 across 22 cases, and costing
-about 6.7x the warp at HD. Whether that trade is worth taking further is a
-judgement to make on footage; `docs/monobw-inpaint.md` has the numbers.
+`stereo_inpaint.py` is iw3's `monobw_inpaint` — forward warp, hole mask, then a
+2.26M-parameter inpaint network — matching stock iw3 at diff 0 across 22 cases,
+and costing about 6.7x the warp at HD. **Not in the plugin yet.** The network
+exports (`models/light_inpaint_v1.onnx`, within 2e-5); the warp cannot, because
+`cummax` and `searchsorted` have no ONNX operator, so it needs CUDA kernels like
+the rest of the arithmetic. `docs/monobw-inpaint.md` has the numbers and what is
+left.
 
 Three constraints worth knowing before reading further, each with evidence in
 `docs/`:

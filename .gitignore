@@ -3,7 +3,9 @@ __pycache__/
 ofx/build/
 
 # Checkpoints are downloaded, not vendored. The exported .onnx files ARE
-# committed -- they are the plugin's payload, and they are ~200 KiB together.
+# committed -- they are the plugin's payload. The three warp graphs are ~1 MiB
+# together; light_inpaint_v1.onnx is 9.2 MiB on its own, which is 2.26M
+# parameters in fp32 and is simply what that model weighs.
 *.pth
 
 # Regenerable by export_onnx.py, and large.

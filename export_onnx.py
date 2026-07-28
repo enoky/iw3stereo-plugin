@@ -4,10 +4,13 @@
 
 Writes to models/:
 
-    row_flow_v2.onnx    the network alone: (B,3,h,w) -> delta (B,2,h,w)
-    stereo_warp.onnx    the whole warp: image + depth -> left + right
-    reference.npz       inputs and PyTorch outputs, so any environment can
-                        check an execution provider without needing torch
+    row_flow_v2.onnx        the network alone: (B,3,h,w) -> delta (B,2,h,w)
+    stereo_warp.onnx        the whole warp: image + depth -> left + right
+    stereo_warp_v3.onnx     the same, with row_flow_v3
+    light_inpaint_v1.onnx   the inpaint half of monobw_inpaint: eye + hole
+                            mask -> filled eye
+    reference.npz           inputs and PyTorch outputs, so any environment can
+                            check an execution provider without needing torch
 
 What is in the graph and what is not
 ------------------------------------
@@ -35,6 +38,21 @@ The caller computes three scalars, all trivial:
     divergence_value = divergence_pix / 32          -> x channel 1
     convergence_value = -divergence_pix * convergence / 32   -> x channel 2
     delta_scale      = 1 / (depth_w // 2 - 1)
+
+What is in the inpaint graph, and what is not
+---------------------------------------------
+Same rule, applied again: fixed arithmetic goes in, anything whose *amount* is
+a runtime parameter stays out.
+
+In:  the mask blur, the blanking, the pad to a multiple of 64, the network, the
+     crop back, and the composite by the mask.
+Out: mask_closing and the inner/outer dilations, whose iteration counts are
+     plugin parameters, and the horizontal flip that gives the left eye the
+     handedness the network was trained for.
+
+The warp half is not here at all, and cannot be: `MonoBW` is built on
+`torch.cummax` and `torch.searchsorted`, and **neither has an ONNX operator**.
+Everything else it needs does. See docs/monobw-inpaint.md.
 """
 
 import argparse
@@ -44,6 +62,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+import stereo_inpaint
 import stereo_warp
 
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
@@ -53,12 +72,14 @@ CHECKPOINT_DIR = os.path.join(
 CHECKPOINTS = {
     "row_flow_v2": os.path.join(CHECKPOINT_DIR, "iw3_row_flow_v2_20240130.pth"),
     "row_flow_v3": os.path.join(CHECKPOINT_DIR, "iw3_row_flow_v3_20250627.pth"),
+    "light_inpaint_v1": os.path.join(CHECKPOINT_DIR, "iw3_light_inpaint_v1_20250919.pth"),
 }
 DEFAULT_CHECKPOINT = CHECKPOINTS["row_flow_v2"]
 
 OPSET = 17
 # row_flow_v3 needs the dynamo exporter, and that needs opset 18.
 OPSET_V3 = 18
+OPSET_INPAINT = 18
 
 
 class StereoWarpGraph(torch.nn.Module):
@@ -186,6 +207,62 @@ def export_pipeline_v3(model, path):
     return path
 
 
+class LightInpaintGraph(torch.nn.Module):
+    """The inpaint half of ``monobw_inpaint`` as one graph.
+
+    Takes the warped eye and its hole mask, returns the eye with the holes
+    filled and every other pixel passed through untouched -- the composite is
+    inside the graph, so the caller does not have to blend.
+
+    ``infer()`` is the model's own method rather than ``I2IBaseModel``'s, and
+    calls ``forward(skip_i2i_offset=True)``, so nothing is cropped: the output
+    is the same size as the input.
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, eye, mask):
+        return self.model.infer(eye, mask)
+
+
+def export_light_inpaint_v1(model, path):
+    """``light_inpaint_v1``, the one part of this pipeline that can be a graph.
+
+    The investigation recorded this as blocked -- accurate at the traced size,
+    failing everywhere else on an ``Expand`` node with a baked dimension. That
+    was iw3's ``replication_pad2d_naive``, which builds padding by Python tuple
+    repetition and so needs a concrete width. ``stereo_inpaint.LightInpaintV1``
+    uses ``F.pad(mode="replicate")`` instead, and the blocker goes with it: the
+    change was already in the port before the export was ever attempted.
+    Verified by putting the old padding back, which reproduces the failure at
+    exactly the sizes first reported.
+
+    Unlike ``row_flow_v3`` this needs neither the attention rewrite -- gMLP
+    mixes tokens with a Conv1d and has no head permute to lower -- nor the
+    batch-2 example, which was checked and is not required here. The example is
+    batch 2 anyway, to keep the two exports the same shape.
+    """
+    graph = LightInpaintGraph(model).eval()
+    generator = torch.Generator().manual_seed(0)
+    eye = torch.rand((2, 3, 256, 448), generator=generator)
+    mask = torch.zeros((2, 1, 256, 448))
+    mask[:, :, 64:128, 112:150] = 1.0
+
+    batch = torch.export.Dim("batch", min=1, max=64)
+    height = torch.export.Dim("height", min=64, max=8192)
+    width = torch.export.Dim("width", min=64, max=8192)
+
+    torch.onnx.export(
+        graph, (eye, mask), path,
+        input_names=["eye", "mask"], output_names=["y"],
+        dynamic_shapes={"eye": {0: batch, 2: height, 3: width},
+                        "mask": {0: batch, 2: height, 3: width}},
+        opset_version=OPSET_INPAINT, dynamo=True, external_data=False)
+    return path
+
+
 def write_reference(model, path):
     """Reference IO at several shapes, so a provider can be checked without torch."""
     graph = StereoWarpGraph(model).eval()
@@ -230,6 +307,7 @@ def main():
     parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
     parser.add_argument("--output-dir", default=MODEL_DIR)
     parser.add_argument("--skip-v3", action="store_true")
+    parser.add_argument("--skip-inpaint", action="store_true")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -248,6 +326,12 @@ def main():
         v3 = stereo_warp.load_row_flow_v3(CHECKPOINTS["row_flow_v3"], device="cpu", export_safe=True)
         v3_path = export_pipeline_v3(v3, os.path.join(args.output_dir, "stereo_warp_v3.onnx"))
         print(f"wrote {v3_path} ({os.path.getsize(v3_path) / 1024:.0f} KiB)")
+
+    if not args.skip_inpaint and os.path.exists(CHECKPOINTS["light_inpaint_v1"]):
+        inpaint = stereo_inpaint.load_light_inpaint_v1(CHECKPOINTS["light_inpaint_v1"], device="cpu")
+        inpaint_path = export_light_inpaint_v1(
+            inpaint, os.path.join(args.output_dir, "light_inpaint_v1.onnx"))
+        print(f"wrote {inpaint_path} ({os.path.getsize(inpaint_path) / 1024:.0f} KiB)")
 
     reference_path = os.path.join(args.output_dir, "reference.npz")
     cases = write_reference(model, reference_path)
