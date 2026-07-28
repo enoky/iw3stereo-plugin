@@ -65,9 +65,9 @@ matches that within **2e-4**; and the C++ numeric core matches the Python at
 and costing about 6.7x the warp at HD. **Not wired into the plugin yet**, but
 the pieces are built: the network exports to ONNX within 2e-5, and the warp,
 which cannot (`cummax` and `searchsorted` have no ONNX operator), has CUDA
-kernels running at 0.172 ms an eye with a bit-exact hole mask. What is left is
-the mask morphology and the plugin's own plumbing; `docs/monobw-inpaint.md` has
-the numbers.
+kernels running at 0.297 ms an eye with a bit-exact hole mask and its
+morphology. What is left is the plugin's own plumbing;
+`docs/monobw-inpaint.md` has the numbers.
 
 Three constraints worth knowing before reading further, each with evidence in
 `docs/`:

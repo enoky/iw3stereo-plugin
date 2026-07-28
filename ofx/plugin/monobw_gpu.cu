@@ -139,11 +139,41 @@ __global__ void sampleKernel(const float* __restrict__ image, int width, int hei
     mask[index] = stretched ? 1.0f : 0.0f;
 }
 
+// mask_closing's four passes. One kernel with a flag rather than two, because
+// the only difference is which way the reduction goes and the launch pattern is
+// identical.
+__global__ void morphologyKernel(const float* __restrict__ mask, int width, int height,
+                                 int dilating, float* __restrict__ out)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    out[size_t(y) * size_t(width) + size_t(x)] =
+        dilating ? math::maskDilateAt(mask, width, height, x, y)
+                 : math::maskErodeAt(mask, width, height, x, y);
+}
+
+// Putting the isolated pixels back, and both directional dilations in one
+// window pass. See maskFinishAt for why the two dilations collapse into one.
+__global__ void maskFinishKernel(const float* __restrict__ closed,
+                                 const float* __restrict__ original,
+                                 int width, int height, int outer, int inner,
+                                 float* __restrict__ out)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    out[size_t(y) * size_t(width) + size_t(x)] =
+        math::maskFinishAt(closed, original, width, x, y, outer, inner);
+}
+
 }  // namespace
 
 MonoBwGpu::~MonoBwGpu()
 {
-    for (float* pointer : {_gridX, _gridY, _scratch, _eye, _mask})
+    for (float* pointer : {_gridX, _gridY, _scratch, _eye, _mask, _maskA, _maskB})
     {
         if (pointer) cudaFree(pointer);
     }
@@ -189,8 +219,47 @@ bool MonoBwGpu::prepare(int width, int height, int depthWidth, int depthHeight)
     if (!allocate(&_scratch, depthPixels * 3, _scratchHeld)) return false;
     if (!allocate(&_eye, pixels * 3, _eyeHeld)) return false;
     if (!allocate(&_mask, pixels, _maskHeld)) return false;
+    // The morphology ping-pongs between these; the finished mask ends in _maskA.
+    if (!allocate(&_maskA, pixels, _maskAHeld)) return false;
+    if (!allocate(&_maskB, pixels, _maskBHeld)) return false;
 
     return _error.empty();
+}
+
+void MonoBwGpu::preprocessMask(const float* mask, int innerDilation, int outerDilation,
+                               int baseWidth, void* stream)
+{
+    cudaStream_t cudaStream = static_cast<cudaStream_t>(stream);
+    const dim3 blocks = grid2d(_width, _height);
+    const dim3 block2d(kBlock, kBlock);
+
+    const int outer = math::maskDilateIterations(outerDilation, _width, baseWidth);
+    const int inner = math::maskDilateIterations(innerDilation, _width, baseWidth);
+
+    // dilate, dilate, erode, erode -- ping-ponging, because each pass reads its
+    // input's whole neighbourhood and cannot run in place. `mask` is left alone
+    // throughout: the finish step needs the original back.
+    const float* source = mask;
+    float* destination = _maskA;
+    for (int pass = 0; pass < 4; ++pass)
+    {
+        morphologyKernel<<<blocks, block2d, 0, cudaStream>>>(
+            source, _width, _height, pass < 2 ? 1 : 0, destination);
+        source = destination;
+        destination = (destination == _maskA) ? _maskB : _maskA;
+    }
+
+    // Four passes leaves the closed mask in _maskB, so the finish writes _maskA
+    // and there is no aliasing with the window it reads.
+    maskFinishKernel<<<blocks, block2d, 0, cudaStream>>>(
+        source, mask, _width, _height, outer, inner, destination);
+    _processedMask = destination;
+
+    const cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess)
+    {
+        _error = std::string("mask kernel launch failed: ") + cudaGetErrorString(status);
+    }
 }
 
 void MonoBwGpu::forward(const float* image, const float* depth,

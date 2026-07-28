@@ -178,4 +178,17 @@ void monobwForward(const float* image, int width, int height,
                    bool preserveScreenBorder, int fixScreenBorderMask,
                    std::vector<float>& eye, std::vector<float>& mask);
 
+// preprocess_mask: threshold, mask_closing, then the two directional dilations.
+//
+// This is the step between the warp and the inpaint graph, and it is outside
+// the graph because the dilation counts are plugin parameters -- the same rule
+// that keeps preserve_screen_border out of the warp's graph.
+//
+// `baseWidth` is the depth's width, which is what iw3 quotes the dilations
+// against so a setting means the same thing at any output resolution. Pass 0 to
+// take the counts literally.
+void maskPreprocess(const float* mask, int width, int height,
+                    int innerDilation, int outerDilation, int baseWidth,
+                    std::vector<float>& out);
+
 }  // namespace iw3

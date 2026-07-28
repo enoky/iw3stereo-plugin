@@ -250,6 +250,38 @@ int main(int argc, char** argv)
                             (entry.name + "/mask").c_str(), set, wantMask.size());
             }
         }
+        else if (entry.name.rfind("mask_preprocess_", 0) == 0)
+        {
+            const int width = entry.ints[0], height = entry.ints[1];
+            const int inner = entry.ints[2], outer = entry.ints[3];
+            const int baseWidth = entry.ints[4];
+
+            std::vector<float> got;
+            iw3::maskPreprocess(entry.inputs.data(), width, height, inner, outer, baseWidth, got);
+
+            // A mask is 0 or 1 and every operation on it is a max, a min or an
+            // or. Nothing here rounds, so the bar is equality: a tolerance
+            // would let a whole misplaced pixel through.
+            ++checks;
+            size_t wrong = 0;
+            for (size_t i = 0; i < got.size() && i < entry.outputs.size(); ++i)
+            {
+                if (got[i] != entry.outputs[i]) ++wrong;
+            }
+            if (got.size() != entry.outputs.size() || wrong != 0)
+            {
+                std::printf("  FAIL %-44s %zu of %zu pixels differ\n",
+                            entry.name.c_str(), wrong, entry.outputs.size());
+                ++failures;
+            }
+            else
+            {
+                size_t set = 0;
+                for (float value : entry.outputs) if (value != 0.0f) ++set;
+                std::printf("  ok   %-44s %zu of %zu pixels, exact\n",
+                            entry.name.c_str(), set, entry.outputs.size());
+            }
+        }
         else
         {
             std::printf("  ??   %s (no handler)\n", entry.name.c_str());

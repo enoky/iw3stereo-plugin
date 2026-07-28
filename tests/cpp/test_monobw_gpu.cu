@@ -182,6 +182,64 @@ int main(int argc, char** argv)
         cudaFree(depth);
     }
 
+    // The mask morphology. Its reference cases carry the raw mask directly
+    // rather than the image and depth that produced it, so this drives
+    // preprocessMask with an uploaded mask; the depth geometry passed to
+    // prepare() is unused by this path and is kept small.
+    for (const iw3test::Case& entry : cases)
+    {
+        if (entry.name.rfind("mask_preprocess_", 0) != 0)
+        {
+            continue;
+        }
+        ++ran;
+
+        const int width = entry.ints[0], height = entry.ints[1];
+        const int inner = entry.ints[2], outer = entry.ints[3];
+        const int baseWidth = entry.ints[4];
+        const size_t pixels = size_t(width) * size_t(height);
+
+        float* raw = upload(entry.inputs.data(), pixels);
+        if (!raw || !gpu.prepare(width, height, 8, 8))
+        {
+            std::printf("  FAIL %s: setup failed\n", entry.name.c_str());
+            ++failures;
+            ++checks;
+            if (raw) cudaFree(raw);
+            continue;
+        }
+
+        gpu.preprocessMask(raw, inner, outer, baseWidth, nullptr);
+        cudaDeviceSynchronize();
+
+        std::vector<float> got;
+        download(got, gpu.processedMaskDevice(), pixels);
+
+        // A mask is 0 or 1 and every operation on it is a max, a min or an or.
+        // Nothing rounds, so the bar is equality.
+        ++checks;
+        size_t wrong = 0;
+        for (size_t i = 0; i < got.size() && i < entry.outputs.size(); ++i)
+        {
+            if (got[i] != entry.outputs[i]) ++wrong;
+        }
+        if (got.size() != entry.outputs.size() || wrong != 0)
+        {
+            std::printf("  FAIL %-46s %zu of %zu pixels differ\n",
+                        entry.name.c_str(), wrong, entry.outputs.size());
+            ++failures;
+        }
+        else
+        {
+            size_t set = 0;
+            for (float value : entry.outputs) if (value != 0.0f) ++set;
+            std::printf("  ok   %-46s %zu of %zu pixels, exact\n",
+                        entry.name.c_str(), set, entry.outputs.size());
+        }
+
+        cudaFree(raw);
+    }
+
     if (ran == 0)
     {
         std::printf("no monobw cases in %s -- regenerate it\n", path.c_str());
@@ -218,9 +276,15 @@ int main(int argc, char** argv)
         float* deviceDepth = upload(depthHost.data(), depthHost.size());
         if (deviceImage && deviceDepth && gpu.prepare(width, height, depthWidth, depthHeight))
         {
-            for (int i = 0; i < 5; ++i)
+            // The whole CUDA half of an eye: warp, mask, and morphology.
+            const auto oneEye = [&]()
             {
                 gpu.forward(deviceImage, deviceDepth, 2.0, 0.5, false, 1, nullptr);
+                gpu.preprocessMask(gpu.maskDevice(), 2, 2, depthWidth, nullptr);
+            };
+            for (int i = 0; i < 5; ++i)
+            {
+                oneEye();
             }
             cudaDeviceSynchronize();
 
@@ -231,7 +295,7 @@ int main(int argc, char** argv)
             cudaEventRecord(start);
             for (int i = 0; i < iterations; ++i)
             {
-                gpu.forward(deviceImage, deviceDepth, 2.0, 0.5, false, 1, nullptr);
+                oneEye();
             }
             cudaEventRecord(stop);
             cudaEventSynchronize(stop);

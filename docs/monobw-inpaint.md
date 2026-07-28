@@ -3,13 +3,13 @@
 Three stages done. **Standalone PyTorch**: `stereo_inpaint.py`, 22/22 at max
 absolute difference 0 against stock iw3. **ONNX**: the export blocker turned out
 to be one thing the port had already fixed, and `models/light_inpaint_v1.onnx`
-matches PyTorch within 2e-5 at every size tried. **CUDA**: the MonoBW kernels,
-matching the same Python reference the CPU core is held to, with a bit-exact
-hole mask, at 0.172 ms per eye at HD.
+matches PyTorch within 2e-5 at every size tried. **CUDA**: the MonoBW kernels
+and the mask morphology, matching the same Python reference the CPU core is held
+to, with a bit-exact hole mask, at 0.297 ms per eye at HD.
 
-What is left is the mask morphology and the plugin plumbing. The warp half will
-not be a graph — its two defining operations have no ONNX operator — which
-settles the architecture rather than blocking it.
+What is left is the plugin plumbing. The warp half will not be a graph — its two
+defining operations have no ONNX operator — which settles the architecture
+rather than blocking it.
 
 The cost also turned out to be about half what this document first predicted.
 
@@ -267,6 +267,11 @@ plugin's six kernels are packing, the depth resize, the input tensor and the
 compose. MonoBW cannot put its sampler in a graph, so `bilinearSampleBorder`
 and the align-corners resize are new.
 
+The mask morphology sits alongside them — `mask_closing` and the two directional
+dilations, which are outside the ONNX graph because their counts are plugin
+parameters, the same rule that keeps `preserve_screen_border` out of the warp's
+graph.
+
 Correctness, against `stereo_inpaint.py` through `tools/dump_pipeline_reference.py`:
 
 | | |
@@ -275,6 +280,7 @@ Correctness, against `stereo_inpaint.py` through `tools/dump_pipeline_reference.
 | CPU, hole mask | **exact**, every pixel |
 | CUDA, warped eye | 1.6e-06 to 2.7e-06 |
 | CUDA, hole mask | **exact**, every pixel |
+| CPU and CUDA, morphology | **exact**, six cases including base-width scaling |
 
 The mask matters more than the eye here. It is a threshold on a difference, so
 it cannot be checked with a tolerance — a pixel is on the right side of the line
@@ -317,14 +323,34 @@ in the same order. It also reads better: each stage's inputs are now obviously
 the previous stage's outputs, which the fused version hid behind two in-place
 buffers and a comment about why they could not be fused.
 
-Both eyes now cost about 0.34 ms against the inpaint network's 23.6 ms. The warp
-is no longer worth optimising.
+Both eyes now cost about 0.34 ms against the inpaint network's 23.6 ms — 0.6 ms
+with the morphology included. The warp is no longer worth optimising.
+
+## Two dilations, one pass
+
+`dilate_outer` ors each pixel with the *n* pixels to its left, `dilate_inner`
+with the *n* to its right, and iw3 runs them in sequence, each as *n* separate
+shift-and-or passes. All of that collapses to a single pass over
+`[x - outer, x + inner]`: or is idempotent and associative, so the union of the
+two ranges is the same answer for any counts, and running it once instead of
+`outer + inner` times is exact rather than approximate.
+
+One detail that is not exact if it is written the obvious way. The dilation
+count is `round(width / base_width * n)`, and Python's `round()` is
+half-to-even while C's `lround()` is half-away-from-zero. That is reachable
+here — 1920 / 1536 * 2 is exactly 2.5, which Python makes 2 and `lround` would
+make 3 — because the input is a ratio of two frame dimensions rather than
+something scaled by an awkward constant. `pythonRound()` in `monobw_math.h`
+does it the way Python does.
+
+The screen-border widths in the same file still go through `lround`. Their input
+is scaled by 0.0075, so an exact tie is not reachable in binary floating point,
+and the existing warp path has been using `lround` for them all along.
 
 ## What is left
 
 | | |
 | --- | --- |
-| mask morphology kernels | `mask_closing` (four max-pool passes), `dilate_inner`, `dilate_outer` |
 | plugin | a Method parameter, a second branch in `stereo_pipeline.cpp`, a second ORT session, and the two dilation parameters |
 
 Still open, and unchanged by any of this: whether the occlusion quality is worth

@@ -98,6 +98,120 @@ inline int monobwMaskBorderPix(double divergence, int imageWidth, int depthWidth
     return int(lround(divergence * 0.01 * double(imageWidth) * scaled)) + 1;
 }
 
+// --- the mask morphology -----------------------------------------------------
+//
+// preprocess_mask, from iw3's MonoBWInpaintImage: threshold, mask_closing, then
+// the two directional dilations. It runs between the warp and the inpaint
+// network, on the CPU side of the ONNX boundary, because the dilations' counts
+// are plugin parameters rather than fixed arithmetic.
+//
+// The resize preprocess_mask starts with is not here: MonoBW already produces
+// the mask at the frame's resolution, so `mask.shape[-2:] != target_size` is
+// false and F.interpolate never runs.
+
+// Python's round(), which is half-to-even rather than half-away-from-zero.
+//
+// This matters here and only here. The dilation count is width / base_width
+// times an integer -- a ratio of two frame dimensions -- so an exact .5 is
+// entirely reachable: 1920 / 1536 * 2 is 2.5, which Python makes 2 and lround
+// would make 3. The border widths above go through lround, but their input is
+// scaled by 0.0075 and cannot land on a tie in binary floating point.
+inline int pythonRound(double value)
+{
+    const double floored = floor(value);
+    const double fraction = value - floored;
+    if (fraction > 0.5) return int(floored) + 1;
+    if (fraction < 0.5) return int(floored);
+    const int whole = int(floored);
+    return (whole % 2 == 0) ? whole : whole + 1;
+}
+
+// dilate_inner / dilate_outer's iteration count. iw3 quotes them against the
+// depth's width so the same setting means the same thing at any output
+// resolution, and never rounds a requested dilation down to nothing.
+inline int maskDilateIterations(int iterations, int width, int baseWidth)
+{
+    if (iterations <= 0)
+    {
+        return 0;
+    }
+    if (baseWidth <= 0)
+    {
+        return iterations;
+    }
+    const int scaled = pythonRound(double(width) / double(baseWidth) * double(iterations));
+    return scaled > 1 ? scaled : 1;
+}
+
+// One pass of dilate() or erode(), 3x3.
+//
+// max_pool2d pads with -inf, so out-of-range neighbours never win a maximum;
+// erode is -max_pool2d(-x), so they never win a minimum either. Both therefore
+// reduce over the in-range part of the window and nothing else -- not a
+// replicated or zeroed edge, which would give a different answer at the border.
+IW3_HD inline float maskDilateAt(const float* mask, int width, int height, int x, int y)
+{
+    float best = -INFINITY;
+    for (int dy = -1; dy <= 1; ++dy)
+    {
+        const int sy = y + dy;
+        if (sy < 0 || sy >= height) continue;
+        for (int dx = -1; dx <= 1; ++dx)
+        {
+            const int sx = x + dx;
+            if (sx < 0 || sx >= width) continue;
+            const float value = mask[size_t(sy) * size_t(width) + size_t(sx)];
+            best = value > best ? value : best;
+        }
+    }
+    return best;
+}
+
+IW3_HD inline float maskErodeAt(const float* mask, int width, int height, int x, int y)
+{
+    float best = INFINITY;
+    for (int dy = -1; dy <= 1; ++dy)
+    {
+        const int sy = y + dy;
+        if (sy < 0 || sy >= height) continue;
+        for (int dx = -1; dx <= 1; ++dx)
+        {
+            const int sx = x + dx;
+            if (sx < 0 || sx >= width) continue;
+            const float value = mask[size_t(sy) * size_t(width) + size_t(sx)];
+            best = value < best ? value : best;
+        }
+    }
+    return best;
+}
+
+// mask_closing's last step and both dilations, at one pixel.
+//
+// `closed` is the eroded result and `original` the mask that went in; closing
+// erases isolated pixels and iw3 adds them back, clamped.
+//
+// The two dilations are one window rather than two loops. dilate_outer ors each
+// pixel with the `outer` pixels to its left, dilate_inner with the `inner` to
+// its right, and applying them in sequence ors over the union of the two
+// ranges -- or is idempotent and associative, so a single pass over
+// [x - outer, x + inner] is the same answer for any counts.
+IW3_HD inline float maskFinishAt(const float* closed, const float* original,
+                                 int width, int x, int y, int outer, int inner)
+{
+    const size_t row = size_t(y) * size_t(width);
+    const int first = x - outer < 0 ? 0 : x - outer;
+    const int last = x + inner >= width ? width - 1 : x + inner;
+    for (int sx = first; sx <= last; ++sx)
+    {
+        const float value = closed[row + size_t(sx)] + original[row + size_t(sx)];
+        if (value > 0.0f)
+        {
+            return 1.0f;
+        }
+    }
+    return 0.0f;
+}
+
 // torch.linspace(start, end, n) evaluated at i. Worth spelling out because the
 // n == 1 case is not the average of the endpoints -- torch returns `start` --
 // and the two border ramps run in opposite directions, so a single-pixel ramp

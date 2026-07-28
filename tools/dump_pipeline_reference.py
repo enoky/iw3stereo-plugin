@@ -206,6 +206,30 @@ for index, (image_hw, depth_hw, divergence, convergence, border, fix_mask) in en
         np.concatenate([eye.numpy().ravel(), mask.float().numpy().ravel()]))
 
 
+# the mask morphology, on masks a real warp produced rather than drawn by hand
+for index, (image_hw, depth_hw, divergence, inner, outer) in enumerate([
+        ((216, 384), (108, 192), 5.0, 0, 0),
+        ((216, 384), (108, 192), 5.0, 2, 0),
+        ((216, 384), (108, 192), 5.0, 0, 3),
+        ((216, 384), (108, 192), 5.0, 2, 3),
+        ((216, 384), (108, 192), 10.0, 4, 4),
+        # base_width scaling: the frame is twice the depth's width, so a count
+        # of 1 becomes 2 and one of 3 becomes 6.
+        ((160, 288), (80, 144), 3.0, 1, 3),
+]):
+    image, depth = _monobw_pair(image_hw, depth_hw, 400 + index)
+    with torch.inference_mode():
+        _, raw = _monobw(image, depth, divergence=divergence, convergence=0.5,
+                         preserve_screen_border=False, fix_screen_border_mask=1,
+                         return_mask=True)
+        processed = stereo_inpaint.MonoBWInpaintImage.preprocess_mask(
+            raw, target_size=raw.shape[-2:],
+            inner_dilation=inner, outer_dilation=outer, base_width=depth_hw[1])
+    add(f"mask_preprocess_{image_hw[1]}x{image_hw[0]}_{depth_hw[1]}_{inner}_{outer}",
+        [image_hw[1], image_hw[0], inner, outer, depth_hw[1]],
+        raw.float(), processed.float())
+
+
 # --- write -------------------------------------------------------------------
 os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)
 with open(OUTPUT, "wb") as handle:

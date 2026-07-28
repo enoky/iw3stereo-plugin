@@ -1,4 +1,5 @@
-// MonoBW on the GPU: the forward warp and its hole mask, in device memory.
+// The CUDA half of monobw_inpaint: the forward warp, its hole mask, and the
+// mask morphology that runs before the inpaint graph. All in device memory.
 //
 // This is the half of monobw_inpaint that cannot be an ONNX graph. torch.export
 // handles it, but ONNX has no operator for either torch.cummax or
@@ -43,10 +44,26 @@ public:
                  bool preserveScreenBorder, int fixScreenBorderMask,
                  void* stream);
 
+    // preprocess_mask on the mask forward() produced: mask_closing, then the
+    // two directional dilations. Outside the ONNX graph because the counts are
+    // plugin parameters -- the same rule that keeps preserve_screen_border out
+    // of the warp's graph.
+    //
+    // `baseWidth` is the depth's width, which is what iw3 quotes the dilations
+    // against. Result lands in processedMaskDevice().
+    //
+    // `mask` is taken explicitly rather than read from maskDevice() so the
+    // dataflow is visible at the call site, and so a test can drive this with a
+    // mask it supplies rather than one forward() happened to leave behind.
+    void preprocessMask(const float* mask, int innerDilation, int outerDilation,
+                        int baseWidth, void* stream);
+
     // The warped eye, three planes of width * height.
     const float* eyeDevice() const { return _eye; }
-    // The hole mask, width * height, 0.0 or 1.0.
+    // The raw hole mask, width * height, 0.0 or 1.0.
     const float* maskDevice() const { return _mask; }
+    // The mask after preprocessMask(), which is what the inpaint graph takes.
+    const float* processedMaskDevice() const { return _processedMask; }
 
     bool ok() const { return _error.empty(); }
     const std::string& error() const { return _error; }
@@ -60,9 +77,13 @@ private:
     float* _gridY = nullptr;    // depthHeight
     float* _scratch = nullptr;  // 3 * depthWidth * depthHeight: dest, moved, smoothed
     float* _eye = nullptr;      // 3 * width * height
-    float* _mask = nullptr;     // width * height
+    float* _mask = nullptr;     // width * height, the raw stretch mask
+    float* _maskA = nullptr;    // the morphology's ping-pong pair; the finished
+    float* _maskB = nullptr;    // mask ends in one of them
+    const float* _processedMask = nullptr;  // whichever that was
 
     size_t _gridXHeld = 0, _gridYHeld = 0, _scratchHeld = 0, _eyeHeld = 0, _maskHeld = 0;
+    size_t _maskAHeld = 0, _maskBHeld = 0;
 
     std::string _error;
 };

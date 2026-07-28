@@ -384,4 +384,48 @@ void monobwForward(const float* image, int width, int height,
     }
 }
 
+void maskPreprocess(const float* mask, int width, int height,
+                    int innerDilation, int outerDilation, int baseWidth,
+                    std::vector<float>& out)
+{
+    const size_t pixels = size_t(width) * size_t(height);
+    const int outer = iw3::math::maskDilateIterations(outerDilation, width, baseWidth);
+    const int inner = iw3::math::maskDilateIterations(innerDilation, width, baseWidth);
+
+    // closing() is two dilates then two erodes, and the passes cannot run in
+    // place: each reads its input's whole 3x3 neighbourhood.
+    std::vector<float> a(pixels, 0.0f);
+    std::vector<float> b(pixels, 0.0f);
+
+    const float* source = mask;
+    float* destination = a.data();
+    for (int pass = 0; pass < 4; ++pass)
+    {
+        const bool dilating = pass < 2;
+        for (int y = 0; y < height; ++y)
+        {
+            for (int x = 0; x < width; ++x)
+            {
+                destination[size_t(y) * size_t(width) + size_t(x)] =
+                    dilating ? iw3::math::maskDilateAt(source, width, height, x, y)
+                             : iw3::math::maskErodeAt(source, width, height, x, y);
+            }
+        }
+        source = destination;
+        destination = (destination == a.data()) ? b.data() : a.data();
+    }
+
+    // `source` now holds the closed mask. The original goes back in because
+    // closing erases isolated pixels, and the two dilations run as one window.
+    out.resize(pixels);
+    for (int y = 0; y < height; ++y)
+    {
+        for (int x = 0; x < width; ++x)
+        {
+            out[size_t(y) * size_t(width) + size_t(x)] =
+                iw3::math::maskFinishAt(source, mask, width, x, y, outer, inner);
+        }
+    }
+}
+
 }  // namespace iw3
