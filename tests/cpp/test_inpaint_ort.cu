@@ -325,6 +325,102 @@ int main(int argc, char** argv)
         cudaFree(deviceDepth);
     }
 
+    // Is the fill for frame N actually derived from frame N?
+    //
+    // The indexing survives three hops -- slot j of the window is absolute
+    // firstFrame + j, the graph's output j pairs with its input j, and the cache
+    // keeps slots kPad..kPad+kStride-1 -- and an off-by-one anywhere in that
+    // chain would show as an inpaint that lags or leads the picture. Reasoning
+    // says it lines up; this checks it, because two bugs in this path have
+    // already looked fine on paper.
+    //
+    // Each frame of the window is a different flat grey. The warp of a constant
+    // field is that constant and so is a fill of it, so whatever comes out of
+    // slot j should still be frame j's grey. That makes the alignment readable
+    // as a number.
+    {
+        const int width = 384, height = 216;
+        const int depthWidth = 192, depthHeight = 108;
+        const size_t pixels = size_t(width) * size_t(height);
+        const int seq = iw3::MonoBwVideoGpu::kSequence;
+
+        std::vector<float> depth(size_t(depthWidth) * size_t(depthHeight));
+        for (size_t i = 0; i < depth.size(); ++i)
+        {
+            depth[i] = float((i * 37) % 1000) / 1000.0f;
+        }
+        float* deviceDepth = upload(depth);
+
+        iw3::MonoBwGpu gpu;
+        iw3::MonoBwVideoGpu video;
+        std::vector<float> greys(size_t(seq), 0.0f);
+        bool built = deviceDepth != nullptr &&
+                     gpu.prepare(width, height, depthWidth, depthHeight) &&
+                     video.prepare(width, height);
+
+        for (int slot = 0; slot < seq && built; ++slot)
+        {
+            // Values well apart in fp16 and clear of 0 and 1.
+            greys[size_t(slot)] = 0.2f + 0.05f * float(slot);
+            std::vector<float> frame(pixels * 3, greys[size_t(slot)]);
+            float* deviceFrame = upload(frame);
+            built = deviceFrame != nullptr &&
+                    gpu.prepareEye(deviceFrame, deviceDepth, false, 2.0, 0.5, false,
+                                   0, 0, depthWidth, nullptr);
+            if (built)
+            {
+                gpu.prepareInpaintInput(0, nullptr);
+                video.storeFrame(slot, gpu.inpaintEyeHalfDevice(),
+                                 gpu.processedMaskHalfDevice(), nullptr);
+                cudaDeviceSynchronize();
+            }
+            if (deviceFrame) cudaFree(deviceFrame);
+        }
+
+        const int64_t alignShape[4] = {seq, 3, height, width};
+        const float* aligned = nullptr;
+        if (built && ort.runInpaintDevice(3, reinterpret_cast<const float*>(video.eyesDevice()),
+                                          reinterpret_cast<const float*>(video.masksDevice()),
+                                          alignShape, &aligned))
+        {
+            video.cacheOutput(false, aligned, nullptr);
+            cudaDeviceSynchronize();
+
+            std::printf("\n  frame alignment through the window:\n");
+            int wrong = 0;
+            for (int offset = 0; offset < iw3::MonoBwVideoGpu::kStride; ++offset)
+            {
+                // The middle of the frame, well away from the screen border the
+                // mask fix clears and from the holes at the edges.
+                const size_t middle = size_t(height / 2) * size_t(width) + size_t(width / 2);
+                unsigned short bits = 0;
+                cudaMemcpy(&bits,
+                           static_cast<const char*>(video.cachedFrame(false, offset)) +
+                               middle * sizeof(unsigned short),
+                           sizeof(bits), cudaMemcpyDeviceToHost);
+                const float got = halfToFloat(bits);
+                const int expectedSlot = iw3::MonoBwVideoGpu::kPad + offset;
+                const float want = greys[size_t(expectedSlot)];
+                const bool ok = std::abs(got - want) < 0.02f;
+                std::printf("    %s cache[%d] = %.3f, slot %d went in as %.3f\n",
+                            ok ? "ok  " : "FAIL", offset, got, expectedSlot, want);
+                if (!ok) ++wrong;
+            }
+            if (wrong)
+            {
+                std::printf("FAIL: %d of %d cached frames came from the wrong input frame\n",
+                            wrong, iw3::MonoBwVideoGpu::kStride);
+                ++failures;
+            }
+        }
+        else
+        {
+            std::printf("FAIL: frame alignment case did not run\n");
+            ++failures;
+        }
+        if (deviceDepth) cudaFree(deviceDepth);
+    }
+
     std::printf("\n%d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
 }
