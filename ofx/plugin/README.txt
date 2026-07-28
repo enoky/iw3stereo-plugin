@@ -68,15 +68,20 @@ PARAMETERS
                       times the parameters, and is generally cleaner around
                       edges.
 
+                      Despite the parameter count v3 is the slightly faster of
+                      the two, because it works on a reduced grid: 4.8 ms
+                      against 5.4 ms on a 1920x800 frame. Try both on a shot and
+                      keep whichever looks better -- neither is more correct.
+
                       monobw_inpaint is a different pipeline rather than another
                       network. The other two warp backwards, which means that
                       where an object moves aside there is nothing behind it and
                       the edge gets smeared into the gap. This one warps
                       forwards, works out exactly which pixels ended up with
                       nothing behind them, and fills those with a network. It
-                      handles occlusions better and costs roughly seven times as
-                      much: about 26 ms a frame at HD against 4 ms, and 4K is
-                      render-only.
+                      handles occlusions better and costs roughly eight times
+                      as much: about 37 ms a frame at HD against 4 ms, and 4K
+                      is render-only.
 
                       monobw_inpaint_video is the same pipeline with a model
                       that sees twelve frames at once instead of one. The
@@ -85,7 +90,7 @@ PARAMETERS
                       not. It asks Resolve for the frames either side of the
                       one being rendered and keeps a window's worth of results,
                       so it costs about twice what monobw_inpaint does rather
-                      than twelve times.
+                      than twelve times -- roughly 78 ms a frame at HD.
 
                       Both need the GPU path -- NVIDIA, with Fusion's GPU
                       processing on. On the CPU they decline and pass the
@@ -103,11 +108,6 @@ PARAMETERS
                       Both are counted against the depth's width, so a setting
                       means the same thing whatever resolution you render at.
                       Both do nothing when another Model is selected.
-
-                      Despite the parameter count v3 is the slightly faster of
-                      the two, because it works on a reduced grid: 4.8 ms
-                      against 5.4 ms on a 1920x800 frame. Try both on a shot and
-                      keep whichever looks better -- neither is more correct.
 
 Stereo
 
