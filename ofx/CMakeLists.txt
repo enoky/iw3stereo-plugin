@@ -83,6 +83,13 @@ target_include_directories(iw3probe PRIVATE "${IW3_COMMON}")
 # is what light_video_inpaint_v1 would need. Instrumentation, not product.
 ofx_bundle(iw3temporal probe/iw3temporal.cpp)
 target_include_directories(iw3temporal PRIVATE "${IW3_COMMON}")
+if(IW3_HAS_CUDA)
+    # It opts into CUDA render, so the images it fetches are device pointers and
+    # fingerprinting them needs a copy back.
+    find_package(CUDAToolkit REQUIRED)
+    target_link_libraries(iw3temporal PRIVATE CUDA::cudart_static)
+    target_include_directories(iw3temporal PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+endif()
 
 # --- the ONNX Runtime probe --------------------------------------------------
 # There is deliberately no import library and no target_link_libraries for ONNX

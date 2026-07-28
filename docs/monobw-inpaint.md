@@ -283,11 +283,32 @@ The twelve is not negotiable: `enc2.1` and `enc2.3` carry `proj_spatial`
 weights of shape `(12, 12, 1)`, a convolution over the frame axis, so the count
 is baked into the checkpoint.
 
-Two things the probe did not answer, and both should be settled before the port
-rather than during it: whether temporal fetch still works with **CUDA render
-enabled** (the probe deliberately stays on the host path so it can checksum
-pixels), and whether the **depth clip** can be fetched at other times too, which
-it must be — the probe used a single-input filter context.
+The first version of the probe left two things convenient rather than honest: it
+stayed off the CUDA path so it could read pixels directly, and it used one
+input. The plugin does neither. Asked again under the real conditions:
+
+```
+render: cudaRender=1 cudaStream=00000237E941C460
+source t=3152: fetched 8/8, 7 differ ...   OK
+depth  t=3152: fetched 8/8, 7 differ ...   OK
+```
+
+**Temporal fetch survives CUDA render**, and the fetched images are device
+pointers like every other — the probe fingerprints them by copying the sampled
+rows back. **The depth clip honours it too**, which was not a given: a host could
+plausibly support temporal access on the primary input and not a secondary one.
+
+The probe also turned up something neither question asked. At the start of a
+clip the negative offsets simply are not there:
+
+```
+source t=0: fetched 4/8, 3 differ -- -6:null -5:null -3:null -1:null ...   INCOMPLETE
+```
+
+Which is correct behaviour and an implementation requirement: a twelve-frame
+window has to clamp at the clip boundaries rather than assume it can always
+centre itself. iw3's own `infer()` already does the equivalent, repeating the
+first and last frame to pad a short sequence, so the rule to copy is there.
 
 **The offset convention.** `LightInpaintV1` has `i2i_offset = 16`, so its
 `forward()` crops 16 pixels from each side; 256x448 in gives 224x416 out.
@@ -442,11 +463,19 @@ and would have hit it on any resolution change, and there is now a
 is what found it.
 
 What is left is temporal consistency. The image model flickers, the video model
-is the fix, the host will supply the frames, and the cost is about a quarter
-more per frame if the window's outputs are cached. The port is four pieces:
-`LightVideoInpaintV1` to standalone PyTorch at diff 0 (it brings `GMLP3DBlock`
-and `WindowGMLP3d` with it), an ONNX export at a fixed batch of twelve, a frame
-cache keyed by frame number, and `getFramesNeeded` in the plugin.
+is the fix, the host will supply the frames under the conditions the plugin
+actually runs in, and the cost is about a quarter more per frame if the window's
+outputs are cached. Nothing about it is unknown any more; it is work.
+
+The port is five pieces:
+
+| | |
+| --- | --- |
+| `LightVideoInpaintV1` to standalone PyTorch at diff 0 | brings `GMLP3DBlock` and `WindowGMLP3d` with it |
+| ONNX export at a fixed batch of twelve | the batch is baked into the weights, which makes this easier than the dynamic one |
+| `getFramesNeeded` plus per-frame fetch of both clips | measured to work |
+| a frame cache keyed by frame number | what makes it 14.9 ms rather than 178 ms, and what Phase 0 already required |
+| edge clamping on the window | the offsets before the first frame come back null |
 
 Still open: whether the occlusion quality is worth the cost at all. That is a
 judgement on footage, and it is now answerable — the node works.

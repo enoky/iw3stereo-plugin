@@ -21,12 +21,19 @@
 //   2. the images differ from each other, i.e. they really are other frames
 //   3. it still holds during playback and render, not just a single scrub
 //
-// Deliberately does not opt into CUDA render, so getPixelData() is host memory
-// and can be checksummed without a device copy. The temporal question is
-// independent of where the pixels live.
+// The first version of this probe stayed off the CUDA path so it could
+// checksum pixels directly, and used one input. Both of those were the
+// convenient choice rather than the honest one, because the plugin that would
+// use this does neither: it opts into CUDA render, so fetched images are device
+// pointers, and it needs twelve frames of *depth* as well as colour. Assuming
+// those work because the simple case did is the reasoning that produced the
+// output-binding bug. So this now asks under the real conditions -- CUDA render
+// on, two clips -- and fingerprints device memory by copying the sampled rows
+// back.
 //
-// Add "iw3 Temporal Probe" to a clip with *moving* content -- on a freeze frame
-// every offset is legitimately identical and the probe cannot tell you anything.
+// Add "iw3 Temporal Probe" to a clip with *moving* content, and connect Depth
+// as well -- on a freeze frame every offset is legitimately identical and the
+// probe cannot tell you anything.
 
 #include "ofxsImageEffect.h"
 #include "ofxsInteract.h"
@@ -35,6 +42,9 @@
 
 #include "probe_log.h"
 
+#include <cuda_runtime.h>
+
+#include <algorithm>
 #include <cmath>
 #include <memory>
 #include <sstream>
@@ -68,7 +78,7 @@ int componentCount(OFX::PixelComponentEnum components)
 //
 // Not a hash -- the point is only to tell one frame from another, and a sum of
 // widely spaced pixels does that on any real footage while costing nothing.
-double fingerprint(OFX::Image* image)
+double fingerprint(OFX::Image* image, bool deviceMemory)
 {
     if (!image || image->getPixelDepth() != OFX::eBitDepthFloat)
     {
@@ -87,10 +97,28 @@ double fingerprint(OFX::Image* image)
     const size_t rowBytes = size_t(image->getRowBytes());
     double sum = 0.0;
     const int steps = 8;
+    std::vector<float> hostRow;
     for (int j = 0; j < steps; ++j)
     {
         const int y = (height * (2 * j + 1)) / (2 * steps);
-        const float* row = reinterpret_cast<const float*>(base + size_t(y) * rowBytes);
+        const float* row = nullptr;
+        if (deviceMemory)
+        {
+            // With CUDA render on, getPixelData() is a device pointer and
+            // reading it here is an access violation that takes Resolve with
+            // it. One row at a time is plenty for a fingerprint.
+            hostRow.resize(size_t(width) * size_t(components));
+            if (cudaMemcpy(hostRow.data(), base + size_t(y) * rowBytes,
+                           hostRow.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
+            {
+                return 0.0;
+            }
+            row = hostRow.data();
+        }
+        else
+        {
+            row = reinterpret_cast<const float*>(base + size_t(y) * rowBytes);
+        }
         for (int i = 0; i < steps; ++i)
         {
             const int x = (width * (2 * i + 1)) / (2 * steps);
@@ -110,6 +138,14 @@ public:
     {
         _dstClip = fetchClip(kOfxImageEffectOutputClipName);
         _srcClip = fetchClip(kOfxImageEffectSimpleSourceClipName);
+        try
+        {
+            _depthClip = fetchClip("Depth");
+        }
+        catch (...)
+        {
+            _depthClip = nullptr;  // filter context permits only one input
+        }
     }
 
     virtual void render(const OFX::RenderArguments& args) override;
@@ -123,23 +159,110 @@ public:
         OfxRangeD range;
         range.min = args.time + kOffsets[0];
         range.max = args.time + kOffsets[sizeof(kOffsets) / sizeof(kOffsets[0]) - 1];
+        // Both clips, because the real plugin needs twelve frames of depth as
+        // much as twelve frames of colour.
         if (_srcClip)
         {
             frames.setFramesNeeded(*_srcClip, range);
         }
+        if (_depthClip && _depthClip->isConnected())
+        {
+            frames.setFramesNeeded(*_depthClip, range);
+        }
         if (_framesNeededCalls++ == 0)
         {
-            probe::logf("getFramesNeeded: CALLED, t=%.3f range=[%.3f, %.3f]",
-                        args.time, range.min, range.max);
+            probe::logf("getFramesNeeded: CALLED, t=%.3f range=[%.3f, %.3f] depth=%d",
+                        args.time, range.min, range.max,
+                        int(_depthClip && _depthClip->isConnected()));
         }
     }
 
 private:
+    // One pass over a clip: fetch it at every offset and report whether the
+    // frames are real and correctly indexed.
+    void probeClip(OFX::Clip* clip, const char* label, double time, bool deviceMemory,
+                   bool verbose);
+
     OFX::Clip* _dstClip = nullptr;
     OFX::Clip* _srcClip = nullptr;
+    OFX::Clip* _depthClip = nullptr;
     int _framesNeededCalls = 0;
     int _renders = 0;
 };
+
+void TemporalProbeEffect::probeClip(OFX::Clip* clip, const char* label, double time,
+                                    bool deviceMemory, bool verbose)
+{
+    if (!clip || !clip->isConnected())
+    {
+        if (verbose)
+        {
+            probe::logf("  %s: not connected", label);
+        }
+        return;
+    }
+
+    std::ostringstream summary;
+    double baseline = 0.0;
+    int fetched = 0;
+    int distinct = 0;
+
+    for (int offset : kOffsets)
+    {
+        std::unique_ptr<OFX::Image> image;
+        try
+        {
+            image.reset(clip->fetchImage(time + double(offset)));
+        }
+        catch (const std::exception& error)
+        {
+            if (verbose) probe::logf("    %s t%+d: THREW %s", label, offset, error.what());
+            continue;
+        }
+        catch (...)
+        {
+            if (verbose) probe::logf("    %s t%+d: THREW (unknown)", label, offset);
+            continue;
+        }
+
+        if (!image)
+        {
+            summary << " " << offset << ":null";
+            continue;
+        }
+
+        ++fetched;
+        const double print = fingerprint(image.get(), deviceMemory);
+        if (offset == 0)
+        {
+            baseline = print;
+        }
+        else if (std::abs(print - baseline) > 1e-6)
+        {
+            ++distinct;
+        }
+        summary << " " << offset << ":"
+                << (offset == 0 ? "base" : (std::abs(print - baseline) > 1e-6 ? "diff" : "SAME"));
+        if (verbose)
+        {
+            // The absolute frame number goes in the line with the fingerprint on
+            // purpose. Reading the same value back for the same absolute frame,
+            // fetched at different offsets from different render times, is what
+            // proves the frames are correctly indexed rather than merely
+            // different from one another.
+            probe::logf("    %s t%+d (frame %.0f): fingerprint=%.6f%s",
+                        label, offset, time + double(offset), print,
+                        offset == 0 ? "  <- baseline" : "");
+        }
+    }
+
+    const int wanted = int(sizeof(kOffsets) / sizeof(kOffsets[0]));
+    probe::logf("  %s t=%.0f: fetched %d/%d, %d differ --%s%s",
+                label, time, fetched, wanted, distinct, summary.str().c_str(),
+                fetched == wanted && distinct >= 2 ? "   OK"
+              : fetched == wanted ? "   ALL IDENTICAL (freeze frame, or the host is stubbing it)"
+                                  : "   INCOMPLETE");
+}
 
 void TemporalProbeEffect::render(const OFX::RenderArguments& args)
 {
@@ -149,87 +272,28 @@ void TemporalProbeEffect::render(const OFX::RenderArguments& args)
         return;
     }
 
-    // Only the first few renders are logged in detail. Playback would otherwise
-    // produce thousands of lines and bury the answer.
-    const bool verbose = _renders < 8;
+    // With CUDA render on, every image the host hands back -- including the ones
+    // fetched at other times -- is device memory.
+    const bool deviceMemory = args.isEnabledCudaRender;
+
+    const bool verbose = _renders < 4;
+    if (_renders == 0)
+    {
+        probe::logf("render: cudaRender=%d cudaStream=%p depthConnected=%d",
+                    int(args.isEnabledCudaRender), args.pCudaStream,
+                    int(_depthClip && _depthClip->isConnected()));
+    }
     ++_renders;
 
-    std::ostringstream summary;
-    double baseline = 0.0;
-    int fetched = 0;
-    int distinct = 0;
-
-    for (int offset : kOffsets)
+    if (_renders <= 8)
     {
-        const double time = args.time + double(offset);
-        std::unique_ptr<OFX::Image> image;
-        try
-        {
-            image.reset(_srcClip && _srcClip->isConnected() ? _srcClip->fetchImage(time) : nullptr);
-        }
-        catch (const std::exception& error)
-        {
-            if (verbose)
-            {
-                probe::logf("    t%+d: THREW %s", offset, error.what());
-            }
-            continue;
-        }
-        catch (...)
-        {
-            if (verbose)
-            {
-                probe::logf("    t%+d: THREW (unknown)", offset);
-            }
-            continue;
-        }
-
-        if (!image)
-        {
-            summary << " " << offset << ":null";
-            if (verbose)
-            {
-                probe::logf("    t%+d: null", offset);
-            }
-            continue;
-        }
-
-        ++fetched;
-        const double print = fingerprint(image.get());
-        if (offset == 0)
-        {
-            baseline = print;
-        }
-        else if (std::abs(print - baseline) > 1e-6)
-        {
-            ++distinct;
-        }
-        const OfxRectI bounds = image->getBounds();
-        summary << " " << offset << ":" << (offset != 0 && std::abs(print - baseline) > 1e-6 ? "diff" : "same");
-        if (verbose)
-        {
-            probe::logf("    t%+d: ok bounds=(%d,%d)-(%d,%d) fingerprint=%.6f%s",
-                        offset, bounds.x1, bounds.y1, bounds.x2, bounds.y2, print,
-                        offset == 0 ? "  <- baseline" : "");
-        }
+        probeClip(_srcClip, "source", args.time, deviceMemory, verbose);
+        probeClip(_depthClip, "depth ", args.time, deviceMemory, verbose);
     }
 
-    if (verbose)
-    {
-        const int wanted = int(sizeof(kOffsets) / sizeof(kOffsets[0]));
-        probe::logf("render t=%.3f: fetched %d/%d, %d differ from t+0 --%s",
-                    args.time, fetched, wanted, distinct, summary.str().c_str());
-        if (_renders == 1)
-        {
-            probe::logf("  VERDICT so far: %s",
-                        distinct >= 2 ? "temporal access WORKS (other frames really are other frames)"
-                      : fetched > 1 ? "fetch succeeds but every frame is IDENTICAL -- either a freeze "
-                                      "frame, or the host is returning the current frame for every time"
-                                    : "temporal access UNAVAILABLE");
-        }
-    }
-
-    // Pass the source through so the node is visible in the viewer.
+    // Pass the source through so the node is visible. On the CUDA path that has
+    // to be a device copy: the loops below would fault on device pointers, which
+    // is a crash this project has already had once.
     std::unique_ptr<OFX::Image> src(
         _srcClip && _srcClip->isConnected() ? _srcClip->fetchImage(args.time) : nullptr);
     const int components = componentCount(dst->getPixelComponents());
@@ -238,6 +302,24 @@ void TemporalProbeEffect::render(const OFX::RenderArguments& args)
         return;
     }
     const OfxRectI dstBounds = dst->getBounds();
+
+    if (deviceMemory)
+    {
+        if (src)
+        {
+            const OfxRectI srcBounds = src->getBounds();
+            const int rows = std::min(dstBounds.y2 - dstBounds.y1, srcBounds.y2 - srcBounds.y1);
+            const size_t bytes = size_t(std::min(dstBounds.x2 - dstBounds.x1,
+                                                 srcBounds.x2 - srcBounds.x1)) *
+                                 size_t(components) * sizeof(float);
+            cudaMemcpy2DAsync(dst->getPixelData(), size_t(dst->getRowBytes()),
+                              src->getPixelData(), size_t(src->getRowBytes()),
+                              bytes, size_t(rows), cudaMemcpyDeviceToDevice,
+                              static_cast<cudaStream_t>(args.pCudaStream));
+        }
+        return;
+    }
+
     for (int y = args.renderWindow.y1; y < args.renderWindow.y2; ++y)
     {
         if (y < dstBounds.y1 || y >= dstBounds.y2) continue;
@@ -288,6 +370,9 @@ void TemporalProbeFactory::describe(OFX::ImageEffectDescriptor& desc)
     desc.setSupportsTiles(false);
     // The whole point.
     desc.setTemporalClipAccess(true);
+    // Under the conditions the real plugin runs in, not the convenient ones.
+    desc.setSupportsCudaRender(true);
+    desc.setSupportsCudaStream(true);
     desc.setRenderTwiceAlways(false);
     desc.setSupportsMultipleClipPARs(false);
 
@@ -299,12 +384,25 @@ void TemporalProbeFactory::describe(OFX::ImageEffectDescriptor& desc)
     }
 }
 
-void TemporalProbeFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OFX::ContextEnum)
+void TemporalProbeFactory::describeInContext(OFX::ImageEffectDescriptor& desc,
+                                             OFX::ContextEnum context)
 {
     OFX::ClipDescriptor* src = desc.defineClip(kOfxImageEffectSimpleSourceClipName);
     src->addSupportedComponent(OFX::ePixelComponentRGBA);
     src->addSupportedComponent(OFX::ePixelComponentRGB);
     src->setSupportsTiles(false);
+
+    // A second input is only legal in the general context, which is also the
+    // context the real plugin runs in.
+    if (context == OFX::eContextGeneral)
+    {
+        OFX::ClipDescriptor* depth = desc.defineClip("Depth");
+        depth->addSupportedComponent(OFX::ePixelComponentRGBA);
+        depth->addSupportedComponent(OFX::ePixelComponentRGB);
+        depth->addSupportedComponent(OFX::ePixelComponentAlpha);
+        depth->setSupportsTiles(false);
+        depth->setOptional(true);
+    }
 
     OFX::ClipDescriptor* dst = desc.defineClip(kOfxImageEffectOutputClipName);
     dst->addSupportedComponent(OFX::ePixelComponentRGBA);
