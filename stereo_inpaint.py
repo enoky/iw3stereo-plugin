@@ -40,10 +40,16 @@ which bakes one frame size into an exported graph. ``F.pad(mode="replicate")``
 takes the amount as data. Numerically identical, and it is the same change
 ``row_flow_v3`` needed; ``docs/row-flow-v3.md`` records why.
 
-The video model is deliberately not ported. ``light_video_inpaint_v1`` is
-driven through a frame queue with pre- and post-padding, and Resolve renders
-frames out of order, with gaps and repeats -- see ``docs/phase0-findings.md``.
-``light_inpaint_v1`` is per-frame and is the right target.
+Both inpaint models are here. ``LightInpaintV1`` fills each frame on its own,
+which is cheap and flickers, because nothing ties one frame's invention to the
+next. ``LightVideoInpaintV1`` mixes along a twelve-frame axis and does not.
+
+iw3 drives the video one through a stateful frame queue that assumes frames
+arrive consecutively, which Resolve does not do -- it renders in order but with
+gaps and repeats, measured in ``docs/phase0-findings.md``. That rules out the
+queue, not the model: a caller that asks for the twelve frames it wants works
+fine, and ``docs/monobw-inpaint.md`` records the probe showing Resolve supplies
+them. So what is ported here is the model and a window, not the queue.
 """
 
 import torch
@@ -65,17 +71,23 @@ from stereo_warp import (
 __all__ = [
     "MonoBW",
     "LightInpaintV1",
+    "LightVideoInpaintV1",
     "MonoBWInpaintImage",
     "load_light_inpaint_v1",
+    "load_light_video_inpaint_v1",
     "load_monobw_inpaint",
     "synthesize_stereo_inpaint",
     "LIGHT_INPAINT_V1_URL",
+    "LIGHT_VIDEO_INPAINT_V1_URL",
+    "SEQ_LEN",
 ]
 
 _RELEASE = "https://github.com/nagadomi/nunif/releases/download/0.0.0/"
 LIGHT_INPAINT_V1_URL = _RELEASE + "iw3_light_inpaint_v1_20250919.pth"
+LIGHT_VIDEO_INPAINT_V1_URL = _RELEASE + "iw3_light_video_inpaint_v1_20250919.pth"
 
 MODEL_NAME = "inpaint.light_inpaint_v1"
+VIDEO_MODEL_NAME = "inpaint.light_video_inpaint_v1"
 
 
 # ---------------------------------------------------------------------------
@@ -448,11 +460,14 @@ class _WindowGMLP2d(nn.Module):
 
     def __init__(self, in_channels, window_size, mlp_ratio=2, shift=False):
         super().__init__()
-        self.window_size = (window_size, window_size)
+        if not isinstance(window_size, (tuple, list)):
+            window_size = (window_size, window_size)
+        self.window_size = tuple(window_size)
         self.shift = shift
-        self.pad_h = window_size // 2
-        self.pad_w = window_size // 2
-        self.gmlp = _GMLP(in_channels, seq_len=window_size * window_size, mlp_ratio=mlp_ratio)
+        self.pad_h = self.window_size[0] // 2
+        self.pad_w = self.window_size[1] // 2
+        self.gmlp = _GMLP(in_channels, seq_len=self.window_size[0] * self.window_size[1],
+                          mlp_ratio=mlp_ratio)
 
     def forward(self, x, norm1, norm2):
         if self.shift:
@@ -618,6 +633,269 @@ class LightInpaintV1(nn.Module):
         # iw3 guards this with `if not self.training`; this is an inference-only
         # port, so it always applies.
         return src.clamp(0, 1)
+
+
+# ---------------------------------------------------------------------------
+# LightVideoInpaintV1
+#
+# The same idea as LightInpaintV1 with a temporal axis, and it exists because
+# the image model has no temporal path at all: every frame's fill is invented
+# independently, so the filled regions crawl. Two of the five `enc2` blocks are
+# replaced with gMLP blocks that mix along the frame axis, which is the whole
+# difference -- 2.31M parameters against 2.26M.
+#
+# It needs exactly twelve frames. The count is not a window size that could be
+# tuned: `enc2.1` and `enc2.3` carry `proj_spatial` weights of shape
+# (12, 12, 1), a convolution over the frame axis, so it is baked into the
+# checkpoint.
+#
+# Everything except the temporal blocks is shared with the image model above:
+# _GMLPBlock, _GLUConvMLP, _FastLayerNorm, the gaussian filters, the dilations.
+
+SEQ_LEN = 12
+
+
+def _window_partition_3d(x, window):
+    """BCDHW -> (B*windows, tokens, C), aka nunif's bcdhw_to_bnc."""
+    sd, sh, sw = window
+    B, C, D, H, W = x.shape
+    od, oh, ow = D // sd, H // sh, W // sw
+    x = x.reshape(B, C, od, sd, oh, sh, ow, sw)
+    x = x.permute(0, 2, 4, 6, 3, 5, 7, 1)
+    return x.reshape(B * od * oh * ow, sd * sh * sw, C)
+
+
+def _window_merge_3d(x, shape, window):
+    sd, sh, sw = window
+    B, C, D, H, W = shape
+    od, oh, ow = D // sd, H // sh, W // sw
+    x = x.reshape(B, od, oh, ow, sd, sh, sw, C)
+    x = x.permute(0, 7, 1, 4, 2, 5, 3, 6)
+    return x.reshape(B, C, D, H, W)
+
+
+class _WindowGMLP3d(nn.Module):
+    """``_GMLP`` over a window of the frame axis.
+
+    Only the unshifted case is here. ``LightVideoInpaintV1`` builds both of its
+    3D blocks with ``shift=False``, so the reflect-padded shifted path in
+    nunif's version has nothing to run.
+
+    With a window of (SEQ_LEN, 1, 1) each spatial position gets its own
+    sequence of twelve tokens and they are mixed by the Conv1d in ``_GMLP``.
+    That is the entire temporal mechanism.
+    """
+
+    def __init__(self, in_channels, window_size, mlp_ratio=2):
+        super().__init__()
+        self.window_size = tuple(window_size)
+        seq_len = self.window_size[0] * self.window_size[1] * self.window_size[2]
+        self.gmlp = _GMLP(in_channels, seq_len=seq_len, mlp_ratio=mlp_ratio)
+
+    def forward(self, x, norm1, norm2):
+        shape = x.shape
+        x = _window_partition_3d(x, self.window_size)
+        x = self.gmlp(x, norm1, norm2)
+        return _window_merge_3d(x, shape, self.window_size)
+
+
+class _GMLP3DBlock(nn.Module):
+    """The temporal block. Takes the frames as the batch dimension.
+
+    iw3 hands this a (frames, C, H, W) tensor and reinterprets it as one
+    five-dimensional (1, C, frames, H, W) volume, mixes along the frame axis,
+    and puts it back. The permutes are its own; the reshape after them copies,
+    because a permuted tensor is not contiguous.
+    """
+
+    def __init__(self, in_channels, window_size, mlp_ratio=2):
+        super().__init__()
+        self.gmlp = _WindowGMLP3d(in_channels, window_size=window_size, mlp_ratio=mlp_ratio)
+        self.norm1 = _FastLayerNorm(in_channels, bias=False)
+        self.norm2 = _FastLayerNorm(in_channels * mlp_ratio, bias=False)
+        self.glu_conv = _GLUConvMLP(in_channels, in_channels, mlp_ratio=1, kernel_size=3)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x = x.permute(1, 0, 2, 3).reshape(1, C, B, H, W)
+        x = x + self.gmlp(x, self.norm1, self.norm2)
+        x = x.permute(0, 2, 1, 3, 4).reshape(B, C, H, W)
+        return x + self.glu_conv(x)
+
+
+def _chunked_forward(module, x, chunk):
+    """Run ``module`` over the frame axis in fixed-size pieces.
+
+    Not an optimisation to tidy away. iw3 calls the model with
+    ``micro_batch_size=2``, so the 2D blocks see two frames at a time while the
+    3D blocks see all twelve, and a different batch size can pick a different
+    kernel. Reproduced because the golden test wants difference 0.
+    """
+    outputs = []
+    for i in range(0, x.shape[0], chunk):
+        outputs.append(module(x[i:i + chunk]))
+    return torch.cat(outputs, dim=0)
+
+
+class LightVideoInpaintV1(nn.Module):
+    """iw3's ``inpaint.light_video_inpaint_v1``, inference path only.
+
+    Input is twelve warped eyes (12, 3, H, W) and their hole masks
+    (12, 1, H, W); output is the twelve eyes with the holes filled.
+
+    Differences from ``LightInpaintV1`` that are easy to miss when reading the
+    two side by side: ``patch`` is one stride-4 convolution rather than a pixel
+    unshuffle and a 1x1, its LeakyReLU is applied in ``_forward`` rather than
+    being part of a Sequential, ``enc1`` does not shift its windows, and
+    ``to_image`` is a 1x1 with no padding.
+    """
+
+    I2I_OFFSET = 16
+    DOWNSCALING_FACTOR = 4
+    MOD = 16
+
+    def __init__(self, base_dim=96, lv2_mlp_ratio=1):
+        super().__init__()
+        pack = self.DOWNSCALING_FACTOR ** 2
+        C = base_dim
+        C2 = C * 2
+        self.mask_bias = nn.Parameter(torch.zeros(1, C, 1, 1))
+        self.patch = nn.Conv2d(3, C, kernel_size=self.DOWNSCALING_FACTOR,
+                               stride=self.DOWNSCALING_FACTOR, padding=0)
+        self.enc1 = _GMLPBlock(C, window_size=16, mlp_ratio=2, shift=False)
+        self.down = nn.Conv2d(C, C2, kernel_size=2, stride=2, padding=0)
+        # The two 3D blocks are the temporal mixing, and they sit between the
+        # 2D ones rather than replacing them.
+        self.enc2 = nn.ModuleList([
+            _GMLPBlock(C2, window_size=(8, 8), mlp_ratio=lv2_mlp_ratio, shift=True),
+            _GMLP3DBlock(C2, window_size=(SEQ_LEN, 1, 1), mlp_ratio=2),
+            _GMLPBlock(C2, window_size=(8, 8), mlp_ratio=lv2_mlp_ratio, shift=False),
+            _GMLP3DBlock(C2, window_size=(SEQ_LEN, 1, 1), mlp_ratio=2),
+            _GMLPBlock(C2, window_size=(8, 8), mlp_ratio=lv2_mlp_ratio, shift=True),
+        ])
+        self.up = nn.Conv2d(C2, C * 4, kernel_size=1, stride=1, padding=0)
+        self.dec1 = _GMLPBlock(C, window_size=16, mlp_ratio=2, shift=False)
+        self.to_image = nn.Conv2d(C, 3 * pack, kernel_size=1, stride=1, padding=0)
+        self.mask_blur = _SeparableGaussianFilter2d(1, kernel_size=15, padding=15 // 2)
+
+    def preprocess(self, x, mask, closing=False, inner_dilation=0, outer_dilation=0,
+                   base_width=None):
+        if closing:
+            mask = _mask_closing(mask)
+        else:
+            mask = mask.float()
+
+        mask = _dilate_inner(mask, n_iter=inner_dilation, base_width=base_width)
+        mask = _dilate_outer(mask, n_iter=outer_dilation, base_width=base_width)
+
+        x = x * (1 - mask)
+        mask = torch.clamp(self.mask_blur(mask) + mask, 0, 1)
+        return x, mask
+
+    def infer(self, x, mask, closing=False, inner_dilation=0, outer_dilation=0, base_width=None):
+        """A sequence of frames in, the same number out.
+
+        Anything that is not a multiple of twelve is padded by repeating the
+        first and last frame, and the padding is cropped off again. That is
+        also the rule for a window that runs off the start or end of a clip.
+        """
+        pad_before = pad_after = 0
+        if x.shape[0] % SEQ_LEN != 0:
+            total = SEQ_LEN - x.shape[0] % SEQ_LEN
+            pad_before = total // 2
+            pad_after = total - pad_before
+            x = torch.cat([x[0:1]] * pad_before + [x] + [x[-1:]] * pad_after, dim=0)
+            mask = torch.cat([mask[0:1]] * pad_before + [mask] + [mask[-1:]] * pad_after, dim=0)
+
+        x, mask = self.preprocess(x, mask, closing=closing,
+                                  inner_dilation=inner_dilation, outer_dilation=outer_dilation,
+                                  base_width=base_width)
+        out = self.forward(x, mask, skip_i2i_offset=True, micro_batch_size=2)
+
+        if pad_before > 0:
+            out = out[pad_before:]
+        if pad_after > 0:
+            out = out[:-pad_after]
+        return out
+
+    def _forward(self, x, mask, micro_batch_size=SEQ_LEN):
+        # Exactly twelve, as iw3 asserts here too. `infer` pads a shorter
+        # sequence up to twelve; a longer one is not a bigger window, it is a
+        # different arrangement of windows, and the model was not trained on it.
+        assert x.shape[0] == SEQ_LEN, f"needs exactly {SEQ_LEN} frames, got {x.shape[0]}"
+
+        mask = _pixel_unshuffle(mask, (self.DOWNSCALING_FACTOR,) * 2).amax(dim=1, keepdim=True) > 0.99
+
+        # The encoder runs per micro-batch and both of its outputs are kept:
+        # x1 is needed again by the decoder, x2 by the temporal blocks, which
+        # need every frame at once and so cannot be chunked with the rest.
+        x1s = []
+        x2s = []
+        for i in range(0, x.shape[0], micro_batch_size):
+            x0 = F.leaky_relu(self.patch(x[i:i + micro_batch_size]), 0.1, inplace=True)
+            x0 = torch.where(mask[i:i + micro_batch_size], self.mask_bias.to(x0.dtype), x0)
+            x1 = self.enc1(x0)
+            x1s.append(x1)
+            x2s.append(self.down(x1))
+
+        x2 = torch.cat(x2s, dim=0)
+
+        for block in self.enc2:
+            if isinstance(block, _GMLP3DBlock):
+                x2 = block(x2)
+            else:
+                x2 = _chunked_forward(block, x2, micro_batch_size)
+
+        outputs = []
+        for i in range(0, x.shape[0], micro_batch_size):
+            x3 = _pixel_shuffle(self.up(x2[i:i + micro_batch_size]), (2, 2))
+            out = self.dec1(x1s[i // micro_batch_size] + x3)
+            outputs.append(self.to_image(out))
+        return _pixel_shuffle(torch.cat(outputs, dim=0), (self.DOWNSCALING_FACTOR,) * 2)
+
+    def forward(self, x, mask, skip_i2i_offset=False, micro_batch_size=SEQ_LEN):
+        src = x
+        x = (x - 0.5) / 0.5
+
+        input_height, input_width = x.shape[2:]
+        pad1 = (self.MOD * self.DOWNSCALING_FACTOR) - input_width % (self.MOD * self.DOWNSCALING_FACTOR)
+        pad2 = (self.MOD * self.DOWNSCALING_FACTOR) - input_height % (self.MOD * self.DOWNSCALING_FACTOR)
+        padding = (0, pad1, 0, pad2)
+        x = F.pad(x, padding, mode="replicate")
+        mask = F.pad(mask, padding, mode="replicate")
+
+        x = self._forward(x, mask, micro_batch_size=micro_batch_size)
+        x = F.pad(x, (0, -pad1, 0, -pad2))
+        mask = F.pad(mask, (0, -pad1, 0, -pad2))
+
+        if not skip_i2i_offset:
+            # sequence_offset is 0 in this model, so iw3's trim of the sequence
+            # ends never runs and is not reproduced.
+            src = F.pad(src.to(x.dtype), (-self.I2I_OFFSET,) * 4)
+            mask = F.pad(mask, (-self.I2I_OFFSET,) * 4)
+            x = F.pad(x, (-self.I2I_OFFSET,) * 4)
+
+        mask = mask.expand_as(src)
+        src = src * (1 - mask) + x * mask
+        return src.clamp(0, 1)
+
+
+def load_light_video_inpaint_v1(path=None, device="cpu"):
+    """Load the published ``light_video_inpaint_v1`` checkpoint."""
+    if path is None:
+        data = torch.hub.load_state_dict_from_url(LIGHT_VIDEO_INPAINT_V1_URL,
+                                                  weights_only=True, map_location="cpu")
+    else:
+        data = torch.load(path, map_location="cpu", weights_only=True)
+
+    if "nunif_model" not in data:
+        raise ValueError("not a nunif checkpoint")
+    if data.get("name") != VIDEO_MODEL_NAME:
+        raise ValueError(f"expected {VIDEO_MODEL_NAME}, got {data.get('name')!r}")
+
+    model = LightVideoInpaintV1(**data.get("kwargs", {}))
+    model.load_state_dict(data["state_dict"], strict=True)
+    return model.eval().to(device)
 
 
 def load_light_inpaint_v1(path=None, device="cpu"):

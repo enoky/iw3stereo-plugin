@@ -310,5 +310,114 @@ class GoldenInpaintTest(unittest.TestCase):
         self.assertLess(coverage, 0.5, "mask covers half the frame; that is not a hole mask")
 
 
+class GoldenVideoInpaintTest(unittest.TestCase):
+    """light_video_inpaint_v1, the temporal model, at difference 0.
+
+    This tests the network rather than a pipeline around it. iw3 drives it
+    through a stateful frame queue that assumes frames arrive consecutively,
+    which Resolve does not do, so the queue is deliberately not ported -- the
+    plugin will hand the model the twelve frames it wants directly. What has to
+    be right is the model and its padding rule.
+    """
+
+    CHECKPOINT = os.path.join(NUNIF_ROOT, "iw3", "pretrained_models", "hub", "checkpoints",
+                              "iw3_light_video_inpaint_v1_20250919.pth")
+
+    @classmethod
+    def setUpClass(cls):
+        if not os.path.exists(cls.CHECKPOINT):
+            raise unittest.SkipTest(f"checkpoint not downloaded: {cls.CHECKPOINT}")
+        from nunif.models import load_model
+        cls.model = stereo_inpaint.load_light_video_inpaint_v1(cls.CHECKPOINT, device=DEVICE)
+        cls.reference, _ = load_model(cls.CHECKPOINT, device_ids=[DEVICE_ID], weights_only=True)
+        cls.reference = cls.reference.eval()
+
+    @staticmethod
+    def make_sequence(frames, height, width, seed=0):
+        """A short sequence with moving content and a stationary hole.
+
+        The content has to move, or the temporal axis has nothing to carry and
+        a model that ignored it entirely would pass.
+        """
+        generator = torch.Generator().manual_seed(seed)
+        coarse = torch.rand((frames, 3, 12, 20), generator=generator)
+        sequence = torch.nn.functional.interpolate(
+            coarse, size=(height, width), mode="bilinear", align_corners=False).clamp(0, 1)
+        mask = torch.zeros((frames, 1, height, width))
+        mask[:, :, :, width // 4:width // 4 + 3] = 1.0
+        mask[:, :, height // 3:, width // 2:width // 2 + 5] = 1.0
+        return sequence.to(DEVICE), mask.to(DEVICE)
+
+    def assert_identical(self, frames, height, width):
+        x, mask = self.make_sequence(frames, height, width, seed=frames * 1000 + height)
+        with torch.inference_mode(), torch.autocast(DEVICE, enabled=(DEVICE == "cuda")):
+            expected = self.reference.infer(x.clone(), mask.clone())
+            actual = self.model.infer(x.clone(), mask.clone())
+        self.assertEqual(expected.shape, actual.shape, f"{frames}f {height}x{width}")
+        diff = (expected.float() - actual.float()).abs().max().item()
+        self.assertEqual(diff, 0.0, f"{frames}f {height}x{width}: max abs diff {diff}")
+
+    def test_full_window(self):
+        for height, width in ((128, 192), (216, 384), (107, 193)):
+            with self.subTest(size=(height, width)):
+                self.assert_identical(stereo_inpaint.SEQ_LEN, height, width)
+
+    def test_short_sequences_are_padded(self):
+        """Fewer than twelve frames is padded by repeating the first and last.
+
+        That is also the rule for a window running off the start or end of a
+        clip, which the temporal probe showed does happen.
+        """
+        for frames in (1, 2, 6, 11):
+            with self.subTest(frames=frames):
+                self.assert_identical(frames, 128, 192)
+
+    def test_more_than_a_window_is_refused(self):
+        """Thirteen frames is not a bigger window, and iw3 asserts on it too."""
+        x, mask = self.make_sequence(13, 128, 192)
+        with self.assertRaises(AssertionError):
+            with torch.inference_mode():
+                self.model.infer(x, mask)
+
+    def test_the_temporal_axis_is_actually_used(self):
+        """Changing a *neighbouring* frame must change this frame's fill.
+
+        This is the property the image model does not have and the whole reason
+        for porting a second one. If the window were being processed frame by
+        frame, the middle frame's output would not move at all.
+        """
+        x, mask = self.make_sequence(12, 128, 192, seed=11)
+        altered = x.clone()
+        # Leave frame 6 alone; scramble everything else.
+        generator = torch.Generator().manual_seed(99)
+        noise = torch.rand(altered.shape, generator=generator).to(DEVICE)
+        keep = altered[6:7].clone()
+        altered = noise
+        altered[6:7] = keep
+
+        with torch.inference_mode(), torch.autocast(DEVICE, enabled=(DEVICE == "cuda")):
+            before = self.model.infer(x, mask)
+            after = self.model.infer(altered, mask)
+
+        self.assertEqual((x[6] - altered[6]).abs().max().item(), 0.0,
+                         "the frame under test must be unchanged")
+        moved = (before[6] - after[6]).abs().max().item()
+        self.assertGreater(moved, 1e-3,
+                           f"frame 6 moved by only {moved} when its neighbours changed; "
+                           "is the temporal axis wired up?")
+
+    def test_is_really_the_video_model(self):
+        """Guard against the suite loading the image model on both sides."""
+        image = stereo_inpaint.load_light_inpaint_v1(CHECKPOINT, device=DEVICE)
+        x, mask = self.make_sequence(12, 128, 192, seed=5)
+        with torch.inference_mode(), torch.autocast(DEVICE, enabled=(DEVICE == "cuda")):
+            from_video = self.model.infer(x, mask)
+            from_image = image.infer(x, mask)
+        difference = (from_video - from_image).abs().max().item()
+        self.assertGreater(difference, 1e-3,
+                           f"the two inpaint models agree to {difference}; is this really the "
+                           "video one?")
+
+
 if __name__ == "__main__":
     unittest.main()

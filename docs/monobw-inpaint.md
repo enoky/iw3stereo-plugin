@@ -471,7 +471,7 @@ The port is five pieces:
 
 | | |
 | --- | --- |
-| `LightVideoInpaintV1` to standalone PyTorch at diff 0 | brings `GMLP3DBlock` and `WindowGMLP3d` with it |
+| ~~`LightVideoInpaintV1` to standalone PyTorch at diff 0~~ | **done** — six cases at difference 0, in `stereo_inpaint.py` beside the image model |
 | ONNX export at a fixed batch of twelve | the batch is baked into the weights, which makes this easier than the dynamic one |
 | `getFramesNeeded` plus per-frame fetch of both clips | measured to work |
 | a frame cache keyed by frame number | what makes it 14.9 ms rather than 178 ms, and what Phase 0 already required |
