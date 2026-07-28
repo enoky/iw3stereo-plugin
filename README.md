@@ -14,6 +14,7 @@ builds it into a tool creators already use.
 | Path | What |
 | --- | --- |
 | `stereo_warp.py` | Phase 1. Standalone PyTorch stereo synthesis, one file, no nunif imports. |
+| `stereo_inpaint.py` | The other pipeline: forward warp plus inpainting, standalone PyTorch. |
 | `stereo_warp_onnx.py` | Phase 2. The same thing on ONNX Runtime and numpy, no PyTorch. |
 | `export_onnx.py` | Builds `models/*.onnx` and the reference data. |
 | `tools/check_ort.py` | Validates and times any execution provider; needs only ORT and numpy. |
@@ -29,7 +30,7 @@ builds it into a tool creators already use.
 | `docs/phase0-findings.md` | What Resolve can and cannot do, with evidence. |
 | `docs/phase2-onnx.md` | What exported, what did not, and the timing table. |
 | `docs/row-flow-v3.md` | The second model, and the three things ONNX export needed. |
-| `docs/monobw-inpaint.md` | Investigation of the inpaint method: architecture, cost, port inventory. |
+| `docs/monobw-inpaint.md` | The inpaint method: architecture, measured cost, what got ported. |
 
 ## Status
 
@@ -56,6 +57,12 @@ Correctness carries across three hops, each measured rather than assumed:
 `stereo_warp.py` matches stock iw3 at **diff 0**; the ONNX implementation
 matches that within **2e-4**; and the C++ numeric core matches the Python at
 **float32 epsilon**.
+
+`stereo_inpaint.py` is a **standalone stage only**, not in the plugin. It is
+iw3's `monobw_inpaint` — forward warp, hole mask, then a 2.26M-parameter
+inpaint network — matching stock iw3 at diff 0 across 22 cases, and costing
+about 6.7x the warp at HD. Whether that trade is worth taking further is a
+judgement to make on footage; `docs/monobw-inpaint.md` has the numbers.
 
 Three constraints worth knowing before reading further, each with evidence in
 `docs/`:

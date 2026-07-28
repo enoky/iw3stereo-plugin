@@ -1,8 +1,10 @@
 # monobw_inpaint + light_inpaint_v1
 
-Investigation only. Nothing is implemented yet; this is the map that makes the
-implementation session efficient, and the numbers that decide whether it is
-worth having.
+The standalone PyTorch stage is **done**: `stereo_inpaint.py`, 22/22 at max
+absolute difference 0 against stock iw3. Nothing past that is built — no CUDA
+kernels, no ONNX, no plugin parameter. The decision that gate was waiting on is
+below, and the cost turned out to be about half what this document first
+predicted.
 
 ## What it is, and why it is not a model swap
 
@@ -15,7 +17,8 @@ depth ─> MonoBW warp ─┬─> warped eye ─┐
 ```
 
 Forward-warp-and-fill rather than backward-warp. Two stages, two very different
-kinds of work, and a mask travelling between them.
+kinds of work, and a mask travelling between them. That is why it lives in its
+own file rather than joining `stereo_warp.py`'s Model parameter.
 
 ## The two halves are nothing alike
 
@@ -32,7 +35,8 @@ nothing to export — but everything to port. Its notable operations:
 | `dest_index_fix[mask] = ...` | boolean masked assignment; trivial in a kernel |
 | `compute_stretch_mask` | neighbour difference against a threshold |
 
-It is also cheap: iw3 benchmarks it at 1800 FPS at FHD.
+It is also cheap: measured at **1.7 - 3.5 ms** for both eyes at HD, mask
+included, which is the same order as the whole `row_flow_v3` path.
 
 **LightInpaintV1 is 2.26M parameters** — 75x `row_flow_v2`, 19x `row_flow_v3` —
 and runs on the **colour frame at full resolution**, not on downsampled depth.
@@ -40,28 +44,106 @@ That is what makes it expensive.
 
 ## The number that decides it
 
-Measured on an RTX 5080, PyTorch, the inpaint model alone:
+Measured on an RTX 5080, PyTorch, both eyes, end to end — warp, mask
+morphology, and inpaint — against `row_flow_v3` on the same input:
 
-| | per eye | both eyes |
+| | monobw_inpaint | row_flow_v3 | ratio |
+| --- | --- | --- | --- |
+| 1920x1036, depth 392x938 | **25.9 - 26.2 ms** | 3.7 - 4.2 ms | **~6.7x** |
+| 4K, depth 518x910 | ~124 ms | 6.7 ms | ~19x |
+
+So HD is about **38 fps** rather than 250, and 4K stays render-only. Of the
+26 ms, 23.6 is the inpaint network and the rest is the warp and the mask work.
+
+An earlier draft of this document put HD at 48.4 ms and called it 10x. That
+table was measured **without autocast**, and the model is almost exactly twice
+as fast in half precision — which is what iw3 runs by default:
+
+| inpaint model, one eye | fp16 | fp32 |
 | --- | --- | --- |
-| 1920x1036 | 24.2 ms | **48.4 ms** |
-| 1080p | 26.1 ms | 52.1 ms |
-| 4K | 116.2 ms | 232.4 ms |
+| 1920x1036 | 11.8 ms | 22.6 ms |
+| 4K | 57.5 ms | 105.3 ms |
 
-Against the ~5 ms the current warp costs end to end, HD is roughly **10x
-slower** — about 15 fps rather than 200 — and 4K becomes render-only. And that
-is the inpaint model on its own, before the warp, the mask work, or any
-ONNX and packing overhead.
+The trade is still real, just cheaper than feared: inpainting fixes occlusion
+artifacts that backward warping cannot, because it has something to put in the
+holes rather than smearing an edge. Whether that is worth 6.7x is a judgement to
+make on real footage, not on a benchmark — and now there is something to make it
+with.
 
-The trade is real: inpainting fixes occlusion artifacts that backward warping
-cannot, because it has something to put in the holes rather than smearing an
-edge. Whether that is worth 10x is a judgement to make on real footage, not on
-a benchmark.
+## What got ported
 
-## The export blocker, already located
+`stereo_inpaint.py`, 908 lines — the ~530 of code this document first estimated,
+plus the comments explaining which expressions cannot be tidied — no nunif
+imports:
 
-Same class of problem as `row_flow_v3`, and expected to need the same kind of
-hunt:
+| From | What |
+| --- | --- |
+| `iw3/models/monobw.py` | `MonoBW`, whole |
+| `iw3/dilation.py` | `_dilate`, `_erode`, `_closing`, `_mask_closing`, `_dilate_inner`, `_dilate_outer` |
+| `iw3/models/light_inpaint_v1.py` | `LightInpaintV1`, `_GLUConvMLP`, `_GMLPBlock` |
+| `nunif/modules/attention.py` | `_WindowGMLP2d`, `_GMLP` |
+| `nunif/modules/norm.py` | `_FastLayerNorm` |
+| `nunif/modules/gaussian_filter.py` | `_GaussianFilter2d`, `_SeparableGaussianFilter2d`, the kernel builders |
+| `iw3/monobw_inpaint.py`, `iw3/base_inpaint.py` | `MonoBWInpaintImage` — the two classes folded into one |
+| `iw3/backward_warp.py` | `_apply_divergence_monobw` |
+| `iw3/utils.py` | `synthesize_stereo_inpaint`, the `apply_divergence` equivalent |
+
+The non-square pixel shuffle/unshuffle, the window partition and merge, the
+autocast rule and `get_mapper` all come from `stereo_warp.py` unchanged — they
+were already written and already exercised by the `row_flow_v3` export.
+
+Deliberately not ported: the video model, `basic_module_init`/`icnr_init` (an
+inference port loads weights rather than initialising them), and
+`shift_mask_token` (`LightInpaintV1` never enables it, and the checkpoint
+confirms it — there are no `shift_mask_bias` keys).
+
+One deliberate departure, and it is the same one `row_flow_v3` needed:
+`replication_pad2d_naive` builds padding by Python tuple repetition, which bakes
+a frame size into an exported graph, so `F.pad(mode="replicate")` is used
+instead. Numerically identical; `docs/row-flow-v3.md` records why it matters.
+
+Things that look like bugs and were kept anyway, because the golden test
+compares against them:
+
+- `MonoBW.warp()` guards its grid resize with `grid.shape[-2] != x.shape[-2:]`,
+  an int against a `torch.Size`, which is always true. The grid is therefore
+  interpolated twice, the second time to the size it already is.
+- `LightInpaintV1` pads up to a multiple of 64 but never by zero — an exact
+  multiple still gets a whole extra 64 pixels. The network was trained that way.
+- `_resize` derives the new height from the rounded-up `max_width` against the
+  *original* width.
+
+## The golden test
+
+`tests/test_stereo_inpaint.py`, 22 cases at difference 0, against
+`create_stereo_model("monobw_inpaint", ...)` driven through `apply_divergence`
+— iw3's real path, not a hand-assembled one. Every axis the pipeline has:
+divergence, convergence, synthetic view, mapper, both mask dilations,
+`inpaint_max_width`, mismatched and odd depth sizes, batching, amp on and off,
+and CPU.
+
+Diff 0 on the first run is not on its own evidence of anything, so the harness
+was checked by breaking the implementation on purpose. It catches all of these:
+
+| Mutation | Diff |
+| --- | --- |
+| `MonoBW` index smoothing off | 0.18 |
+| pad only to the next multiple of 64 | 0.17 |
+| window shift off | 0.035 |
+| plain `LayerNorm` instead of `FastLayerNorm` | 4.9e-4 |
+
+The last one is why `_FastLayerNorm` is in the port at all: `nn.LayerNorm` is on
+autocast's fp32 list and upcasts, nunif's does not, and that is worth 5e-4.
+
+Two mutations changed nothing, both for understandable reasons rather than
+missing coverage: dropping the second grid interpolate in `warp()` (it really is
+a no-op, it is kept only for faithfulness), and moving the packed-token mask
+threshold from 0.99 to 0.5 (the blur radius against the 4x4 pack size leaves no
+token in that band).
+
+## The export blocker, still there
+
+Untouched by this stage, and the same class of problem as `row_flow_v3`:
 
 ```
 dynamo export: OK
@@ -73,29 +155,9 @@ dynamo export: OK
 It exports and is accurate where it was traced, and fails everywhere else on an
 `Expand` node with a baked dimension. `row_flow_v3` needed three separate fixes
 to clear this class of problem — the attention head merge, the padding, and a
-batch-1 specialisation. How many this needs is unknown; one is located, and
-`WindowGMLP2d`'s shifted window partitioning is the obvious suspect for the
-rest.
-
-## The port inventory
-
-For the standalone PyTorch stage, with no nunif imports and a diff-0 bar:
-
-| From | Needs |
-| --- | --- |
-| `iw3/models/monobw.py` | `MonoBW`, ~150 lines with its Gaussian filter |
-| `iw3/dilation.py` | `dilate`, `erode`, `closing`, `mask_closing`, `dilate_inner`, `dilate_outer` |
-| `iw3/models/light_inpaint_v1.py` | `LightInpaintV1`, `GLUConvMLP`, `GMLPBlock` |
-| `nunif/modules/attention.py` | `WindowGMLP2d`, `GMLP` |
-| `nunif/modules/norm.py` | `FastLayerNorm` (LayerNorm plus an autocast dtype rule that matters for diff 0) |
-| `nunif/modules/gaussian_filter.py` | `GaussianFilter2d`, `SeparableGaussianFilter2d`, the kernel builders |
-| `iw3/monobw_inpaint.py`, `iw3/base_inpaint.py` | `MonoBWInpaintImage`, `preprocess_mask`, `_inpaint_single`, `_inpaint` |
-
-Roughly 530 lines, all of which must be exact.
-
-Already available from the `row_flow_v3` work: the non-square pixel
-shuffle/unshuffle and the window partition and merge helpers, in
-`stereo_warp.py`.
+batch-1 specialisation. One of those three, the padding, is already in this port
+because it was written that way from the start. How many more this needs is
+unknown; `_WindowGMLP2d`'s shifted window partitioning is the obvious suspect.
 
 ## Two things to get right
 
@@ -107,17 +169,20 @@ temporal queue is a poor fit. `light_inpaint_v1` is per-frame and is the right
 target.
 
 **The offset convention.** `LightInpaintV1` has `i2i_offset = 16`, so its
-`forward()` crops 16 pixels from each side; 256x448 in gives 224x416 out. The
-plugin has to pad before and account for that. Note `LightInpaintV1.infer()` is
-the model's own method, not the `I2IBaseModel` one, and calls `forward()` with
-`skip_i2i_offset=True`.
+`forward()` crops 16 pixels from each side; 256x448 in gives 224x416 out.
+`LightInpaintV1.infer()` is the model's own method, not the `I2IBaseModel` one,
+and calls `forward()` with `skip_i2i_offset=True` — which is the path the
+pipeline uses, so nothing is cropped in practice. A tiled implementation would
+need the other one.
 
-Also worth knowing: `_inpaint_single()` flips the left eye horizontally, inpaints,
-and flips back — the network is trained for one handedness only, the same trick
-`row_flow` uses.
+Also worth knowing: `_inpaint_single()` flips the left eye horizontally,
+inpaints, and flips back — the network is trained for one handedness only, the
+same trick `row_flow` uses.
 
 ## Not decided
 
-Whether to build it at all past the standalone stage. The staged plan was:
-PyTorch first with a golden test at difference 0, judge the quality against the
-10x cost on real footage, then decide about CUDA and ONNX.
+Whether to build it past the standalone stage. The staged plan was: PyTorch
+first with a golden test at difference 0, judge the quality against the cost on
+real footage, then decide about CUDA and ONNX. The first step is done and the
+cost is 6.7x, not 10x. The judgement is the next step, and it needs footage
+rather than another benchmark.

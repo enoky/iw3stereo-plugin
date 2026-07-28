@@ -14,6 +14,22 @@ The depth sizing rule in ofx/plugin/stereo_pipeline.cpp (autoDepthSize) follows
 iw3_ext/depth_file.py, itself following depth_anything_model.batch_preprocess().
 
 ----
+stereo_inpaint.py
+
+Also derived from nunif / iw3 by nagadomi, MIT License, and to the same
+standard: expression-for-expression identical where the tests require exact
+agreement.
+
+Specifically from iw3/models/monobw.py, iw3/models/light_inpaint_v1.py,
+iw3/monobw_inpaint.py, iw3/base_inpaint.py, iw3/dilation.py,
+iw3/backward_warp.py, and from nunif/modules/attention.py, norm.py,
+gaussian_filter.py, permute.py.
+
+No inpaint weights are shipped here. iw3_light_inpaint_v1_20250919.pth is
+downloaded from the nunif GitHub releases at load time, or read from an existing
+nunif checkout.
+
+----
 models/row_flow_v2.onnx, models/stereo_warp.onnx
 
 Converted from iw3_row_flow_v2_20240130.pth, nagadomi's own weight, published
