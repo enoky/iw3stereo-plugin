@@ -33,6 +33,7 @@ builds it into a tool creators already use.
 | `docs/phase2-onnx.md` | What exported, what did not, and the timing table. |
 | `docs/row-flow-v3.md` | The second model, and the three things ONNX export needed. |
 | `docs/monobw-inpaint.md` | The inpaint method: architecture, measured cost, what got ported. |
+| `docs/mlbw-inpaint-plan.md` | Plan for a third pipeline, `mlbw_l2_inpaint`. Not implemented. |
 
 ## Status
 
