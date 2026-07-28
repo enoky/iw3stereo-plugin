@@ -347,12 +347,47 @@ The screen-border widths in the same file still go through `lround`. Their input
 is scaled by 0.0075, so an exact tie is not reachable in binary floating point,
 and the existing warp path has been using `lround` for them all along.
 
+## In the plugin
+
+A third **Model** option, `monobw_inpaint`, with **Mask Inner Dilation** and
+**Mask Outer Dilation** beside it. `light_inpaint_v1.onnx` ships in the bundle
+and gets its own ONNX Runtime session alongside the two warp graphs.
+
+`OrtRuntime` had to stop assuming one graph signature. It bound its outputs by
+the literal names `left` and `right`; it now reads each graph's output names
+from the session and binds what it finds, so a two-output warp and a one-output
+inpaint both work without the binding code knowing which it has. The number of
+outputs is also what distinguishes them at the call site.
+
+**GPU only.** The CPU path implements the backward warp, not this pipeline, and
+the missing half is a 2.26M-parameter network at full frame resolution — on CPU
+ONNX Runtime that is seconds a frame, which nobody would choose over switching
+the Model parameter back. It declines with a message and passes the source
+through.
+
+The fiddly part is orientation, and it is all in `prepareEye()`. iw3 warps the
+right eye in mirrored coordinates and inpaints it in frame coordinates, and does
+the opposite for the left; between the two there are four flips whose order
+matters and which no other test would notice getting wrong. So the reference
+data now includes *exactly what the network is handed* for each eye — after the
+flips, after the morphology — and the kernels reproduce it with the mask
+bit-exact and the eye within 3.1e-06.
+
+Two of those flips are free: the sample kernel writes to the mirrored column,
+which is a permutation rather than arithmetic. Only the right eye's input needs
+a pass of its own.
+
+One ordering detail that is load-bearing: the left eye runs first. The graph's
+output lives in the session's bound output buffer and the next call overwrites
+it, so the eye that has to survive a second inference is the one that gets
+copied on the way out — which is the left, because mirroring it back is a copy
+anyway.
+
 ## What is left
 
-| | |
-| --- | --- |
-| plugin | a Method parameter, a second branch in `stereo_pipeline.cpp`, a second ORT session, and the two dilation parameters |
+Running it in Resolve. Everything here is checked against Python, but no test
+in this repo can drive an OFX host, so whether the node actually appears with
+three models and produces a picture is unverified until someone opens Resolve.
 
-Still open, and unchanged by any of this: whether the occlusion quality is worth
-6.7x at HD and render-only at 4K. That is a judgement on footage, and it is
-still cheaper to make before the plugin work than after.
+Still open, and now the only thing in the way: whether the occlusion quality is
+worth 6.7x at HD and render-only at 4K. That is a judgement on footage.

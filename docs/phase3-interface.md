@@ -43,7 +43,25 @@ the plugin — a 960x384 file arrives as 1920x800.
 
 | Parameter | Type | Range | Default | Meaning |
 | --- | --- | --- | --- | --- |
-| **Model** | choice | row_flow_v2 / row_flow_v3 | **row_flow_v2** | Which warp network runs. Both graphs ship in the bundle and each gets its own ONNX Runtime session, built once at start-up. |
+| **Model** | choice | row_flow_v2 / row_flow_v3 / monobw_inpaint | **row_flow_v2** | Which pipeline runs. All three graphs ship in the bundle and each gets its own ONNX Runtime session, built once at start-up. |
+
+The first two are the same backward warp with a different network. **monobw_inpaint
+is a different pipeline**: it warps forwards, finds the holes that opens, and
+fills them with a 2.26M-parameter network rather than smearing an edge into
+them. Better at occlusions, about seven times slower at HD, and **NVIDIA only** —
+its warp is CUDA, and the CPU path declines it with a message rather than
+running a full-resolution network on the CPU at seconds a frame.
+
+| Parameter | Type | Range | Default | Meaning |
+| --- | --- | --- | --- | --- |
+| **Mask Inner Dilation** | int | 0 – 16, slider 0 – 8 | **0** | monobw_inpaint only. Grows the hole mask towards the occluding edge before filling, which helps when the depth map's edge sits slightly inside the object's. |
+| **Mask Outer Dilation** | int | 0 – 16, slider 0 – 8 | **0** | monobw_inpaint only. Grows it the other way, giving the network more room to invent into. |
+
+Both are counted against the depth's width rather than the frame's, so a setting
+means the same thing at any output resolution. They stay visible when another
+model is selected: an OFX host may or may not honour a dynamic enable, and a
+control that quietly does nothing is less confusing than one that appears and
+disappears.
 
 Added after the first release; the spec below was written when only
 `row_flow_v2` existed. `row_flow_v3` needed no pipeline change at all -- same

@@ -40,6 +40,20 @@ enum class OutputMode
     DepthDebug
 };
 
+// Which pipeline runs. The first two are the same backward warp with a
+// different network; the third is a different pipeline entirely -- forward warp
+// into holes, then an inpaint network to fill them.
+//
+// Same rule as OutputMode: the order is the order of the Model parameter's
+// options, and inserting into the middle would silently change what an
+// already-saved comp means.
+enum class Method
+{
+    RowFlowV2,
+    RowFlowV3,
+    MonoBwInpaint
+};
+
 struct Settings
 {
     double divergence = 2.0;
@@ -51,7 +65,13 @@ struct Settings
     int stereoWidth = 0;  // 0 = auto
     bool undoVideoRange = false;
     OutputMode output = OutputMode::Anaglyph;
+    Method method = Method::RowFlowV2;
     size_t model = 0;  // index into the runtime's graphs
+    // monobw_inpaint only: how far to grow the hole mask before filling.
+    // Counted against the depth's width, so they mean the same thing at any
+    // output resolution.
+    int maskInnerDilation = 0;
+    int maskOuterDilation = 0;
 };
 
 // iw3's depth mappers, for relative depth only.

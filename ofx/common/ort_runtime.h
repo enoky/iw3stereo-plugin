@@ -69,6 +69,20 @@ public:
                    float deltaScale,
                    const float** left, const float** right);
 
+    // The inpaint graph, which has a different signature: one eye and its hole
+    // mask in, the filled eye out, all NCHW and all on the device. `shape` is
+    // the eye's; the mask is the same but with one channel.
+    //
+    // `filled` comes back as a device pointer owned by this object, valid until
+    // the next call on this model.
+    bool runInpaintDevice(size_t model,
+                          const float* eye, const float* mask, const int64_t* shape,
+                          const float** filled);
+
+    // How many outputs a graph has, which is what distinguishes them: the warp
+    // returns left and right, the inpaint one filled eye.
+    size_t outputCount(size_t model) const;
+
     bool deviceCapable() const { return ready() && _provider == "CUDA" && _cudaMemoryInfo; }
 
     bool ready() const { return !_models.empty() && _models[0].session != nullptr; }
@@ -85,12 +99,23 @@ private:
         OrtIoBinding* binding = nullptr;
         OrtValue** boundOutputs = nullptr;
         size_t boundOutputCount = 0;
+        // Read from the graph rather than assumed, so binding does not have to
+        // know which kind of graph it is looking at.
+        std::vector<std::string> outputNames;
     };
 
     void note(const std::string& line) { _report.push_back(line); }
     bool failed(OrtStatus* status, const char* what);
     void releaseBoundOutputs(Model& model);
     bool bindOutputs(Model& model);
+    bool readOutputNames(Model& model);
+
+    // The inpaint run, with the memory the inputs live in left open: the render
+    // path passes device memory, the warm-up passes host memory and lets ORT
+    // copy, because the copy is the point of doing it early.
+    bool runInpaintWith(size_t index, OrtMemoryInfo* memoryInfo,
+                        const float* eye, const float* mask, const int64_t* shape,
+                        const float** filled);
 
     // One throwaway inference per model, so the first real frame does not pay
     // for loading cuDNN's kernels and choosing algorithms.

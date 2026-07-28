@@ -13,6 +13,7 @@
 #include "ofxsMultiThread.h"
 #include "ofxsProcessing.h"
 
+#include "monobw_gpu.h"
 #include "ort_runtime.h"
 #include "probe_log.h"
 #include "stereo_gpu.h"
@@ -109,6 +110,8 @@ public:
         _depthRange = fetchChoiceParam("depthRange");
         _output = fetchChoiceParam("output");
         _modelChoice = fetchChoiceParam("model");
+        _maskInnerDilation = fetchIntParam("maskInnerDilation");
+        _maskOuterDilation = fetchIntParam("maskOuterDilation");
 
         startRuntimeBringUp();
     }
@@ -141,11 +144,14 @@ private:
     OFX::ChoiceParam* _depthRange = nullptr;
     OFX::ChoiceParam* _output = nullptr;
     OFX::ChoiceParam* _modelChoice = nullptr;
+    OFX::IntParam* _maskInnerDilation = nullptr;
+    OFX::IntParam* _maskOuterDilation = nullptr;
 
     // Reused across frames; resized only when the frame size changes.
     std::vector<float> _image, _depthFull, _depthSmall, _x, _left, _right, _composed;
     iw3::DepthResizer _resizer;
     iw3::GpuPipeline _gpu;
+    iw3::MonoBwGpu _monobw;
     std::string _lastMessage;
     unsigned _frameCounter = 0;
 
@@ -173,8 +179,9 @@ static iw3::OrtRuntime& sharedRuntime()
         const std::wstring directory = bundleDirectory();
         // Index order matters: it is what the Model parameter selects.
         const std::vector<std::wstring> graphs = {
-            directory + L"\\stereo_warp.onnx",     // 0: row_flow_v2
-            directory + L"\\stereo_warp_v3.onnx",  // 1: row_flow_v3
+            directory + L"\\stereo_warp.onnx",        // 0: row_flow_v2
+            directory + L"\\stereo_warp_v3.onnx",     // 1: row_flow_v3
+            directory + L"\\light_inpaint_v1.onnx",   // 2: monobw_inpaint
         };
         const bool ok = runtime->open(directory + L"\\ort", graphs, true);
         probe::logf("---- iw3 Stereo: ONNX Runtime bring-up (%s) ----", ok ? "OK" : "FAILED");
@@ -221,7 +228,12 @@ iw3::Settings Iw3StereoEffect::readSettings(double time) const
     _depthRange->getValueAtTime(time, choice);
     settings.undoVideoRange = (choice == 1);
     _modelChoice->getValueAtTime(time, choice);
-    settings.model = size_t(choice == 1 ? 1 : 0);
+    settings.method = choice == 1 ? iw3::Method::RowFlowV3
+                    : choice == 2 ? iw3::Method::MonoBwInpaint
+                                  : iw3::Method::RowFlowV2;
+    settings.model = size_t(choice == 1 ? 1 : choice == 2 ? 2 : 0);
+    _maskInnerDilation->getValueAtTime(time, settings.maskInnerDilation);
+    _maskOuterDilation->getValueAtTime(time, settings.maskOuterDilation);
     _output->getValueAtTime(time, choice);
     settings.output = choice == 1 ? iw3::OutputMode::LeftEye
                     : choice == 2 ? iw3::OutputMode::RightEye
@@ -383,8 +395,13 @@ bool Iw3StereoEffect::renderCuda(const OFX::RenderArguments& args, const iw3::Se
                    depthBounds.x2 - depthBounds.x1, depthBounds.y2 - depthBounds.y1,
                    settings.undoVideoRange, settings.depthInverted, mapper.params(), stream);
     _gpu.resizeDepth(stream);
-    _gpu.buildInputTensor(settings.divergence, settings.convergence,
-                          settings.preserveScreenBorder, stream);
+    if (settings.method != iw3::Method::MonoBwInpaint)
+    {
+        // monobw takes the depth directly; the three-channel input tensor with
+        // its divergence and convergence planes is the row_flow contract.
+        _gpu.buildInputTensor(settings.divergence, settings.convergence,
+                              settings.preserveScreenBorder, stream);
+    }
 
     // ORT runs on its own stream, so Resolve's work has to have landed first.
     // Sharing the stream through user_compute_stream would remove this
@@ -401,8 +418,64 @@ bool Iw3StereoEffect::renderCuda(const OFX::RenderArguments& args, const iw3::Se
     const float* left = nullptr;
     const float* right = nullptr;
     const size_t model = std::min(settings.model, ort.modelCount() - 1);
-    if (!ort.runDevice(model, _gpu.imageDevice(), imageShape, _gpu.inputTensorDevice(), xShape,
-                       iw3::deltaScale(depthWidth), &left, &right))
+
+    if (settings.method == iw3::Method::MonoBwInpaint)
+    {
+        if (model != settings.model || ort.outputCount(model) != 1)
+        {
+            report("The inpaint graph did not load; see the log.", true);
+            return false;
+        }
+        if (!_monobw.prepare(width, height, depthWidth, depthHeight))
+        {
+            report("GPU setup failed: " + _monobw.error() + " -- falling back to the CPU.", true);
+            return false;
+        }
+
+        // The left eye runs first, and that ordering is load-bearing. The
+        // graph's output lives in the session's bound output buffer and the
+        // next call overwrites it, so the eye whose result has to survive a
+        // second inference is the one that gets copied on the way out --
+        // finishEye() mirrors the left eye into its own buffer, while the right
+        // eye is already in frame orientation and is returned in place.
+        for (int pass = 0; pass < 2; ++pass)
+        {
+            const bool rightEye = pass == 1;
+            if (!_monobw.prepareEye(_gpu.imageDevice(), _gpu.depthDevice(), rightEye,
+                                    settings.divergence, settings.convergence,
+                                    settings.preserveScreenBorder,
+                                    settings.maskInnerDilation, settings.maskOuterDilation,
+                                    depthWidth, stream))
+            {
+                report("monobw warp failed: " + _monobw.error(), true);
+                return false;
+            }
+            if (cudaStreamSynchronize(static_cast<cudaStream_t>(stream)) != cudaSuccess)
+            {
+                report("CUDA stream sync failed -- falling back to the CPU.", true);
+                return false;
+            }
+
+            const float* filled = nullptr;
+            if (!ort.runInpaintDevice(model, _monobw.inpaintEyeDevice(),
+                                      _monobw.processedMaskDevice(), imageShape, &filled))
+            {
+                report("GPU inpaint failed; see the log.", true);
+                return false;
+            }
+            const float* eye = _monobw.finishEye(filled, rightEye, stream);
+            if (rightEye)
+            {
+                right = eye;
+            }
+            else
+            {
+                left = eye;
+            }
+        }
+    }
+    else if (!ort.runDevice(model, _gpu.imageDevice(), imageShape, _gpu.inputTensorDevice(), xShape,
+                            iw3::deltaScale(depthWidth), &left, &right))
     {
         report("GPU inference failed; see the log. Falling back to the CPU.", true);
         return false;
@@ -506,6 +579,20 @@ void Iw3StereoEffect::render(const OFX::RenderArguments& args)
         // with CUDA render enabled these buffers are device memory, and the
         // loops that follow would read it on the CPU. That was the crash.
         // Whatever went wrong has already been reported by renderCuda().
+        passSourceThrough(args, dst.get(), src.get(), window, components);
+        return;
+    }
+
+    if (settings.method == iw3::Method::MonoBwInpaint)
+    {
+        // Deliberately GPU-only. The CPU path below implements the backward
+        // warp, not this pipeline, and the missing half is a 2.26M-parameter
+        // network at full frame resolution -- on CPU ONNX Runtime that is
+        // seconds a frame, which is not a fallback anyone would choose over
+        // switching the Model parameter back.
+        report("The monobw_inpaint model needs the GPU render path (NVIDIA, "
+               "and Fusion's GPU processing enabled). Pick row_flow_v2 or "
+               "row_flow_v3 for the CPU.", true);
         passSourceThrough(args, dst.get(), src.get(), window, components);
         return;
     }
@@ -761,12 +848,40 @@ void Iw3StereoFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OFX::
 
     OFX::ChoiceParamDescriptor* model = desc.defineChoiceParam("model");
     model->setLabels("Model", "Model", "Model");
-    model->setHint("row_flow_v2 is a small convolution stack and the faster of the two. "
-                   "row_flow_v3 is a windowed-attention model, roughly four times the parameters.");
+    model->setHint("row_flow_v2 is a small convolution stack and the faster of the two warps. "
+                   "row_flow_v3 is a windowed-attention model, roughly four times the parameters. "
+                   "monobw_inpaint is a different pipeline: it warps forwards, finds the holes "
+                   "that opens, and fills them with a network instead of smearing an edge into "
+                   "them. Better at occlusions, about seven times slower, and NVIDIA only.");
     model->appendOption("row_flow_v2");
     model->appendOption("row_flow_v3");
+    model->appendOption("monobw_inpaint");
     model->setDefault(0);
     page->addChild(*model);
+
+    // The two mask dilations, which only monobw_inpaint reads. Left visible
+    // rather than hidden behind the Model choice: an OFX host may or may not
+    // honour a dynamic enable, and a control that silently does nothing is
+    // less confusing than one that appears and disappears.
+    OFX::IntParamDescriptor* innerDilation = desc.defineIntParam("maskInnerDilation");
+    innerDilation->setLabels("Mask Inner Dilation", "Mask Inner", "Mask Inner Dilation");
+    innerDilation->setHint("monobw_inpaint only. Grows the hole mask towards the occluding edge "
+                           "before filling, which helps when the depth map's edge sits slightly "
+                           "inside the object's. Counted against the depth width, so it means the "
+                           "same at any resolution.");
+    innerDilation->setRange(0, 16);
+    innerDilation->setDisplayRange(0, 8);
+    innerDilation->setDefault(0);
+    page->addChild(*innerDilation);
+
+    OFX::IntParamDescriptor* outerDilation = desc.defineIntParam("maskOuterDilation");
+    outerDilation->setLabels("Mask Outer Dilation", "Mask Outer", "Mask Outer Dilation");
+    outerDilation->setHint("monobw_inpaint only. Grows the hole mask away from the occluding "
+                           "edge, giving the network more room to invent into.");
+    outerDilation->setRange(0, 16);
+    outerDilation->setDisplayRange(0, 8);
+    outerDilation->setDefault(0);
+    page->addChild(*outerDilation);
 
     // -- Stereo ------------------------------------------------------------
     OFX::GroupParamDescriptor* stereo = desc.defineGroupParam("stereoGroup");

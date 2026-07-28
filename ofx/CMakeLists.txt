@@ -108,7 +108,10 @@ function(stage_runtime TARGET)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${CMAKE_CURRENT_SOURCE_DIR}/../models/stereo_warp_v3.onnx"
                 "${BUNDLE}/stereo_warp_v3.onnx"
-        COMMENT "Staging ONNX Runtime and the model into the ${TARGET} bundle")
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_CURRENT_SOURCE_DIR}/../models/light_inpaint_v1.onnx"
+                "${BUNDLE}/light_inpaint_v1.onnx"
+        COMMENT "Staging ONNX Runtime and the models into the ${TARGET} bundle")
 endfunction()
 
 stage_runtime(iw3ort)
@@ -116,7 +119,7 @@ stage_runtime(iw3ort)
 # --- the plugin --------------------------------------------------------------
 set(IW3STEREO_SOURCES plugin/iw3stereo.cpp plugin/stereo_pipeline.cpp common/ort_runtime.cpp)
 if(IW3_HAS_CUDA)
-    list(APPEND IW3STEREO_SOURCES plugin/stereo_gpu.cu)
+    list(APPEND IW3STEREO_SOURCES plugin/stereo_gpu.cu plugin/monobw_gpu.cu)
 endif()
 
 ofx_bundle(iw3stereo ${IW3STEREO_SOURCES})

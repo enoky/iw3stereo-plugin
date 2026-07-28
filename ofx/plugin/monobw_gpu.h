@@ -39,10 +39,37 @@ public:
     // `fixScreenBorderMask` is iw3's: 0 leaves the mask alone, 1 clears the
     // uninpaintable side, 2 clears both. It applies only when
     // preserveScreenBorder is off. The image model uses 1.
+    // `mirrorOutput` writes the eye and mask mirrored horizontally. It is free
+    // -- the sample kernel just writes to the opposite column -- and it is what
+    // prepareEye() uses to hand the inpaint network the handedness it wants
+    // without a separate pass. The mask's screen-border fix still applies in
+    // warp coordinates, before the mirror.
     void forward(const float* image, const float* depth,
                  double divergence, double convergence,
                  bool preserveScreenBorder, int fixScreenBorderMask,
-                 void* stream);
+                 bool mirrorOutput, void* stream);
+
+    // Everything one eye needs before the inpaint graph: the warp, the mask,
+    // the morphology, and all the mirroring.
+    //
+    // iw3 does this with four flips whose order is easy to get wrong, so it
+    // lives here rather than at the call site. The right eye is warped in
+    // mirrored coordinates and inpainted in frame coordinates; the left eye is
+    // warped in frame coordinates and inpainted in mirrored ones. Both end up
+    // handing the network holes that open the same way, which is the only
+    // handedness it was trained for.
+    //
+    // Leaves the eye in inpaintEyeDevice() and the mask in
+    // processedMaskDevice(). Feed the graph's output back through finishEye().
+    bool prepareEye(const float* image, const float* depth, bool rightEye,
+                    double divergence, double convergence, bool preserveScreenBorder,
+                    int innerDilation, int outerDilation, int baseWidth, void* stream);
+
+    // Puts the graph's output back into frame orientation. Returns `filled`
+    // itself for the right eye, which is already there.
+    const float* finishEye(const float* filled, bool rightEye, void* stream);
+
+    const float* inpaintEyeDevice() const { return _eye; }
 
     // preprocess_mask on the mask forward() produced: mask_closing, then the
     // two directional dilations. Outside the ONNX graph because the counts are
@@ -81,9 +108,13 @@ private:
     float* _maskA = nullptr;    // the morphology's ping-pong pair; the finished
     float* _maskB = nullptr;    // mask ends in one of them
     const float* _processedMask = nullptr;  // whichever that was
+    float* _flipImage = nullptr;  // 3 * width * height, the right eye's mirrored source
+    float* _flipDepth = nullptr;  // depthWidth * depthHeight, likewise
+    float* _final = nullptr;      // 3 * width * height, the left eye mirrored back
 
     size_t _gridXHeld = 0, _gridYHeld = 0, _scratchHeld = 0, _eyeHeld = 0, _maskHeld = 0;
     size_t _maskAHeld = 0, _maskBHeld = 0;
+    size_t _flipImageHeld = 0, _flipDepthHeld = 0, _finalHeld = 0;
 
     std::string _error;
 };

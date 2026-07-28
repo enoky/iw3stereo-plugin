@@ -61,12 +61,39 @@ exists for the rarer case of a file whose range tag is simply wrong.
 PARAMETERS
 ----------
 
-  Model               Which warp network to use.
+  Model               Which pipeline to use.
 
                       row_flow_v2 is a small convolution stack and the default.
                       row_flow_v3 is a windowed-attention model with about four
                       times the parameters, and is generally cleaner around
                       edges.
+
+                      monobw_inpaint is a different pipeline rather than another
+                      network. The other two warp backwards, which means that
+                      where an object moves aside there is nothing behind it and
+                      the edge gets smeared into the gap. This one warps
+                      forwards, works out exactly which pixels ended up with
+                      nothing behind them, and fills those with a network. It
+                      handles occlusions better and costs roughly seven times as
+                      much: about 26 ms a frame at HD against 4 ms, and 4K is
+                      render-only.
+
+                      It needs the GPU path -- NVIDIA, with Fusion's GPU
+                      processing on. On the CPU it declines and passes the
+                      source through with a message.
+
+  Mask Inner          monobw_inpaint only. Grows the hole mask towards the
+  Dilation            occluding edge before filling. Worth a try when the depth
+                      map's edge sits slightly inside the object's and a rim of
+                      the old background survives at the boundary.
+
+  Mask Outer          monobw_inpaint only. Grows the mask the other way, giving
+  Dilation            the network more room to invent into. Worth a try when the
+                      fill looks starved next to a large parallax shift.
+
+                      Both are counted against the depth's width, so a setting
+                      means the same thing whatever resolution you render at.
+                      Both do nothing when another Model is selected.
 
                       Despite the parameter count v3 is the slightly faster of
                       the two, because it works on a reduced grid: 4.8 ms

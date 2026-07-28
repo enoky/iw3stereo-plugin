@@ -61,6 +61,12 @@ public:
 
     const float* imageDevice() const { return _image; }
     const float* inputTensorDevice() const { return _x; }
+    // The mapped depth at the model's working size, which is what the monobw
+    // warp takes instead of the three-channel input tensor.
+    const float* depthDevice() const
+    {
+        return (_depthWidth == _width && _depthHeight == _height) ? _depthFull : _depthSmall;
+    }
 
     bool ok() const { return _error.empty(); }
     const std::string& error() const { return _error; }

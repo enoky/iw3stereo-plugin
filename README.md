@@ -60,14 +60,13 @@ Correctness carries across three hops, each measured rather than assumed:
 matches that within **2e-4**; and the C++ numeric core matches the Python at
 **float32 epsilon**.
 
-`stereo_inpaint.py` is iw3's `monobw_inpaint` — forward warp, hole mask, then a
-2.26M-parameter inpaint network — matching stock iw3 at diff 0 across 22 cases,
-and costing about 6.7x the warp at HD. **Not wired into the plugin yet**, but
-the pieces are built: the network exports to ONNX within 2e-5, and the warp,
-which cannot (`cummax` and `searchsorted` have no ONNX operator), has CUDA
-kernels running at 0.297 ms an eye with a bit-exact hole mask and its
-morphology. What is left is the plugin's own plumbing;
-`docs/monobw-inpaint.md` has the numbers.
+A third Model option, **monobw_inpaint**, is iw3's forward-warp-and-fill
+pipeline: it finds the holes the warp opens and fills them with a
+2.26M-parameter network rather than smearing an edge into them. Better at
+occlusions, about 6.7x slower at HD, and NVIDIA only — its warp is CUDA, because
+`cummax` and `searchsorted` have no ONNX operator. Every numeric piece is
+checked against stock iw3, but **it has not been run in Resolve yet**;
+`docs/monobw-inpaint.md` has the numbers and what that leaves open.
 
 Three constraints worth knowing before reading further, each with evidence in
 `docs/`:

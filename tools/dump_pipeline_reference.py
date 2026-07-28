@@ -230,6 +230,42 @@ for index, (image_hw, depth_hw, divergence, inner, outer) in enumerate([
         raw.float(), processed.float())
 
 
+# exactly what the inpaint network is handed, for each eye
+#
+# This is the flip ordering, which is the part of the plugin's monobw path most
+# likely to be wrong and least likely to be caught by anything else. iw3 warps
+# the right eye in mirrored coordinates and inpaints it in frame coordinates,
+# and does the opposite for the left, so between them there are four flips whose
+# order matters. Dumping the network's actual inputs pins all of it down without
+# needing the network.
+for index, (image_hw, depth_hw, divergence, convergence, inner, outer) in enumerate([
+        ((216, 384), (108, 192), 2.0, 0.5, 0, 0),
+        ((216, 384), (108, 192), 5.0, 0.5, 2, 3),
+        ((160, 288), (80, 144), 8.0, 1.0, 1, 1),
+]):
+    image, depth = _monobw_pair(image_hw, depth_hw, 500 + index)
+    with torch.inference_mode():
+        results = stereo_inpaint._apply_divergence_monobw(
+            _monobw, image, depth, divergence=divergence, convergence=convergence,
+            synthetic_view="both", preserve_screen_border=False, fix_screen_border_mask=1)
+        left_eye, right_eye, left_mask, right_mask = results
+        for side, eye, mask in (("left", left_eye, left_mask), ("right", right_eye, right_mask)):
+            # _inpaint_single flips the left eye and not the right, then runs
+            # preprocess_mask on whatever orientation that left it in.
+            if side == "left":
+                eye, mask = eye.flip(-1), mask.flip(-1)
+            mask = stereo_inpaint.MonoBWInpaintImage.preprocess_mask(
+                mask, target_size=eye.shape[-2:],
+                inner_dilation=inner, outer_dilation=outer, base_width=depth_hw[1])
+            add(f"monobw_eye_{side}_{image_hw[1]}x{image_hw[0]}_{depth_hw[1]}"
+                f"_{divergence}_{convergence}_{inner}_{outer}",
+                [image_hw[1], image_hw[0], depth_hw[1], depth_hw[0],
+                 1 if side == "right" else 0, inner, outer,
+                 int(round(divergence * 1000)), int(round(convergence * 1000))],
+                np.concatenate([image.numpy().ravel(), depth.numpy().ravel()]),
+                np.concatenate([eye.numpy().ravel(), mask.float().numpy().ravel()]))
+
+
 # --- write -------------------------------------------------------------------
 os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)
 with open(OUTPUT, "wb") as handle:

@@ -210,6 +210,15 @@ bool OrtRuntime::open(const std::wstring& directory, const std::vector<std::wstr
         }
 
         _models.push_back(model);
+        if (!readOutputNames(_models.back()))
+        {
+            note("could not read output names for " + narrow(path));
+        }
+        else
+        {
+            note(narrow(path) + ": " + std::to_string(_models.back().outputNames.size()) +
+                 " output(s)");
+        }
         if (_cudaMemoryInfo && !bindOutputs(_models.back()))
         {
             note("device binding unavailable for " + narrow(path) + "; using host copies");
@@ -232,20 +241,60 @@ bool OrtRuntime::open(const std::wstring& directory, const std::vector<std::wstr
     return true;
 }
 
+bool OrtRuntime::readOutputNames(Model& model)
+{
+    size_t count = 0;
+    if (failed(_api->SessionGetOutputCount(model.session, &count), "SessionGetOutputCount"))
+    {
+        return false;
+    }
+    OrtAllocator* allocator = nullptr;
+    if (failed(_api->GetAllocatorWithDefaultOptions(&allocator), "GetAllocatorWithDefaultOptions"))
+    {
+        return false;
+    }
+    for (size_t i = 0; i < count; ++i)
+    {
+        char* name = nullptr;
+        if (failed(_api->SessionGetOutputName(model.session, i, allocator, &name),
+                   "SessionGetOutputName"))
+        {
+            return false;
+        }
+        model.outputNames.push_back(name);
+        allocator->Free(allocator, name);
+    }
+    return true;
+}
+
+size_t OrtRuntime::outputCount(size_t model) const
+{
+    return model < _models.size() ? _models[model].outputNames.size() : 0;
+}
+
 bool OrtRuntime::bindOutputs(Model& model)
 {
+    if (model.outputNames.empty())
+    {
+        return false;
+    }
     if (failed(_api->CreateIoBinding(model.session, &model.binding), "CreateIoBinding"))
     {
         model.binding = nullptr;
         return false;
     }
-    // Outputs land in device memory rather than being copied back.
-    if (failed(_api->BindOutputToDevice(model.binding, "left", _cudaMemoryInfo), "BindOutput(left)") ||
-        failed(_api->BindOutputToDevice(model.binding, "right", _cudaMemoryInfo), "BindOutput(right)"))
+    // Outputs land in device memory rather than being copied back. Bound by
+    // the names the graph actually declares, so the warp's two and the
+    // inpaint's one both work without this knowing which is which.
+    for (const std::string& name : model.outputNames)
     {
-        _api->ReleaseIoBinding(model.binding);
-        model.binding = nullptr;
-        return false;
+        if (failed(_api->BindOutputToDevice(model.binding, name.c_str(), _cudaMemoryInfo),
+                   "BindOutputToDevice"))
+        {
+            _api->ReleaseIoBinding(model.binding);
+            model.binding = nullptr;
+            return false;
+        }
     }
     return true;
 }
@@ -269,15 +318,35 @@ void OrtRuntime::warmUp(size_t index)
     constexpr size_t kElements = size_t(kSize) * kSize * 3;
     const int64_t shape[4] = {1, 3, kSize, kSize};
 
-    std::vector<float> image(kElements, 0.5f);
-    std::vector<float> x(kElements, 0.5f);
-    std::vector<float> left(kElements);
-    std::vector<float> right(kElements);
-
     const auto started = std::chrono::steady_clock::now();
-    const bool ok = run(index, image.data(), shape, x.data(), shape,
-                        1.0f / float(kSize / 2 - 1),
-                        left.data(), right.data(), kElements);
+    bool ok = false;
+
+    if (_models[index].outputNames.size() == 1)
+    {
+        // The inpaint graph. Its inputs go in as host tensors and ORT copies
+        // them, which is fine here -- paying for a copy off the render thread
+        // is the entire purpose of a warm-up.
+        if (!_models[index].binding)
+        {
+            note("warm-up skipped for [" + std::to_string(index) +
+                 "]: no device binding (the inpaint graph is GPU-only)");
+            return;
+        }
+        std::vector<float> eye(kElements, 0.5f);
+        std::vector<float> mask(size_t(kSize) * kSize, 0.0f);
+        const float* filled = nullptr;
+        ok = runInpaintWith(index, _memoryInfo, eye.data(), mask.data(), shape, &filled);
+    }
+    else
+    {
+        std::vector<float> image(kElements, 0.5f);
+        std::vector<float> x(kElements, 0.5f);
+        std::vector<float> left(kElements);
+        std::vector<float> right(kElements);
+        ok = run(index, image.data(), shape, x.data(), shape,
+                 1.0f / float(kSize / 2 - 1),
+                 left.data(), right.data(), kElements);
+    }
     const double ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - started).count();
     note("warm-up run [" + std::to_string(index) + "]: " + std::to_string(ms) + " ms" +
@@ -360,6 +429,77 @@ void OrtRuntime::releaseBoundOutputs(Model& model)
     _api->AllocatorFree(_allocator, model.boundOutputs);
     model.boundOutputs = nullptr;
     model.boundOutputCount = 0;
+}
+
+bool OrtRuntime::runInpaintDevice(size_t index,
+                                  const float* eye, const float* mask, const int64_t* shape,
+                                  const float** filled)
+{
+    if (!deviceCapable())
+    {
+        return false;
+    }
+    return runInpaintWith(index, _cudaMemoryInfo, eye, mask, shape, filled);
+}
+
+bool OrtRuntime::runInpaintWith(size_t index, OrtMemoryInfo* memoryInfo,
+                                const float* eye, const float* mask, const int64_t* shape,
+                                const float** filled)
+{
+    if (index >= _models.size() || !_models[index].binding || !memoryInfo)
+    {
+        return false;
+    }
+    Model& model = _models[index];
+
+    // The previous frame's outputs are only valid until here.
+    releaseBoundOutputs(model);
+
+    const size_t eyeElements = size_t(shape[0] * shape[1] * shape[2] * shape[3]);
+    // Same geometry, one channel: the mask is per pixel, not per plane.
+    const int64_t maskShape[4] = {shape[0], 1, shape[2], shape[3]};
+    const size_t maskElements = size_t(shape[0] * shape[2] * shape[3]);
+
+    OrtValue* eyeValue = nullptr;
+    OrtValue* maskValue = nullptr;
+    bool ok = false;
+
+    if (!failed(_api->CreateTensorWithDataAsOrtValue(
+            memoryInfo, const_cast<float*>(eye), eyeElements * sizeof(float),
+            shape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &eyeValue), "inpaint eye tensor") &&
+        !failed(_api->CreateTensorWithDataAsOrtValue(
+            memoryInfo, const_cast<float*>(mask), maskElements * sizeof(float),
+            maskShape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &maskValue), "inpaint mask tensor"))
+    {
+        if (!failed(_api->BindInput(model.binding, "eye", eyeValue), "BindInput(eye)") &&
+            !failed(_api->BindInput(model.binding, "mask", maskValue), "BindInput(mask)"))
+        {
+            const auto started = std::chrono::steady_clock::now();
+            OrtStatus* status = _api->RunWithBinding(model.session, nullptr, model.binding);
+            _lastRunMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - started).count();
+
+            if (!failed(status, "RunWithBinding(inpaint)") &&
+                !failed(_api->GetBoundOutputValues(model.binding, _allocator,
+                                                   &model.boundOutputs, &model.boundOutputCount),
+                        "GetBoundOutputValues") &&
+                model.boundOutputCount == 1)
+            {
+                float* data = nullptr;
+                if (!failed(_api->GetTensorMutableData(model.boundOutputs[0],
+                                                       reinterpret_cast<void**>(&data)),
+                            "inpaint output data"))
+                {
+                    *filled = data;
+                    ok = true;
+                }
+            }
+        }
+    }
+
+    if (eyeValue) _api->ReleaseValue(eyeValue);
+    if (maskValue) _api->ReleaseValue(maskValue);
+    return ok;
 }
 
 bool OrtRuntime::runDevice(size_t index,

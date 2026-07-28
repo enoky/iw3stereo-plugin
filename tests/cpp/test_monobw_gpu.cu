@@ -131,7 +131,9 @@ int main(int argc, char** argv)
             cudaFree(depth);
             continue;
         }
-        gpu.forward(image, depth, divergence, convergence, border, fixMask, nullptr);
+        // mirrorOutput false: the reference is iw3's own unmirrored output.
+        gpu.forward(image, depth, divergence, convergence, border, fixMask,
+                    false, nullptr);
         cudaDeviceSynchronize();
 
         if (!gpu.ok())
@@ -176,6 +178,83 @@ int main(int argc, char** argv)
             for (float value : wantMask) if (value != 0.0f) ++set;
             std::printf("  ok   %-46s %zu of %zu mask pixels, exact\n",
                         (entry.name + "/mask").c_str(), set, wantMask.size());
+        }
+
+        cudaFree(image);
+        cudaFree(depth);
+    }
+
+    // What the inpaint network is actually handed, per eye. This is the flip
+    // ordering: prepareEye() has to reproduce four flips whose order matters,
+    // and nothing else in this file would notice if it got them wrong.
+    for (const iw3test::Case& entry : cases)
+    {
+        if (entry.name.rfind("monobw_eye_", 0) != 0)
+        {
+            continue;
+        }
+        ++ran;
+
+        const int width = entry.ints[0], height = entry.ints[1];
+        const int depthWidth = entry.ints[2], depthHeight = entry.ints[3];
+        const bool rightEye = entry.ints[4] != 0;
+        const int inner = entry.ints[5], outer = entry.ints[6];
+        const double divergence = double(entry.ints[7]) / 1000.0;
+        const double convergence = double(entry.ints[8]) / 1000.0;
+
+        const size_t pixels = size_t(width) * size_t(height);
+        const size_t depthPixels = size_t(depthWidth) * size_t(depthHeight);
+
+        float* image = upload(entry.inputs.data(), pixels * 3);
+        float* depth = upload(entry.inputs.data() + pixels * 3, depthPixels);
+        if (!image || !depth || !gpu.prepare(width, height, depthWidth, depthHeight))
+        {
+            std::printf("  FAIL %s: setup failed\n", entry.name.c_str());
+            ++failures;
+            ++checks;
+            if (image) cudaFree(image);
+            if (depth) cudaFree(depth);
+            continue;
+        }
+
+        const bool prepared = gpu.prepareEye(image, depth, rightEye, divergence, convergence,
+                                             false, inner, outer, depthWidth, nullptr);
+        cudaDeviceSynchronize();
+        if (!prepared)
+        {
+            std::printf("  FAIL %s: %s\n", entry.name.c_str(), gpu.error().c_str());
+            ++failures;
+            ++checks;
+            cudaFree(image);
+            cudaFree(depth);
+            continue;
+        }
+
+        std::vector<float> eye, mask;
+        download(eye, gpu.inpaintEyeDevice(), pixels * 3);
+        download(mask, gpu.processedMaskDevice(), pixels);
+
+        const std::vector<float> wantEye(entry.outputs.begin(),
+                                         entry.outputs.begin() + ptrdiff_t(pixels * 3));
+        const std::vector<float> wantMask(entry.outputs.begin() + ptrdiff_t(pixels * 3),
+                                          entry.outputs.end());
+        expectClose(entry.name + "/eye", eye, wantEye, 1e-5);
+
+        ++checks;
+        size_t wrong = 0;
+        for (size_t i = 0; i < mask.size() && i < wantMask.size(); ++i)
+        {
+            if (mask[i] != wantMask[i]) ++wrong;
+        }
+        if (mask.size() != wantMask.size() || wrong != 0)
+        {
+            std::printf("  FAIL %-46s %zu of %zu mask pixels differ\n",
+                        (entry.name + "/mask").c_str(), wrong, wantMask.size());
+            ++failures;
+        }
+        else
+        {
+            std::printf("  ok   %-46s mask exact\n", (entry.name + "/mask").c_str());
         }
 
         cudaFree(image);
@@ -279,7 +358,7 @@ int main(int argc, char** argv)
             // The whole CUDA half of an eye: warp, mask, and morphology.
             const auto oneEye = [&]()
             {
-                gpu.forward(deviceImage, deviceDepth, 2.0, 0.5, false, 1, nullptr);
+                gpu.forward(deviceImage, deviceDepth, 2.0, 0.5, false, 1, false, nullptr);
                 gpu.preprocessMask(gpu.maskDevice(), 2, 2, depthWidth, nullptr);
             };
             for (int i = 0; i < 5; ++i)

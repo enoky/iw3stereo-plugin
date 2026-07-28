@@ -87,7 +87,7 @@ __global__ void gridYKernel(int depthHeight, float* __restrict__ gridY)
 __global__ void sampleKernel(const float* __restrict__ image, int width, int height,
                              const float* __restrict__ gridX, const float* __restrict__ gridY,
                              int depthWidth, int depthHeight,
-                             int maskBorderPix, int fixScreenBorderMask,
+                             int maskBorderPix, int fixScreenBorderMask, int mirrorOutput,
                              float* __restrict__ eye, float* __restrict__ mask)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -95,7 +95,11 @@ __global__ void sampleKernel(const float* __restrict__ image, int width, int hei
     if (x >= width || y >= height) return;
 
     const size_t pixels = size_t(width) * size_t(height);
-    const size_t index = size_t(y) * size_t(width) + size_t(x);
+    // Everything below reads and decides in warp coordinates -- including the
+    // screen-border fix, which is defined on the warped frame. Only the write
+    // is mirrored, which makes the mirror exactly a permutation.
+    const size_t index = size_t(y) * size_t(width) +
+                         size_t(mirrorOutput ? (width - 1 - x) : x);
 
     const float gx = math::bilinearResizeAt(gridX, depthWidth, depthHeight, width, height, x, y);
     const float gy = math::bilinearResizeAt(gridY, 1, depthHeight, 1, height, 0, y);
@@ -139,6 +143,24 @@ __global__ void sampleKernel(const float* __restrict__ image, int width, int hei
     mask[index] = stretched ? 1.0f : 0.0f;
 }
 
+// Horizontal mirror of a planar buffer. Exactly a permutation of the samples,
+// so it introduces no arithmetic difference of its own.
+__global__ void flipKernel(const float* __restrict__ source, int width, int height, int planes,
+                           float* __restrict__ destination)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    const size_t pixels = size_t(width) * size_t(height);
+    const size_t from = size_t(y) * size_t(width) + size_t(x);
+    const size_t to = size_t(y) * size_t(width) + size_t(width - 1 - x);
+    for (int plane = 0; plane < planes; ++plane)
+    {
+        destination[size_t(plane) * pixels + to] = source[size_t(plane) * pixels + from];
+    }
+}
+
 // mask_closing's four passes. One kernel with a flag rather than two, because
 // the only difference is which way the reduction goes and the launch pattern is
 // identical.
@@ -173,7 +195,8 @@ __global__ void maskFinishKernel(const float* __restrict__ closed,
 
 MonoBwGpu::~MonoBwGpu()
 {
-    for (float* pointer : {_gridX, _gridY, _scratch, _eye, _mask, _maskA, _maskB})
+    for (float* pointer : {_gridX, _gridY, _scratch, _eye, _mask, _maskA, _maskB,
+                           _flipImage, _flipDepth, _final})
     {
         if (pointer) cudaFree(pointer);
     }
@@ -222,6 +245,9 @@ bool MonoBwGpu::prepare(int width, int height, int depthWidth, int depthHeight)
     // The morphology ping-pongs between these; the finished mask ends in _maskA.
     if (!allocate(&_maskA, pixels, _maskAHeld)) return false;
     if (!allocate(&_maskB, pixels, _maskBHeld)) return false;
+    if (!allocate(&_flipImage, pixels * 3, _flipImageHeld)) return false;
+    if (!allocate(&_flipDepth, depthPixels, _flipDepthHeld)) return false;
+    if (!allocate(&_final, pixels * 3, _finalHeld)) return false;
 
     return _error.empty();
 }
@@ -265,7 +291,7 @@ void MonoBwGpu::preprocessMask(const float* mask, int innerDilation, int outerDi
 void MonoBwGpu::forward(const float* image, const float* depth,
                         double divergence, double convergence,
                         bool preserveScreenBorder, int fixScreenBorderMask,
-                        void* stream)
+                        bool mirrorOutput, void* stream)
 {
     cudaStream_t cudaStream = static_cast<cudaStream_t>(stream);
 
@@ -303,13 +329,67 @@ void MonoBwGpu::forward(const float* image, const float* depth,
 
     sampleKernel<<<grid2d(_width, _height), dim3(kBlock, kBlock), 0, cudaStream>>>(
         image, _width, _height, _gridX, _gridY, _depthWidth, _depthHeight,
-        maskBorderPix, fixScreenBorderMask, _eye, _mask);
+        maskBorderPix, fixScreenBorderMask, mirrorOutput ? 1 : 0, _eye, _mask);
 
     const cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess)
     {
         _error = std::string("kernel launch failed: ") + cudaGetErrorString(status);
     }
+}
+
+bool MonoBwGpu::prepareEye(const float* image, const float* depth, bool rightEye,
+                           double divergence, double convergence, bool preserveScreenBorder,
+                           int innerDilation, int outerDilation, int baseWidth, void* stream)
+{
+    cudaStream_t cudaStream = static_cast<cudaStream_t>(stream);
+
+    const float* warpImage = image;
+    const float* warpDepth = depth;
+    if (rightEye)
+    {
+        // iw3 mirrors the inputs, warps, and mirrors the result back. The
+        // mirror of the result is folded into the sample kernel's write below,
+        // so only the inputs need a pass of their own.
+        flipKernel<<<grid2d(_width, _height), dim3(kBlock, kBlock), 0, cudaStream>>>(
+            image, _width, _height, 3, _flipImage);
+        flipKernel<<<grid2d(_depthWidth, _depthHeight), dim3(kBlock, kBlock), 0, cudaStream>>>(
+            depth, _depthWidth, _depthHeight, 1, _flipDepth);
+        warpImage = _flipImage;
+        warpDepth = _flipDepth;
+    }
+
+    // The mirror on the way out serves two different purposes and happens to be
+    // the same operation for both eyes. For the right eye it undoes the input
+    // mirror, putting the eye back in frame orientation, which is the
+    // orientation the network wants for that side. For the left eye it is the
+    // flip _inpaint_single does before inferring. Either way what comes out of
+    // here is what the network should see.
+    forward(warpImage, warpDepth, divergence, convergence, preserveScreenBorder,
+            1 /* fix the uninpaintable side, as the image model does */,
+            true /* mirrorOutput */, stream);
+    if (!ok())
+    {
+        return false;
+    }
+
+    // The morphology runs on the mask in that same orientation, which matters:
+    // dilate_inner and dilate_outer are directional.
+    preprocessMask(_mask, innerDilation, outerDilation, baseWidth, stream);
+    return ok();
+}
+
+const float* MonoBwGpu::finishEye(const float* filled, bool rightEye, void* stream)
+{
+    if (rightEye)
+    {
+        // Already in frame orientation: the input mirror and the output mirror
+        // cancelled, and the network ran on the result of both.
+        return filled;
+    }
+    flipKernel<<<grid2d(_width, _height), dim3(kBlock, kBlock), 0,
+                 static_cast<cudaStream_t>(stream)>>>(filled, _width, _height, 3, _final);
+    return _final;
 }
 
 }  // namespace iw3
