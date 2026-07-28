@@ -167,7 +167,8 @@ private:
     // Warp twelve frames and run the temporal graph over them, filling the
     // cache. Only called when the cache does not already hold this window.
     bool buildVideoWindow(const OFX::RenderArguments& args, const iw3::Settings& settings,
-                          long long firstFrame, const OfxRectI& window, int depthWidth,
+                          long long firstFrame, long long currentFrame,
+                          const OfxRectI& window, int depthWidth,
                           int depthHeight, void* stream);
 
 public:
@@ -443,7 +444,8 @@ void Iw3StereoEffect::getFramesNeeded(const OFX::FramesNeededArguments& args,
 
 bool Iw3StereoEffect::buildVideoWindow(const OFX::RenderArguments& args,
                                        const iw3::Settings& settings,
-                                       long long firstFrame, const OfxRectI& window,
+                                       long long firstFrame, long long currentFrame,
+                                       const OfxRectI& window,
                                        int depthWidth, int depthHeight, void* stream)
 {
     iw3::OrtRuntime& ort = sharedRuntime();
@@ -460,16 +462,28 @@ bool Iw3StereoEffect::buildVideoWindow(const OFX::RenderArguments& args,
         {
             // Clip boundaries: a window centred near the start or end runs off
             // the material, and the probe showed those fetches come back null.
-            // Repeating the nearest frame is what iw3's own padding does.
+            // Repeating the nearest frame that exists is what iw3's own padding
+            // does for a short sequence.
+            //
+            // The search steps *towards the frame being rendered*, which is the
+            // one frame guaranteed to exist, so it clamps at both ends. Walking
+            // only backwards -- which is what this did first -- cannot move at
+            // all at slot 0, and slot 0 of the first window is frame -3. That
+            // failed the whole window and fell back to passing the source
+            // through, so the first six frames of a render came out as flat 2D
+            // before the seventh snapped into stereo.
             std::unique_ptr<OFX::Image> frameSrc;
             std::unique_ptr<OFX::Image> frameDepth;
-            for (int back = 0; back <= slot && !frameSrc; ++back)
+            const long long wanted = firstFrame + slot;
+            const long long step = (wanted < currentFrame) ? 1 : -1;
+            for (long long time = wanted;
+                 !frameSrc && ((step > 0) ? (time <= currentFrame) : (time >= currentFrame));
+                 time += step)
             {
-                const double time = double(firstFrame + slot - back);
-                frameSrc.reset(_srcClip->fetchImage(time));
+                frameSrc.reset(_srcClip->fetchImage(double(time)));
                 if (frameSrc && _depthClip && _depthClip->isConnected())
                 {
-                    frameDepth.reset(_depthClip->fetchImage(time));
+                    frameDepth.reset(_depthClip->fetchImage(double(time)));
                     if (!frameDepth)
                     {
                         frameSrc.reset();
@@ -639,7 +653,7 @@ bool Iw3StereoEffect::renderCuda(const OFX::RenderArguments& args, const iw3::Se
         if (!_video.holds(windowIndex, fingerprint))
         {
             _video.invalidate();
-            if (!buildVideoWindow(args, settings, firstFrame, window,
+            if (!buildVideoWindow(args, settings, firstFrame, frame, window,
                                   depthWidth, depthHeight, stream))
             {
                 return false;
