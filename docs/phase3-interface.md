@@ -43,7 +43,7 @@ the plugin — a 960x384 file arrives as 1920x800.
 
 | Parameter | Type | Range | Default | Meaning |
 | --- | --- | --- | --- | --- |
-| **Model** | choice | row_flow_v2 / row_flow_v3 / monobw_inpaint / monobw_inpaint_video | **row_flow_v2** | Which pipeline runs. All four graphs ship in the bundle and each gets its own ONNX Runtime session, built once at start-up. |
+| **Model** | choice | row_flow_v2 / row_flow_v3 / monobw_inpaint / monobw_inpaint_video | **row_flow_v3** | Which pipeline runs. All four graphs ship in the bundle and each gets its own ONNX Runtime session, built once at start-up. |
 
 The first two are the same backward warp with a different network.
 **monobw_inpaint_video** is monobw_inpaint with a temporal model: it sees twelve
@@ -60,11 +60,17 @@ running a full-resolution network on the CPU at seconds a frame.
 | --- | --- | --- | --- | --- |
 | **Mask Inner Dilation** | int | 0 – 16, slider 0 – 8 | **0** | monobw_inpaint only. Grows the hole mask towards the occluding edge before filling, which helps when the depth map's edge sits slightly inside the object's. |
 | **Mask Outer Dilation** | int | 0 – 16, slider 0 – 8 | **0** | monobw_inpaint only. Grows it the other way, giving the network more room to invent into. |
-| **Inpaint Max Width** | choice | Full / 1920 / 1280 / 960 / 720 | **Full** | Both monobw models. Caps the width the inpaint network runs at. Its memory scales with area, so this is what fits the temporal model on a smaller card: about 9 GB at HD, 4.5 at 1280, 3.4 at 960. |
+| **Inpaint Max Width** | choice | Full / 1920 / 1280 / 960 / 720 | **1280** | Both monobw models. Caps the width the inpaint network runs at. Its memory scales with area, so this is what fits the temporal model on a smaller card: about 9 GB at HD, 4.5 at 1280, 3.4 at 960. |
 
 A short list rather than a free number, because the useful values are a short
 list. **Full** is the frame's own width and is not the same as 1920 — on a 4K
 timeline 1920 is a real reduction.
+
+It defaults to **1280** rather than Full so that selecting an inpaint model on a
+smaller card does not immediately ask it for nine gigabytes. Above 1280 wide
+that costs a little detail in the filled pixels and nothing else; at 1280 or
+below it does nothing at all, because the cap is never applied below the frame's
+own width.
 
 Reducing it does **not** reduce the output. The warp and the hole mask stay at
 full resolution; only the network runs small, and its fill is composited back

@@ -63,15 +63,15 @@ PARAMETERS
 
   Model               Which pipeline to use.
 
-                      row_flow_v2 is a small convolution stack and the default.
-                      row_flow_v3 is a windowed-attention model with about four
-                      times the parameters, and is generally cleaner around
-                      edges.
+                      row_flow_v3 is the default: a windowed-attention model,
+                      generally cleaner around edges. row_flow_v2 is a smaller
+                      convolution stack and is still here because neither is
+                      more correct than the other.
 
-                      Despite the parameter count v3 is the slightly faster of
-                      the two, because it works on a reduced grid: 4.8 ms
-                      against 5.4 ms on a 1920x800 frame. Try both on a shot and
-                      keep whichever looks better -- neither is more correct.
+                      Despite having four times the parameters v3 is also the
+                      slightly faster of the two, because it works on a reduced
+                      grid: 4.8 ms against 5.4 ms on a 1920x800 frame. Try both
+                      on a shot and keep whichever looks better.
 
                       monobw_inpaint is a different pipeline rather than another
                       network. The other two warp backwards, which means that
@@ -112,6 +112,10 @@ PARAMETERS
   Inpaint Max        Caps the width the inpaint network runs at: Full, 1920,
   Width              1280, 960 or 720. Full is the frame's own width, which on
                      a 4K timeline is not the same as picking 1920.
+
+                      Defaults to 1280, so that trying an inpaint model does not
+                      immediately ask your card for nine gigabytes. If yours has
+                      the memory, Full is the better picture.
 
                       This is the setting to reach for if you run out of VRAM.
                       The network's memory scales with area: at HD the temporal

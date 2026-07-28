@@ -22,7 +22,7 @@ builds it into a tool creators already use.
 | `tests/` | Golden test against stock iw3 at diff 0, and ONNX against PyTorch. |
 | `ofx/` | CMake build for OFX plugins, against the OpenFX SDK Resolve ships. |
 | `ofx/plugin/` | **The plugin.** `iw3stereo.cpp` is the OFX glue, `stereo_pipeline.cpp` the CPU core, `stereo_gpu.cu` the kernels, `numeric_math.h` the arithmetic both share. |
-| `ofx/plugin/monobw_*` | MonoBW's forward warp: `monobw_math.h` shared, `monobw_gpu.cu` the kernels. Built, not yet wired in. |
+| `ofx/plugin/monobw_*` | MonoBW's forward warp and the mask morphology: `monobw_math.h` shared with the CPU core, `monobw_gpu.cu` the kernels. |
 | `ofx/common/` | ONNX Runtime loader (dynamic, never linked) and the log. |
 | `ofx/probe/` | Phase 0 probe plugins — instrumentation, not product. |
 | `tests/cpp/` | Checks the C++ numeric core against the Python implementation. |
@@ -42,13 +42,16 @@ builds it into a tool creators already use.
 | 1 — standalone PyTorch | **done**, 20/20 at max abs diff 0 vs stock iw3 |
 | 2 — ONNX | **done**, 12/12 vs PyTorch within 2e-4; 1080p in ~13 ms on CUDA |
 | 3 — the plugin | **done**, running in Resolve on the GPU at ~5 ms a frame |
+| the inpaint pipeline | **done**, both the per-frame and the temporal model |
 
 **iw3 Stereo** is a Fusion node with Source and Depth inputs, producing an
 anaglyph, either eye, or half SBS. Interface in `docs/phase3-interface.md`.
 
 Both `row_flow_v2` and `row_flow_v3` are supported, selected by the Model
-parameter. v3 needed no pipeline change but three separate fixes to export at
-dynamic shapes; `docs/row-flow-v3.md` records them.
+parameter, with v3 the default — it is cleaner around edges and, despite four
+times the parameters, slightly the faster of the two. v3 needed no pipeline
+change but three separate fixes to export at dynamic shapes;
+`docs/row-flow-v3.md` records them.
 
 It renders entirely on the GPU: Resolve's device buffers, six CUDA kernels and
 ONNX Runtime bound to device memory, with nothing crossing PCIe. A 1920x800
@@ -60,13 +63,23 @@ Correctness carries across three hops, each measured rather than assumed:
 matches that within **2e-4**; and the C++ numeric core matches the Python at
 **float32 epsilon**.
 
-A third Model option, **monobw_inpaint**, is iw3's forward-warp-and-fill
-pipeline: it finds the holes the warp opens and fills them with a
-2.26M-parameter network rather than smearing an edge into them. Better at
-occlusions, about 6.7x slower at HD, and NVIDIA only — its warp is CUDA, because
-`cummax` and `searchsorted` have no ONNX operator. Every numeric piece is
-checked against stock iw3, but **it has not been run in Resolve yet**;
-`docs/monobw-inpaint.md` has the numbers and what that leaves open.
+Two further Model options are a different pipeline rather than another network.
+**monobw_inpaint** warps forwards, finds the holes that opens, and fills them
+with a 2.26M-parameter network instead of smearing an edge into them.
+**monobw_inpaint_video** does the same with a model that sees twelve frames at
+once, so the fills stop crawling — the per-frame one invents each independently.
+
+Both are NVIDIA only: their warp is CUDA, because `cummax` and `searchsorted`
+have no ONNX operator. Both graphs run in fp16, which for the temporal one is
+not an optimisation but the only form that fits. At HD, roughly 37 ms a frame
+against `row_flow_v3`'s 4 - 5, and about twice that again for the temporal
+model.
+
+**Inpaint Max Width** caps the resolution the network runs at and defaults to
+1280, because at full HD the temporal model wants about 9 GB. The output stays
+full resolution either way: only the invented pixels are computed small.
+`docs/monobw-inpaint.md` records the measurements and the several things that
+had to be true for any of it to work.
 
 Three constraints worth knowing before reading further, each with evidence in
 `docs/`:

@@ -1195,7 +1195,11 @@ void Iw3StereoFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OFX::
     model->appendOption("row_flow_v3");
     model->appendOption("monobw_inpaint");
     model->appendOption("monobw_inpaint_video");
-    model->setDefault(0);
+    // row_flow_v3. It is the better default on both counts that matter: cleaner
+    // around edges, and slightly the faster of the two warps because it works on
+    // a reduced grid. Index 1, not 0 -- the option order is the saved meaning
+    // and cannot be rearranged to put the default first.
+    model->setDefault(1);
     page->addChild(*model);
 
     // The two mask dilations, which only monobw_inpaint reads. Left visible
@@ -1235,7 +1239,14 @@ void Iw3StereoFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OFX::
     inpaintWidth->appendOption("1280", "about 4.5 GB");
     inpaintWidth->appendOption("960", "about 3.4 GB");
     inpaintWidth->appendOption("720", "the smallest offered");
-    inpaintWidth->setDefault(0);
+    // 1280, so that reaching for an inpaint model on a smaller card does not
+    // immediately ask it for nine gigabytes. Above 1280 wide this is a real
+    // reduction and costs a little detail in the filled pixels only; at 1280 or
+    // below it does nothing at all, because the cap is never below the frame.
+    //
+    // Full is still there for anyone who wants it, and is the right choice once
+    // the card is known to cope.
+    inpaintWidth->setDefault(2);
     page->addChild(*inpaintWidth);
 
     // -- Stereo ------------------------------------------------------------
