@@ -68,6 +68,25 @@ public:
                     const float* maskLogits, bool rightEye,
                     int innerDilation, int outerDilation, void* stream);
 
+    // What the inpaint graph is fed: half precision, and optionally at a
+    // reduced resolution. Identical in every respect to monobw's -- the same
+    // kernels, from inpaint_boundary.cuh -- because neither the cast nor the
+    // reduce-and-composite has anything to do with which warp opened the holes,
+    // and both pipelines feed the same two LightInpaint graphs.
+    //
+    // `maxWidth` of 0, or anything at least the frame's width, leaves the
+    // resolution alone.
+    void prepareInpaintInput(int maxWidth, void* stream);
+    int inpaintWidth() const { return _workWidth; }
+    int inpaintHeight() const { return _workHeight; }
+    const void* inpaintEyeHalfDevice() const { return _eyeHalf; }
+    const void* processedMaskHalfDevice() const { return _maskHalf; }
+
+    // The graph's output back to a full-resolution float frame: a widening at
+    // full resolution, or a widening plus an upscale plus a feathered composite
+    // against the full-resolution eye when it ran reduced.
+    const float* finishInpaintOutput(const void* filled, void* stream);
+
     // Puts the graph's output back into frame orientation. Returns `filled`
     // itself for the right eye, which is already there.
     const float* finishEye(const float* filled, bool rightEye, void* stream);
@@ -99,6 +118,12 @@ private:
     float* _closedTmp = nullptr;
     float* _mask = nullptr;        // width * height
     float* _final = nullptr;       // 3 * width * height, the left eye flipped back
+    void* _eyeHalf = nullptr;      // 3 * workWidth * workHeight, __half
+    void* _maskHalf = nullptr;     // workWidth * workHeight, __half
+    float* _fromHalf = nullptr;    // 3 * width * height, the graph's output widened
+    float* _maskBlur = nullptr;    // width * height, the feather for the composite
+    float* _maskBlurTmp = nullptr;
+    int _workWidth = 0, _workHeight = 0;
 
     // The resample tables, exactly as the CPU builds them. Horizontal entries
     // first, then vertical, which is the packing resizeDepth already uses.
@@ -112,6 +137,8 @@ private:
     size_t _weightsHeld = 0, _weightScratchHeld = 0, _eyeHeld = 0;
     size_t _logitsHeld = 0, _closedHeld = 0, _closedTmpHeld = 0;
     size_t _maskHeld = 0, _finalHeld = 0;
+    size_t _eyeHalfHeld = 0, _maskHalfHeld = 0, _fromHalfHeld = 0;
+    size_t _maskBlurHeld = 0, _maskBlurTmpHeld = 0;
     size_t _axisWeightsHeld = 0, _axisIntsHeld = 0;
 
     std::string _error;

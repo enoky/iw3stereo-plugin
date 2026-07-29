@@ -126,6 +126,9 @@ function(stage_runtime TARGET)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${CMAKE_CURRENT_SOURCE_DIR}/../models/light_video_inpaint_v1.onnx"
                 "${BUNDLE}/light_video_inpaint_v1.onnx"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_CURRENT_SOURCE_DIR}/../models/mlbw_net.onnx"
+                "${BUNDLE}/mlbw_net.onnx"
         COMMENT "Staging ONNX Runtime and the models into the ${TARGET} bundle")
 endfunction()
 
@@ -134,7 +137,8 @@ stage_runtime(iw3ort)
 # --- the plugin --------------------------------------------------------------
 set(IW3STEREO_SOURCES plugin/iw3stereo.cpp plugin/stereo_pipeline.cpp common/ort_runtime.cpp)
 if(IW3_HAS_CUDA)
-    list(APPEND IW3STEREO_SOURCES plugin/stereo_gpu.cu plugin/monobw_gpu.cu)
+    list(APPEND IW3STEREO_SOURCES plugin/stereo_gpu.cu plugin/monobw_gpu.cu
+            plugin/mlbw_gpu.cu)
 endif()
 
 ofx_bundle(iw3stereo ${IW3STEREO_SOURCES})
@@ -196,7 +200,8 @@ if(IW3_HAS_CUDA)
     # kernels, real device pointers. It is what localises a failure in Resolve to
     # either the glue or the pipeline.
     add_executable(test_inpaint_ort ../tests/cpp/test_inpaint_ort.cu
-                   plugin/monobw_gpu.cu common/ort_runtime.cpp)
+                   plugin/monobw_gpu.cu plugin/mlbw_gpu.cu
+                   plugin/stereo_pipeline.cpp common/ort_runtime.cpp)
     target_include_directories(test_inpaint_ort PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/plugin"
         "${IW3_COMMON}"

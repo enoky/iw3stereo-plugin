@@ -86,7 +86,7 @@ __global__ void packDepthKernel(const float* __restrict__ source, size_t rowPitc
 
 __global__ void inputTensorKernel(const float* __restrict__ depth, int width, int height,
                                   float divergenceValue, float convergenceValue,
-                                  int borderPix, float* __restrict__ out)
+                                  int borderPix, int mirrorDepth, float* __restrict__ out)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -110,7 +110,10 @@ __global__ void inputTensorKernel(const float* __restrict__ depth, int width, in
         }
     }
 
-    out[index] = depth[index];
+    // The only channel the mirror touches. The ramp above is symmetric in x,
+    // so flipping it would be the identity.
+    out[index] = depth[mirrorDepth ? size_t(y) * size_t(width) + size_t(width - 1 - x)
+                                   : index];
     out[pixels + index] = divergence;
     out[2 * pixels + index] = convergence;
 }
@@ -446,7 +449,8 @@ void GpuPipeline::resizeDepth(void* stream)
 }
 
 void GpuPipeline::buildInputTensor(double divergence, double convergence,
-                                   bool preserveScreenBorder, void* stream)
+                                   bool preserveScreenBorder, bool mirrorDepth,
+                                   void* stream)
 {
     const double imageWidth = double(std::max(_depthWidth, _depthHeight));
     float divergenceValue = 0.0f, convergenceValue = 0.0f;
@@ -464,7 +468,8 @@ void GpuPipeline::buildInputTensor(double divergence, double convergence,
     const float* depth = (_depthWidth == _width && _depthHeight == _height) ? _depthFull : _depthSmall;
     inputTensorKernel<<<grid2d(_depthWidth, _depthHeight), dim3(kBlock, kBlock), 0,
                         static_cast<cudaStream_t>(stream)>>>(
-        depth, _depthWidth, _depthHeight, divergenceValue, convergenceValue, borderPix, _x);
+        depth, _depthWidth, _depthHeight, divergenceValue, convergenceValue, borderPix,
+        mirrorDepth ? 1 : 0, _x);
 }
 
 void GpuPipeline::compose(OutputMode mode, const float* left, const float* right, void* stream)

@@ -50,8 +50,12 @@ public:
     // The stereo_width resize. Skipped when the sizes already match.
     void resizeDepth(void* stream);
 
+    // `mirrorDepth` reads the depth right-to-left, which is what the right
+    // eye needs: iw3 flips the depth before building the model's input, and
+    // mask_mlbw_l2 runs once per eye. The border ramp is symmetric, so only
+    // the depth channel changes.
     void buildInputTensor(double divergence, double convergence,
-                          bool preserveScreenBorder, void* stream);
+                          bool preserveScreenBorder, bool mirrorDepth, void* stream);
 
     // left and right are device pointers from the ONNX session's output.
     void compose(OutputMode mode, const float* left, const float* right, void* stream);

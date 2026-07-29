@@ -55,7 +55,14 @@ enum class Method
     // The same pipeline with the temporal inpaint model. The image one has no
     // temporal path at all, so each frame's fill is invented independently and
     // the filled regions crawl; this one mixes along a twelve-frame axis.
-    MonoBwInpaintVideo
+    MonoBwInpaintVideo,
+    // A third pipeline: a 0.233M-parameter network that emits two sampling
+    // deltas, a softmax weight for each, and the hole mask. The eye is the
+    // weighted sum of two backward warps rather than one, which is how it
+    // represents a pixel that could plausibly come from two places. Its holes
+    // are predicted rather than computed, and its fill is the same
+    // LightInpaintV1 monobw uses.
+    MlbwInpaint
 };
 
 struct Settings

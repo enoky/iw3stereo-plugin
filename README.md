@@ -23,6 +23,8 @@ builds it into a tool creators already use.
 | `ofx/` | CMake build for OFX plugins, against the OpenFX SDK Resolve ships. |
 | `ofx/plugin/` | **The plugin.** `iw3stereo.cpp` is the OFX glue, `stereo_pipeline.cpp` the CPU core, `stereo_gpu.cu` the kernels, `numeric_math.h` the arithmetic both share. |
 | `ofx/plugin/monobw_*` | MonoBW's forward warp and the mask morphology: `monobw_math.h` shared with the CPU core, `monobw_gpu.cu` the kernels. |
+| `ofx/plugin/mlbw_*` | mask_mlbw_l2's two warps, the blend and the predicted-mask post-process, same split. |
+| `ofx/plugin/*_gpu.cuh` | Kernels shared between paths: the antialiased resample, and the fp16 boundary either side of an inpaint graph. |
 | `ofx/common/` | ONNX Runtime loader (dynamic, never linked) and the log. |
 | `ofx/probe/` | Phase 0 probe plugins — instrumentation, not product. |
 | `tests/cpp/` | Checks the C++ numeric core against the Python implementation. |
@@ -33,7 +35,7 @@ builds it into a tool creators already use.
 | `docs/phase2-onnx.md` | What exported, what did not, and the timing table. |
 | `docs/row-flow-v3.md` | The second model, and the three things ONNX export needed. |
 | `docs/monobw-inpaint.md` | The inpaint method: architecture, measured cost, what got ported. |
-| `docs/mlbw-inpaint-plan.md` | Plan for a third pipeline, `mlbw_l2_inpaint`. Not implemented. |
+| `docs/mlbw-inpaint-plan.md` | The third pipeline, `mlbw_l2_inpaint`: the plan, and what measurement changed about it at each stage. |
 
 ## Status
 
@@ -44,6 +46,7 @@ builds it into a tool creators already use.
 | 2 — ONNX | **done**, 12/12 vs PyTorch within 2e-4; 1080p in ~13 ms on CUDA |
 | 3 — the plugin | **done**, running in Resolve on the GPU at ~5 ms a frame |
 | the inpaint pipeline | **done**, both the per-frame and the temporal model |
+| `mlbw_l2_inpaint` | **done**, diff 0 in PyTorch, exact masks in CUDA |
 
 **iw3 Stereo** is a Fusion node with Source and Depth inputs, producing an
 anaglyph, either eye, or half SBS. Interface in `docs/phase3-interface.md`.
@@ -64,7 +67,7 @@ Correctness carries across three hops, each measured rather than assumed:
 matches that within **2e-4**; and the C++ numeric core matches the Python at
 **float32 epsilon**.
 
-Two further Model options are a different pipeline rather than another network.
+Three further Model options are a different pipeline rather than another network.
 **monobw_inpaint** warps forwards, finds the holes that opens, and fills them
 with a 2.26M-parameter network instead of smearing an edge into them.
 **monobw_inpaint_video** does the same with a model that sees twelve frames at
@@ -75,6 +78,17 @@ have no ONNX operator. Both graphs run in fp16, which for the temporal one is
 not an optimisation but the only form that fits. At HD, roughly 37 ms a frame
 against `row_flow_v3`'s 4 - 5, and about twice that again for the temporal
 model.
+
+**mlbw_l2_inpaint** is a third pipeline again. A 0.233M-parameter network
+predicts *two* sampling deltas per pixel with a softmax weight for each, so an
+eye is the blend of two backward warps rather than one, and it predicts the hole
+mask instead of deriving it. The fill is the same network monobw uses, which is
+where nearly all the cost is. Unlike monobw its warp is a backward warp, so
+there is no `cummax` to strand — but its layer-weight resize is PyTorch's
+antialiased kernel, which ignores `align_corners`, and no ONNX `Resize`
+reproduces that. So the network is a graph and the geometry is CUDA, which is
+the same split monobw ended up with for a different reason.
+`docs/mlbw-inpaint-plan.md` records the measurements.
 
 **Inpaint Max Width** caps the resolution the network runs at and defaults to
 1280, because at full HD the temporal model wants about 9 GB. The output stays

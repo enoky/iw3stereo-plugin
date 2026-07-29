@@ -619,6 +619,80 @@ bool OrtRuntime::runInpaintWith(size_t index, OrtMemoryInfo* memoryInfo,
     return ok;
 }
 
+bool OrtRuntime::runMlbwDevice(size_t index,
+                               const float* x, const int64_t* xShape,
+                               const float** delta, const float** layerWeight,
+                               const float** maskLogits)
+{
+    if (!deviceCapable() || index >= _models.size() || !_models[index].binding)
+    {
+        return false;
+    }
+    Model& model = _models[index];
+
+    // The previous eye's outputs are only valid until here. This graph runs
+    // twice a frame, so that is not a per-frame subtlety but a per-eye one: the
+    // left eye's heads have to be consumed before the right eye's call.
+    releaseBoundOutputs(model);
+    if (!rebindOutputs(model))
+    {
+        return false;
+    }
+
+    const size_t elements = size_t(xShape[0] * xShape[1] * xShape[2] * xShape[3]);
+    // fp32, unlike the inpaint graphs, and measured rather than assumed: these
+    // deltas become grid coordinates, and at 1920 wide fp16's resolution near
+    // the grid's edges is coarser than the spacing between adjacent columns.
+    const ONNXTensorElementDataType type = model.inputType;
+    const size_t elementSize =
+        (type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) ? sizeof(uint16_t) : sizeof(float);
+
+    OrtValue* xValue = nullptr;
+    bool ok = false;
+
+    if (!failed(_api->CreateTensorWithDataAsOrtValue(
+            _cudaMemoryInfo, const_cast<float*>(x), elements * elementSize,
+            xShape, 4, type, &xValue), "mlbw x tensor"))
+    {
+        // By position, as everywhere else here: the graph declares one input and
+        // binding by literal name would break on a re-export that renamed it.
+        if (model.inputNames.size() == 1 &&
+            !failed(_api->BindInput(model.binding, model.inputNames[0].c_str(), xValue),
+                    "BindInput(x)"))
+        {
+            const auto started = std::chrono::steady_clock::now();
+            OrtStatus* status = _api->RunWithBinding(model.session, nullptr, model.binding);
+            _lastRunMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - started).count();
+
+            if (!failed(status, "RunWithBinding(mlbw)") &&
+                !failed(_api->GetBoundOutputValues(model.binding, _allocator,
+                                                   &model.boundOutputs, &model.boundOutputCount),
+                        "GetBoundOutputValues") &&
+                model.boundOutputCount == 3)
+            {
+                const float** targets[3] = {delta, layerWeight, maskLogits};
+                ok = true;
+                for (int i = 0; i < 3 && ok; ++i)
+                {
+                    float* data = nullptr;
+                    if (failed(_api->GetTensorMutableData(model.boundOutputs[i],
+                                                          reinterpret_cast<void**>(&data)),
+                               "mlbw output data"))
+                    {
+                        ok = false;
+                        break;
+                    }
+                    *targets[i] = data;
+                }
+            }
+        }
+    }
+
+    if (xValue) _api->ReleaseValue(xValue);
+    return ok;
+}
+
 bool OrtRuntime::runDevice(size_t index,
                            const float* image, const int64_t* imageShape,
                            const float* x, const int64_t* xShape,

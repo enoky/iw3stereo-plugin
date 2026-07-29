@@ -92,16 +92,28 @@ PARAMETERS
                       so it costs about twice what monobw_inpaint does rather
                       than twelve times -- roughly 78 ms a frame at HD.
 
-                      Both need the GPU path -- NVIDIA, with Fusion's GPU
+                      mlbw_l2_inpaint is a third pipeline. Like the two
+                      above it fills occlusions with a network rather than
+                      smearing an edge into them, but it gets there differently:
+                      a small network predicts two ways each pixel could have
+                      moved, blends them, and predicts where the holes are
+                      instead of working them out geometrically. It warps
+                      backwards like row_flow rather than forwards like monobw.
+                      Worth trying on shots where monobw_inpaint's fills look
+                      right but its edges do not, and it costs about the same --
+                      they share the same fill network, which is where nearly all
+                      the time goes.
+
+                      All three need the GPU path -- NVIDIA, with Fusion's GPU
                       processing on. On the CPU they decline and pass the
                       source through with a message.
 
-  Mask Inner          monobw_inpaint only. Grows the hole mask towards the
+  Mask Inner          Inpaint models only. Grows the hole mask towards the
   Dilation            occluding edge before filling. Worth a try when the depth
                       map's edge sits slightly inside the object's and a rim of
                       the old background survives at the boundary.
 
-  Mask Outer          monobw_inpaint only. Grows the mask the other way, giving
+  Mask Outer          Inpaint models only. Grows the mask the other way, giving
   Dilation            the network more room to invent into. Worth a try when the
                       fill looks starved next to a large parallax shift.
 

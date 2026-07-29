@@ -84,6 +84,23 @@ public:
                           const float* eye, const float* mask, const int64_t* shape,
                           const float** filled);
 
+    // mask_mlbw_l2, which has a third signature again: the model's input tensor
+    // in, and three things out -- a sampling delta per layer, a softmax weight
+    // per layer, and the hole mask as *logits*.
+    //
+    // The warp is not in this graph and that is deliberate; see
+    // ofx/plugin/mlbw_gpu.h. So unlike the row_flow graphs this returns the
+    // network's raw heads rather than a pair of eyes, and the geometry happens
+    // in MlbwGpu afterwards.
+    //
+    // All three come back as device pointers owned by this object, valid until
+    // the next call on this model -- which matters here more than elsewhere,
+    // because this graph runs twice per frame, once per eye.
+    bool runMlbwDevice(size_t model,
+                       const float* x, const int64_t* xShape,
+                       const float** delta, const float** layerWeight,
+                       const float** maskLogits);
+
     // How many outputs a graph has, which is what distinguishes them: the warp
     // returns left and right, the inpaint one filled eye.
     size_t outputCount(size_t model) const;

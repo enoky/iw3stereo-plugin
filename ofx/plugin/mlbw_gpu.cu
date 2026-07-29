@@ -1,9 +1,11 @@
 #include "mlbw_gpu.h"
 
+#include "inpaint_boundary.cuh"
 #include "mlbw_math.h"
 #include "resample_gpu.cuh"
 #include "stereo_pipeline.h"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -130,7 +132,12 @@ __global__ void maskKernel(const float* __restrict__ closed, int depthWidth, int
 MlbwGpu::~MlbwGpu()
 {
     for (float* pointer : {_flipImage, _gridX, _gridY, _weights, _weightScratch,
-                           _eye, _logits, _closed, _closedTmp, _mask, _final, _axisWeights})
+                           _eye, _logits, _closed, _closedTmp, _mask, _final,
+                           _fromHalf, _maskBlur, _maskBlurTmp, _axisWeights})
+    {
+        if (pointer) cudaFree(pointer);
+    }
+    for (void* pointer : {_eyeHalf, _maskHalf})
     {
         if (pointer) cudaFree(pointer);
     }
@@ -274,6 +281,16 @@ bool MlbwGpu::prepare(int width, int height, int depthWidth, int depthHeight)
     if (!allocate(&_closedTmp, depthPixels, _closedTmpHeld)) return false;
     if (!allocate(&_mask, pixels, _maskHeld)) return false;
     if (!allocate(&_final, pixels * 3, _finalHeld)) return false;
+    // The half buffers go through the same float allocator, rounded up: two
+    // halves to a float, which is what monobw does and for the same reason --
+    // one allocator rather than two.
+    if (!allocate(reinterpret_cast<float**>(&_eyeHalf), (pixels * 3 + 1) / 2, _eyeHalfHeld))
+        return false;
+    if (!allocate(reinterpret_cast<float**>(&_maskHalf), (pixels + 1) / 2, _maskHalfHeld))
+        return false;
+    if (!allocate(&_fromHalf, pixels * 3, _fromHalfHeld)) return false;
+    if (!allocate(&_maskBlur, pixels, _maskBlurHeld)) return false;
+    if (!allocate(&_maskBlurTmp, pixels, _maskBlurTmpHeld)) return false;
 
     if (geometryChanged || !_axesValid)
     {
@@ -363,6 +380,73 @@ bool MlbwGpu::prepareEye(const float* image, const float* delta, const float* la
     }
     (void)pixels;
     return true;
+}
+
+// Identical to MonoBwGpu's, and deliberately so: the same kernels out of
+// inpaint_boundary.cuh, in the same order, on the same two buffers. What differs
+// between the pipelines is which warp opened the holes, and by this point that
+// is behind us.
+void MlbwGpu::prepareInpaintInput(int maxWidth, void* stream)
+{
+    cudaStream_t cudaStream = static_cast<cudaStream_t>(stream);
+    const size_t pixels = size_t(_width) * size_t(_height);
+    constexpr int kThreads = 256;
+
+    math::inpaintWorkingSize(_width, _height, maxWidth, _workWidth, _workHeight);
+
+    if (_workWidth == _width && _workHeight == _height)
+    {
+        const size_t eyeCount = pixels * 3;
+        toHalfKernel<<<unsigned((eyeCount + kThreads - 1) / kThreads), kThreads, 0, cudaStream>>>(
+            _eye, eyeCount, static_cast<__half*>(_eyeHalf));
+        toHalfKernel<<<unsigned((pixels + kThreads - 1) / kThreads), kThreads, 0, cudaStream>>>(
+            _mask, pixels, static_cast<__half*>(_maskHalf));
+    }
+    else
+    {
+        const dim3 blocks = grid2d(_workWidth, _workHeight);
+        const dim3 block2d(kBlock, kBlock);
+        downscaleEyeKernel<<<blocks, block2d, 0, cudaStream>>>(
+            _eye, _width, _height, _workWidth, _workHeight, static_cast<__half*>(_eyeHalf));
+        downscaleMaskKernel<<<blocks, block2d, 0, cudaStream>>>(
+            _mask, _width, _height, _workWidth, _workHeight,
+            static_cast<__half*>(_maskHalf));
+
+        // The feather for the full-resolution composite, built here so it
+        // overlaps the inference rather than being computed after it.
+        const dim3 fullBlocks = grid2d(_width, _height);
+        maskBlurKernel<<<fullBlocks, block2d, 0, cudaStream>>>(
+            _mask, _width, _height, 1, _maskBlurTmp);
+        maskBlurKernel<<<fullBlocks, block2d, 0, cudaStream>>>(
+            _maskBlurTmp, _width, _height, 0, _maskBlur);
+    }
+
+    const cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess)
+    {
+        _error = std::string("inpaint input preparation failed: ") + cudaGetErrorString(status);
+    }
+}
+
+const float* MlbwGpu::finishInpaintOutput(const void* filled, void* stream)
+{
+    cudaStream_t cudaStream = static_cast<cudaStream_t>(stream);
+    const size_t count = size_t(_width) * size_t(_height) * 3;
+    constexpr int kThreads = 256;
+
+    if (_workWidth == _width && _workHeight == _height)
+    {
+        // The graph already composited against the eye it was given, so this is
+        // only a widening.
+        fromHalfKernel<<<unsigned((count + kThreads - 1) / kThreads), kThreads, 0, cudaStream>>>(
+            static_cast<const __half*>(filled), count, _fromHalf);
+        return _fromHalf;
+    }
+
+    compositeUpscaledKernel<<<grid2d(_width, _height), dim3(kBlock, kBlock), 0, cudaStream>>>(
+        _eye, static_cast<const __half*>(filled), _maskBlur, _mask,
+        _width, _height, _workWidth, _workHeight, _fromHalf);
+    return _fromHalf;
 }
 
 const float* MlbwGpu::finishEye(const float* filled, bool rightEye, void* stream)

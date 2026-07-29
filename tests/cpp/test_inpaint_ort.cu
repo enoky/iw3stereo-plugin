@@ -1,4 +1,4 @@
-// The plugin's monobw_inpaint render path, outside Resolve.
+// The plugin's inpaint render paths, outside Resolve.
 //
 // Everything this runs is the production code: OrtRuntime opening the same
 // three graphs from the same bundle, MonoBwGpu producing the eye and mask on
@@ -12,6 +12,7 @@
 // always staged into a bundle yet -- the ONNX Runtime comes from an installed
 // bundle, the graphs from models/.
 
+#include "mlbw_gpu.h"
 #include "monobw_gpu.h"
 #include "ort_runtime.h"
 
@@ -104,15 +105,16 @@ int main(int argc, char** argv)
         models + L"\\stereo_warp_v3.onnx",
         models + L"\\light_inpaint_v1.onnx",
         models + L"\\light_video_inpaint_v1.onnx",
+        models + L"\\mlbw_net.onnx",
     };
     // The same per-graph session options the plugin uses. Without them the
     // twelve-frame graph takes 15.7 GiB and sixteen seconds instead of 9.0 and
     // a quarter of a second, and a reproduction that does not reproduce the
     // configuration is not one.
-    const std::vector<bool> conserve = {false, false, true, true};
+    const std::vector<bool> conserve = {false, false, true, true, false};
     const bool opened = ort.open(runtimeDir + L"\\ort", graphs, true, conserve);
     dump(ort, "bring-up");
-    if (!opened || ort.modelCount() < 4)
+    if (!opened || ort.modelCount() < 5)
     {
         std::printf("FAIL: only %zu graph(s) opened\n", ort.modelCount());
         return 2;
@@ -419,6 +421,164 @@ int main(int argc, char** argv)
             ++failures;
         }
         if (deviceDepth) cudaFree(deviceDepth);
+    }
+
+    // --- the mlbw_l2_inpaint path -------------------------------------------
+    //
+    // Two graphs a frame per eye: the warp network in slot 4, then the same
+    // LightInpaintV1 fill in slot 2. The plugin does exactly this, so what is
+    // under test is the sequencing as much as the arithmetic -- in particular
+    // that the fill's bound output buffer, which the next call overwrites, is
+    // consumed before the second eye runs.
+    std::printf("\n-- mlbw_l2_inpaint --\n");
+    if (ort.outputCount(4) != 3)
+    {
+        std::printf("FAIL: mlbw_net has %zu outputs, expected 3\n", ort.outputCount(4));
+        ++failures;
+    }
+    else
+    {
+        const struct { int width, height, depthWidth, depthHeight, maxWidth; } mlbwCases[] = {
+            {1920, 1036, 1920, 1036, 0},      // Full: no weight resize at all
+            {1920, 1036, 1920, 1036, 1280},   // Inpaint Max Width: the fill runs small
+            {384, 216, 192, 108, 0},          // depth smaller than the frame
+            {384, 216, 384, 216, 0},
+        };
+        for (const auto& c : mlbwCases)
+        {
+            const size_t pixels = size_t(c.width) * size_t(c.height);
+            const size_t depthPixels = size_t(c.depthWidth) * size_t(c.depthHeight);
+            std::vector<float> image(pixels * 3);
+            for (size_t i = 0; i < image.size(); ++i)
+            {
+                image[i] = float((i * 17) % 997) / 997.0f;
+            }
+            // The model's input tensor, built here rather than by the plugin's
+            // kernel: this test is about the graph and kernel sequencing, and a
+            // plausible tensor is enough for that.
+            std::vector<float> x(depthPixels * 3);
+            for (size_t i = 0; i < depthPixels; ++i)
+            {
+                x[i] = float((i * 37) % 1000) / 1000.0f;   // depth
+                x[depthPixels + i] = 0.6f;                 // divergence feature
+                x[2 * depthPixels + i] = -0.3f;            // convergence feature
+            }
+            float* deviceImage = upload(image);
+            float* deviceX = upload(x);
+
+            iw3::MlbwGpu gpu;
+            if (!deviceImage || !deviceX ||
+                !gpu.prepare(c.width, c.height, c.depthWidth, c.depthHeight))
+            {
+                std::printf("FAIL: %dx%d setup: %s\n", c.width, c.height, gpu.error().c_str());
+                ++failures;
+                if (deviceImage) cudaFree(deviceImage);
+                if (deviceX) cudaFree(deviceX);
+                continue;
+            }
+
+            const int64_t xShape[4] = {1, 3, c.depthHeight, c.depthWidth};
+            bool ok = true;
+            std::vector<float> eyes[2];
+            for (int pass = 0; pass < 2 && ok; ++pass)
+            {
+                const bool rightEye = pass == 1;
+                const float* delta = nullptr;
+                const float* weight = nullptr;
+                const float* logits = nullptr;
+                if (!ort.runMlbwDevice(4, deviceX, xShape, &delta, &weight, &logits))
+                {
+                    dump(ort, "mlbw net");
+                    std::printf("FAIL: %dx%d mlbw net inference\n", c.width, c.height);
+                    ok = false;
+                    break;
+                }
+                if (!gpu.prepareEye(deviceImage, delta, weight, logits, rightEye, 2, 3, nullptr))
+                {
+                    std::printf("FAIL: %dx%d prepareEye: %s\n", c.width, c.height,
+                                gpu.error().c_str());
+                    ok = false;
+                    break;
+                }
+                cudaDeviceSynchronize();
+
+                gpu.prepareInpaintInput(c.maxWidth, nullptr);
+                cudaDeviceSynchronize();
+                const int64_t shape[4] = {1, 3, gpu.inpaintHeight(), gpu.inpaintWidth()};
+                const float* filled = nullptr;
+                if (!ort.runInpaintDevice(
+                        2, reinterpret_cast<const float*>(gpu.inpaintEyeHalfDevice()),
+                        reinterpret_cast<const float*>(gpu.processedMaskHalfDevice()),
+                        shape, &filled))
+                {
+                    dump(ort, "mlbw fill");
+                    std::printf("FAIL: %dx%d fill inference\n", c.width, c.height);
+                    ok = false;
+                    break;
+                }
+                filled = gpu.finishInpaintOutput(filled, nullptr);
+                const float* eye = gpu.finishEye(filled, rightEye, nullptr);
+                cudaDeviceSynchronize();
+
+                // Read the frame back and insist it is a picture rather than a
+                // buffer nothing wrote. Every bug on this path in the monobw
+                // work produced an image, so "it ran without an error" is not
+                // the test: a flat or black frame has to fail here.
+                eyes[pass].resize(pixels * 3);
+                cudaMemcpy(eyes[pass].data(), eye, eyes[pass].size() * sizeof(float),
+                           cudaMemcpyDeviceToHost);
+                float low = eyes[pass][0], high = eyes[pass][0];
+                double sum = 0.0;
+                for (float value : eyes[pass])
+                {
+                    sum += value;
+                    low = value < low ? value : low;
+                    high = value > high ? value : high;
+                }
+                const float mean = float(sum / double(eyes[pass].size()));
+                if (!(high - low > 0.05f) || mean < 0.01f)
+                {
+                    std::printf("FAIL: %dx%d %s eye is flat (%.4f..%.4f, mean %.4f)\n",
+                                c.width, c.height, rightEye ? "right" : "left", low, high, mean);
+                    ok = false;
+                }
+            }
+
+            if (ok)
+            {
+                // The two eyes must differ. Both are warped from the same frame
+                // with the same network outputs here, so if the mirroring were a
+                // no-op they would come back identical -- which in Resolve looks
+                // like a working plugin producing no 3D at all.
+                size_t same = 0;
+                for (size_t i = 0; i < eyes[0].size(); ++i)
+                {
+                    if (eyes[0][i] == eyes[1][i]) ++same;
+                }
+                const double fraction = double(same) / double(eyes[0].size());
+                if (fraction > 0.98)
+                {
+                    std::printf("FAIL: %dx%d the two eyes agree on %.1f%% of samples; "
+                                "the mirroring is a no-op\n",
+                                c.width, c.height, 100.0 * fraction);
+                    ++failures;
+                }
+                else
+                {
+                    std::printf("    ok   %4dx%-4d depth %4dx%-4d maxWidth %4d  "
+                                "fill at %dx%d, eyes differ on %.1f%%, fill %.1f ms\n",
+                                c.width, c.height, c.depthWidth, c.depthHeight, c.maxWidth,
+                                gpu.inpaintWidth(), gpu.inpaintHeight(),
+                                100.0 * (1.0 - fraction), ort.lastRunMilliseconds());
+                }
+            }
+            else
+            {
+                ++failures;
+            }
+            cudaFree(deviceImage);
+            cudaFree(deviceX);
+        }
     }
 
     std::printf("\n%d failure(s)\n", failures);
