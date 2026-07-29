@@ -96,7 +96,7 @@ Step 4 does not commute in general, and step 1 operating on logits rather than
 on a binary mask means the existing `mask_closing` is the wrong function. Both
 are the kind of detail that a diff-0 test catches and a reading does not.
 
-## The gating unknown: shifted-window attention through ONNX
+## The gating unknown: shifted-window attention through ONNX — ANSWERED, green
 
 `WABlock` here is `row_flow_v3`'s block with one addition — `shift`, which
 `WindowMHA2d` implements by padding half a window on each side, partitioning,
@@ -105,28 +105,43 @@ and cropping back. `row_flow_v3`'s blocks never shift.
 `docs/monobw-inpaint.md` predicted, before any of that work started, that
 "`WindowGMLP2d`'s shifted window partitioning is the obvious suspect" for export
 trouble. That prediction was never tested, because `light_inpaint_v1` turned out
-to export cleanly for an unrelated reason. It is still untested, and it is
-squarely on this model's critical path.
+to export cleanly for an unrelated reason. So it was tested here first, before
+porting anything: `tools/probe_shifted_window.py` builds MLBW's body at the
+right shape with random weights and exports it at dynamic shapes.
 
-**Probe it first, before porting anything.** Build `MLBW` badly if necessary —
-random weights, no fidelity — and try to export it at dynamic shapes. The answer
-takes an hour and decides the shape of everything after it:
+**Shift is not the problem, and it is not even a variable.** Four runs, `shift`
+crossed with `export_safe`:
 
-- exports and runs at several sizes → the rest is work, not risk
-- fails → the fix is likely `row_flow_v3`'s attention rewrite applied again,
-  which is already written and understood
-- fails in some new way → that is worth knowing before a diff-0 port is sunk
-  into it
+| | SDPA | head-sliced (`export_safe`) |
+| --- | --- | --- |
+| no shift | export fails | **6.0e-7** |
+| shift | export fails | **6.0e-7** |
 
-This is the same discipline that paid off with the temporal-access probe: the
-question that could kill the approach gets asked with the cheapest possible
-experiment, not discovered three days in.
+Six sizes each — 108x192, 392x938, 392x940, 384x960, 100x200, 528x940 — every
+one within 6e-7 of PyTorch, and the shifted and unshifted columns agree to the
+last digit. The prediction was wrong: shifted-window partitioning exports
+cleanly.
+
+What does decide it is the same thing that decided `row_flow_v3`: SDPA's head
+permute, which `torch.export`'s decomposition cannot lower. Without the rewrite
+both variants die identically in `Run decompositions`, with or without shift.
+That rewrite already exists in `stereo_warp.py` as `export_safe`, so the fix was
+written before the problem was found.
+
+Two things follow. The risk register below loses its top entry. And stage 1's
+model needs the same `export_safe` flag `RowFlowV3` carries, for the same
+reason — the rewrite is ~5e-5 away from the fused kernel, so diff 0 needs the
+SDPA path and export needs the other one.
+
+This is the discipline that paid off with the temporal-access probe: ask the
+question that could kill the approach with the cheapest possible experiment. It
+cost an hour, and the answer was the opposite of the documented expectation.
 
 ## Staging
 
 Each stage ends somewhere committable, and each has a bar that is a number.
 
-**0 — probe the export.** Above. Half a day at most.
+**0 — probe the export.** **Done**, green. Above.
 
 **1 — `MLBW` standalone in PyTorch, diff 0.** Into `stereo_warp.py` beside
 `RowFlowV3`, not `stereo_inpaint.py`: it is a warp network and it shares
@@ -187,10 +202,11 @@ each eye, checked against the kernels.
 
 ## Risks, in the order they are likely to bite
 
-**The shifted-window export.** Stage 0 exists for this. If it needs the
-attention rewrite, note that `row_flow_v3`'s version is not bit-identical — it
-lands about 5e-5 away — so the PyTorch model keeps an `export_safe` flag and the
-diff-0 test uses the default path. Same arrangement here.
+~~**The shifted-window export.**~~ Retired by stage 0. What remains of it is not
+a risk but a constraint on stage 1: the attention rewrite is not bit-identical —
+about 5e-5 from the fused kernel — so the model carries an `export_safe` flag,
+diff 0 is measured on the default path, and export uses the other one. Exactly
+`RowFlowV3`'s arrangement.
 
 **The predicted mask has no independent check.** MonoBW's mask is arithmetic, so
 "is this mask right" has an answer that does not involve the network. This one
