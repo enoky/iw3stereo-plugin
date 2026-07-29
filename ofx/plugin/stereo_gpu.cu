@@ -1,5 +1,7 @@
 #include "stereo_gpu.h"
 
+#include "resample_gpu.cuh"
+
 #include "numeric_math.h"
 
 #include <cuda_runtime.h>
@@ -80,49 +82,6 @@ __global__ void packDepthKernel(const float* __restrict__ source, size_t rowPitc
         value = 1.0f - value;
     }
     out[size_t(y) * size_t(width) + size_t(x)] = float(math::applyMapper(mapper, double(value)));
-}
-
-// The separable antialiased resample, in the same order as the CPU version:
-// horizontal into scratch, then vertical.
-__global__ void resizeHorizontalKernel(const float* __restrict__ source, int sourceWidth, int height,
-                                       const int* __restrict__ start, const int* __restrict__ count,
-                                       const int* __restrict__ offset, const float* __restrict__ weights,
-                                       int targetWidth, float* __restrict__ out)
-{
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= targetWidth || y >= height) return;
-
-    const float* row = source + size_t(y) * size_t(sourceWidth);
-    const int first = start[x];
-    const int taps = count[x];
-    const float* w = weights + offset[x];
-    float sum = 0.0f;
-    for (int k = 0; k < taps; ++k)
-    {
-        sum += row[first + k] * w[k];
-    }
-    out[size_t(y) * size_t(targetWidth) + size_t(x)] = sum;
-}
-
-__global__ void resizeVerticalKernel(const float* __restrict__ scratch, int targetWidth, int sourceHeight,
-                                     const int* __restrict__ start, const int* __restrict__ count,
-                                     const int* __restrict__ offset, const float* __restrict__ weights,
-                                     int targetHeight, float* __restrict__ out)
-{
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= targetWidth || y >= targetHeight) return;
-
-    const int first = start[y];
-    const int taps = count[y];
-    const float* w = weights + offset[y];
-    float sum = 0.0f;
-    for (int k = 0; k < taps; ++k)
-    {
-        sum += scratch[size_t(first + k) * size_t(targetWidth) + size_t(x)] * w[k];
-    }
-    out[size_t(y) * size_t(targetWidth) + size_t(x)] = fminf(fmaxf(sum, 0.0f), 1.0f);
 }
 
 __global__ void inputTensorKernel(const float* __restrict__ depth, int width, int height,

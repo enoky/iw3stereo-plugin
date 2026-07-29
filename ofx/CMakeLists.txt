@@ -178,6 +178,20 @@ if(IW3_HAS_CUDA)
         RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/tests"
         CUDA_SEPARABLE_COMPILATION OFF)
 
+    # The mlbw kernels, likewise. Links stereo_pipeline.cpp as well as the
+    # kernels, because the antialiased resample weights are built on the CPU by
+    # buildResampleAxis and uploaded -- deriving them twice is how the two paths
+    # would drift.
+    add_executable(test_mlbw_gpu ../tests/cpp/test_mlbw_gpu.cu
+                   plugin/mlbw_gpu.cu plugin/stereo_pipeline.cpp)
+    target_include_directories(test_mlbw_gpu PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/plugin"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../tests/cpp")
+    set_target_properties(test_mlbw_gpu PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/tests"
+        CUDA_SEPARABLE_COMPILATION OFF)
+
     # The plugin's monobw render path without an OFX host: real OrtRuntime, real
     # kernels, real device pointers. It is what localises a failure in Resolve to
     # either the glue or the pipeline.

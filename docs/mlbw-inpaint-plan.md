@@ -237,8 +237,50 @@ will happen between the plugin's CUDA mask and iw3's**, for the same reason. It
 is inherent to any two implementations that differ at all, and it is not a
 defect in either — worth knowing before it is discovered as a bug in stage 4.
 
-**3 — the geometry and the mask post-process in CUDA.** Bigger than planned,
-because stage 2 handed it the warp. Two groups of kernels.
+**3 — the geometry and the mask post-process in CUDA.** **Done.** It looked
+bigger than planned, because stage 2 handed it the warp, and then turned out
+smaller, because most of what stage 2 sent here already existed.
+
+The antialiased resize is the reason the warp left the graph — and this repo had
+already hit that wall once, for the depth resize, and answered it the same way.
+`buildResampleAxis` was already written, already public "because the CUDA path
+uploads exactly these weights rather than deriving its own", and already covered
+by reference data in both directions. The layer weights are a new *caller* of
+that filter, not a new filter. Its two kernels moved into `resample_gpu.cuh` so
+there is one definition rather than two copies.
+
+Worth recording as a process note: stage 2 spent its time rediscovering
+something `stereo_warp_onnx.py` documents in a docstring. Reading the existing
+resize before building the full-warp graph would have been the cheaper order.
+
+Results, all against the Python that matches iw3 at diff 0:
+
+| | |
+| --- | --- |
+| CPU core (`test_pipeline`) | 76 checks, warp within **2.4e-6**, mask **exact** |
+| CUDA (`test_mlbw_gpu`) | 23 checks, warp within **2.9e-6**, mask **exact** |
+| mutations of the kernels | **7 of 7 caught** |
+
+The mask being exact is a stronger claim here than for monobw, whose mask input
+is already binary. This one thresholds a *resized continuous* value, so any
+disagreement in the upscale's last bit near 0.15 would surface as a wrong pixel.
+
+**The mirroring resolved more simply than expected.** Working it through: the
+left eye's model sees the frame and `_inpaint_single` flips the result; the right
+eye's model sees the mirror and `apply_divergence` flips it back before
+`_inpaint_single` leaves it alone. Both therefore hand the network *the mirror of
+their own warp coordinates* — so the warp writes mirrored for both eyes and the
+logits are flipped for both eyes, and the only per-eye difference left is which
+image the warp samples. That was worth confirming against the real Python rather
+than trusting the derivation, which is what the `mlbw_eye_*` cases do.
+
+One detail the reference data earns its keep on: the logits must be flipped
+*before* the post-process, not after. The closing and the resize are symmetric,
+but the dilation window is not.
+
+Original plan for this stage follows.
+
+Two groups of kernels.
 
 *The mask post-process*, as originally scoped. Four steps, three of which exist
 in some form: `closing` on logits (reuse `maskDilateAt`/`maskErodeAt`), a

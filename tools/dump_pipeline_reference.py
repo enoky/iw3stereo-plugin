@@ -384,6 +384,15 @@ if os.path.exists(MASK_MLBW_CHECKPOINT):
                 synthetic_view="both", preserve_screen_border=False, enable_amp=False)
             for side, eye, mask in (("left", left_eye, left_mask),
                                     ("right", right_eye, right_mask)):
+                # The inputs are the network's three outputs, in the orientation
+                # the network saw them -- mirrored for the right eye, because
+                # apply_divergence flips the depth before building the model's
+                # input. That is exactly what MlbwGpu::prepareEye is handed, so
+                # the case drives the production path rather than a rehearsal
+                # of it.
+                seen = depth.flip(-1) if side == "right" else depth
+                delta, layer_weight, logits = _mlbw_heads(seen, divergence, convergence)
+
                 # _inpaint_single flips the left eye and not the right, then runs
                 # preprocess_mask on whatever orientation that left it in.
                 if side == "left":
@@ -396,7 +405,8 @@ if os.path.exists(MASK_MLBW_CHECKPOINT):
                     [image_hw[1], image_hw[0], depth_hw[1], depth_hw[0],
                      1 if side == "right" else 0, inner, outer,
                      int(round(divergence * 1000)), int(round(convergence * 1000))],
-                    np.concatenate([image.numpy().ravel(), depth.numpy().ravel()]),
+                    np.concatenate([image.numpy().ravel(), delta.numpy().ravel(),
+                                    layer_weight.numpy().ravel(), logits.numpy().ravel()]),
                     np.concatenate([eye.numpy().ravel(), mask.float().numpy().ravel()]))
 else:
     print(f"skipping mlbw cases: {MASK_MLBW_CHECKPOINT} not found")
