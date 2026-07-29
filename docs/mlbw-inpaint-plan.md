@@ -1,13 +1,26 @@
-# mlbw_l2_inpaint — implementation plan
+# mlbw_l2_inpaint — plan, and what building it changed
 
-Investigation and plan. Nothing is implemented. This is the map that makes the
-implementation session efficient, written the same way `docs/monobw-inpaint.md`
-was and with the benefit of having since built that one end to end.
+**Built.** All five stages are done and both Model options ship. What follows is
+the original plan with each stage's outcome folded in where it landed, because
+three of the five stages changed on contact with a measurement and the reasons
+are worth more than a tidy plan would have been.
 
-The headline: **this should be materially cheaper than `monobw_inpaint` was**,
-because the expensive half is already built and the warp half is a better fit
-for ONNX than MonoBW's was. The one thing that could turn that around is a
-single unknown, and it should be probed before anything else is written.
+The prediction was that this would be **materially cheaper than
+`monobw_inpaint`**, because the expensive half already existed and the warp half
+looked like a better fit for ONNX. Both halves of that were right, and the
+cheapness came from somewhere slightly different than expected: not from the warp
+exporting cleanly — it does not, and had to move to CUDA — but from almost
+everything it needed in CUDA already being there.
+
+What actually changed, in order:
+
+| Stage | Plan said | Turned out |
+| --- | --- | --- |
+| 0 probe | shifted-window attention is the risk | not a variable at all; `export_safe` is |
+| 1 PyTorch | diff 0 | diff 0, and two plan claims were wrong |
+| 2 ONNX | the whole warp, in fp16 | the network only, in fp32 |
+| 3 CUDA | bigger, because stage 2 handed it the warp | smaller, because the filter already existed |
+| 4 plugin | a fifth option, maybe a sixth | both, and one cache bug caught in the writing |
 
 ## What it is
 
@@ -314,7 +327,31 @@ record the **antialias tap weights** for at least one upscale and one downscale
 ratio; getting that filter subtly wrong is the single most likely way this stage
 produces a plausible picture that is not iw3's.
 
-**4 — the plugin.** A fifth Model option, and a sixth if the temporal variant is
+**4 — the plugin.** **Done**, both options: `mlbw_l2_inpaint` and
+`mlbw_l2_inpaint_video`. The twelve-frame machinery was model-agnostic as
+predicted, so the temporal variant cost one window-build function and a branch.
+
+Three pieces are now shared rather than copied — the antialiased resample
+(`resample_gpu.cuh`), the fp16 and reduce-and-composite boundary either side of
+an inpaint graph (`inpaint_boundary.cuh`), and both fill graphs themselves.
+monobw's 30 checks passed across every extraction.
+
+One bug this stage introduced and caught before it shipped: `settingsFingerprint`
+did not include the method, so switching between the two *video* pipelines with
+everything else untouched would have served the other model's cached window and
+looked like the switch had not taken.
+
+Most of the work went into the test rather than the plugin, deliberately.
+`test_inpaint_ort` now drives both mlbw paths with real ORT on the real bundle,
+real kernels and real device pointers, and the assertions are aimed at the three
+bugs that actually reached the user last time: a flat or black frame fails, two
+eyes agreeing on more than 98% of samples fails (a no-op mirror looks exactly
+like a working plugin producing no 3D), and the temporal case traces each cached
+frame back to the slot it was stored in.
+
+Original plan for this stage follows.
+
+A fifth Model option, and a sixth if the temporal variant is
 wanted — `MLBWInpaintVideo` exists upstream and the twelve-frame machinery here
 is model-agnostic, so it should be nearly free once the image one works.
 

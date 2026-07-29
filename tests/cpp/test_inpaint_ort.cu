@@ -581,6 +581,130 @@ int main(int argc, char** argv)
         }
     }
 
+    // --- mlbw_l2_inpaint_video ----------------------------------------------
+    //
+    // The window build and the cache mapping, which is where the monobw work's
+    // periodic glitch lived: the frame that builds a window was composited
+    // against slot eleven's warp rather than its own, one frame in six.
+    //
+    // Each slot gets a distinct flat grey, so the cached output can be traced
+    // back to the slot it came from. The alignment machinery is shared with
+    // monobw and already covered above; what is new here is the mlbw window
+    // loop feeding it.
+    std::printf("\n-- mlbw_l2_inpaint_video --\n");
+    {
+        const int width = 384, height = 216;
+        const int depthWidth = 192, depthHeight = 108;
+        const size_t pixels = size_t(width) * size_t(height);
+        const size_t depthPixels = size_t(depthWidth) * size_t(depthHeight);
+
+        std::vector<float> x(depthPixels * 3);
+        for (size_t i = 0; i < depthPixels; ++i)
+        {
+            x[i] = float((i * 37) % 1000) / 1000.0f;
+            x[depthPixels + i] = 0.6f;
+            x[2 * depthPixels + i] = -0.3f;
+        }
+        float* deviceX = upload(x);
+
+        iw3::MlbwGpu gpu;
+        iw3::MonoBwVideoGpu video;
+        if (!deviceX || !gpu.prepare(width, height, depthWidth, depthHeight) ||
+            !video.prepare(width, height))
+        {
+            std::printf("FAIL: setup: %s%s\n", gpu.error().c_str(), video.error().c_str());
+            ++failures;
+        }
+        else
+        {
+            const int64_t xShape[4] = {1, 3, depthHeight, depthWidth};
+            const int64_t shape[4] = {iw3::MonoBwVideoGpu::kSequence, 3, height, width};
+            // The extra argument is not decoration: with one argument this is a
+            // function declaration, not a vector. Third time in this codebase.
+            std::vector<float> greys(size_t(iw3::MonoBwVideoGpu::kSequence), 0.0f);
+            bool ok = true;
+
+            for (int slot = 0; slot < iw3::MonoBwVideoGpu::kSequence && ok; ++slot)
+            {
+                // A flat frame per slot. The warp of a flat frame is still flat,
+                // so whatever comes out of the cache can be read straight back
+                // as "which slot did this come from".
+                greys[size_t(slot)] = 0.2f + 0.05f * float(slot);
+                std::vector<float> image(pixels * 3, greys[size_t(slot)]);
+                float* deviceImage = upload(image);
+                if (!deviceImage)
+                {
+                    std::printf("FAIL: slot %d upload\n", slot);
+                    ok = false;
+                    break;
+                }
+
+                const float* delta = nullptr;
+                const float* weight = nullptr;
+                const float* logits = nullptr;
+                if (!ort.runMlbwDevice(4, deviceX, xShape, &delta, &weight, &logits) ||
+                    !gpu.prepareEye(deviceImage, delta, weight, logits, false, 0, 0, nullptr))
+                {
+                    dump(ort, "mlbw video window");
+                    std::printf("FAIL: slot %d warp: %s\n", slot, gpu.error().c_str());
+                    ok = false;
+                }
+                else
+                {
+                    gpu.prepareInpaintInput(0, nullptr);
+                    video.storeFrame(slot, gpu.inpaintEyeHalfDevice(),
+                                     gpu.processedMaskHalfDevice(), nullptr);
+                }
+                cudaDeviceSynchronize();
+                cudaFree(deviceImage);
+            }
+
+            const float* filled = nullptr;
+            if (ok && !ort.runInpaintDevice(3, reinterpret_cast<const float*>(video.eyesDevice()),
+                                            reinterpret_cast<const float*>(video.masksDevice()),
+                                            shape, &filled))
+            {
+                dump(ort, "mlbw video fill");
+                std::printf("FAIL: temporal fill inference\n");
+                ok = false;
+            }
+            if (ok)
+            {
+                video.cacheOutput(false, filled, nullptr);
+                cudaDeviceSynchronize();
+
+                int wrong = 0;
+                for (int offset = 0; offset < iw3::MonoBwVideoGpu::kStride; ++offset)
+                {
+                    const size_t middle = size_t(height / 2) * size_t(width) + size_t(width / 2);
+                    unsigned short bits = 0;
+                    cudaMemcpy(&bits,
+                               static_cast<const char*>(video.cachedFrame(false, offset)) +
+                                   middle * sizeof(unsigned short),
+                               sizeof(bits), cudaMemcpyDeviceToHost);
+                    const float got = halfToFloat(bits);
+                    const int expectedSlot = iw3::MonoBwVideoGpu::kPad + offset;
+                    const float want = greys[size_t(expectedSlot)];
+                    const bool good = std::abs(got - want) < 0.02f;
+                    std::printf("    %s cache[%d] = %.3f, slot %d went in as %.3f\n",
+                                good ? "ok  " : "FAIL", offset, got, expectedSlot, want);
+                    if (!good) ++wrong;
+                }
+                if (wrong)
+                {
+                    std::printf("FAIL: %d of %d cached frames came from the wrong slot\n",
+                                wrong, iw3::MonoBwVideoGpu::kStride);
+                    ++failures;
+                }
+            }
+            else
+            {
+                ++failures;
+            }
+        }
+        if (deviceX) cudaFree(deviceX);
+    }
+
     std::printf("\n%d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
 }

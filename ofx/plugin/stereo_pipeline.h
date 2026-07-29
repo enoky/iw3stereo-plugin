@@ -62,7 +62,11 @@ enum class Method
     // represents a pixel that could plausibly come from two places. Its holes
     // are predicted rather than computed, and its fill is the same
     // LightInpaintV1 monobw uses.
-    MlbwInpaint
+    MlbwInpaint,
+    // mask_mlbw_l2's warp with the twelve-frame inpaint model, so the
+    // fills stop crawling. The warp is per frame either way -- it is only
+    // the fill that sees a window.
+    MlbwInpaintVideo
 };
 
 struct Settings

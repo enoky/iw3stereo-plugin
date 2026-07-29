@@ -104,7 +104,13 @@ PARAMETERS
                       they share the same fill network, which is where nearly all
                       the time goes.
 
-                      All three need the GPU path -- NVIDIA, with Fusion's GPU
+                      mlbw_l2_inpaint_video pairs that warp with the same
+                      twelve-frame fill monobw_inpaint_video uses, for the same
+                      reason: the per-frame model invents each fill on its own,
+                      so filled regions crawl. Only the fill sees a window --
+                      the warp is per frame either way.
+
+                      All four need the GPU path -- NVIDIA, with Fusion's GPU
                       processing on. On the CPU they decline and pass the
                       source through with a message.
 

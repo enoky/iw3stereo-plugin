@@ -46,7 +46,7 @@ builds it into a tool creators already use.
 | 2 — ONNX | **done**, 12/12 vs PyTorch within 2e-4; 1080p in ~13 ms on CUDA |
 | 3 — the plugin | **done**, running in Resolve on the GPU at ~5 ms a frame |
 | the inpaint pipeline | **done**, both the per-frame and the temporal model |
-| `mlbw_l2_inpaint` | **done**, diff 0 in PyTorch, exact masks in CUDA |
+| `mlbw_l2_inpaint` | **done**, diff 0 in PyTorch, exact masks in CUDA, per-frame and temporal |
 
 **iw3 Stereo** is a Fusion node with Source and Depth inputs, producing an
 anaglyph, either eye, or half SBS. Interface in `docs/phase3-interface.md`.
@@ -89,6 +89,11 @@ antialiased kernel, which ignores `align_corners`, and no ONNX `Resize`
 reproduces that. So the network is a graph and the geometry is CUDA, which is
 the same split monobw ended up with for a different reason.
 `docs/mlbw-inpaint-plan.md` records the measurements.
+
+**mlbw_l2_inpaint_video** pairs that warp with the twelve-frame fill, for the
+same reason the monobw pair exists: the per-frame model invents each fill
+independently and the filled regions crawl. Only the fill sees a window; the
+warp runs per frame either way.
 
 **Inpaint Max Width** caps the resolution the network runs at and defaults to
 1280, because at full HD the temporal model wants about 9 GB. The output stays

@@ -176,6 +176,24 @@ private:
                           const OfxRectI& window, int depthWidth,
                           int depthHeight, void* stream);
 
+    // One mlbw eye up to the point the fill graph takes over: build the
+    // model's input over the right depth orientation, run the warp network,
+    // then the two warps, the blend and the mask.
+    //
+    // Three callers -- the per-frame path, the window build, and the composite
+    // that runs after a window -- and they must agree exactly, because the
+    // composite blends the graph's output against the eye this produced. A
+    // divergence between them would show as a seam at hole edges on one frame
+    // in six, which is precisely the class of bug the monobw work kept hitting.
+    bool mlbwWarpEye(const iw3::Settings& settings, bool rightEye,
+                     const int64_t* xShape, void* stream);
+
+    // The twelve-frame window for the mlbw temporal variant.
+    bool buildMlbwVideoWindow(const OFX::RenderArguments& args, const iw3::Settings& settings,
+                              long long firstFrame, long long currentFrame,
+                              const OfxRectI& window, int depthWidth,
+                              int depthHeight, void* stream);
+
 public:
     // The frames this output frame needs. Declaring the range is the documented
     // way to ask a host for other frames, and Resolve honours it -- probed in
@@ -276,8 +294,11 @@ iw3::Settings Iw3StereoEffect::readSettings(double time) const
                     : choice == 2 ? iw3::Method::MonoBwInpaint
                     : choice == 3 ? iw3::Method::MonoBwInpaintVideo
                     : choice == 4 ? iw3::Method::MlbwInpaint
+                    : choice == 5 ? iw3::Method::MlbwInpaintVideo
                                   : iw3::Method::RowFlowV2;
-    settings.model = size_t(choice >= 1 && choice <= 4 ? choice : 0);
+    // Both mlbw options run the same warp network, graph 4; they differ only
+    // in which fill graph they pair it with.
+    settings.model = size_t(choice == 5 ? 4 : (choice >= 1 && choice <= 4 ? choice : 0));
     _maskInnerDilation->getValueAtTime(time, settings.maskInnerDilation);
     _maskOuterDilation->getValueAtTime(time, settings.maskOuterDilation);
     _inpaintMaxWidth->getValueAtTime(time, choice);
@@ -427,6 +448,11 @@ unsigned long long settingsFingerprint(const iw3::Settings& settings, int width,
     mix(unsigned(settings.maskInnerDilation));
     mix(unsigned(settings.maskOuterDilation));
     mix(unsigned(settings.inpaintMaxWidth));
+    // The method, because two pipelines share the window cache. Without
+    // this, switching from monobw_inpaint_video to mlbw_l2_inpaint_video
+    // with everything else untouched would hit a cache full of the other
+    // model's frames and look like the switch had not taken.
+    mix(unsigned(int(settings.method)));
     mix(unsigned(width));
     mix(unsigned(height));
     return hash;
@@ -438,7 +464,8 @@ void Iw3StereoEffect::getFramesNeeded(const OFX::FramesNeededArguments& args,
                                       OFX::FramesNeededSetter& frames)
 {
     const iw3::Settings settings = readSettings(args.time);
-    if (settings.method != iw3::Method::MonoBwInpaintVideo)
+    if (settings.method != iw3::Method::MonoBwInpaintVideo &&
+        settings.method != iw3::Method::MlbwInpaintVideo)
     {
         return;  // the default is the current frame, which is all the rest need
     }
@@ -569,6 +596,150 @@ bool Iw3StereoEffect::buildVideoWindow(const OFX::RenderArguments& args,
     return _video.ok();
 }
 
+// The mlbw warp network is graph 4 for both mlbw options; the fill is graph 2
+// for the per-frame variant and graph 3 for the temporal one.
+namespace
+{
+constexpr size_t kMlbwNetModel = 4;
+constexpr size_t kMlbwFillModel = 2;
+constexpr size_t kMlbwVideoFillModel = 3;
+}  // namespace
+
+bool Iw3StereoEffect::mlbwWarpEye(const iw3::Settings& settings, bool rightEye,
+                                  const int64_t* xShape, void* stream)
+{
+    // The right eye's model sees a mirrored depth. Building the tensor over the
+    // mirror is what iw3 does; flipping the finished tensor would give the same
+    // numbers, because the border ramp is symmetric, but this reads as the
+    // thing it is.
+    _gpu.buildInputTensor(settings.divergence, settings.convergence,
+                          settings.preserveScreenBorder, rightEye, stream);
+    if (cudaStreamSynchronize(static_cast<cudaStream_t>(stream)) != cudaSuccess)
+    {
+        report("CUDA stream sync failed -- falling back to the CPU.", true);
+        return false;
+    }
+
+    const float* delta = nullptr;
+    const float* layerWeight = nullptr;
+    const float* maskLogits = nullptr;
+    if (!sharedRuntime().runMlbwDevice(kMlbwNetModel, _gpu.inputTensorDevice(), xShape,
+                                       &delta, &layerWeight, &maskLogits))
+    {
+        logRuntimeReport("mlbw warp inference");
+        report("GPU mlbw inference failed; see the log.", true);
+        return false;
+    }
+
+    if (!_mlbw.prepareEye(_gpu.imageDevice(), delta, layerWeight, maskLogits, rightEye,
+                          settings.maskInnerDilation, settings.maskOuterDilation, stream))
+    {
+        report("mlbw warp failed: " + _mlbw.error(), true);
+        return false;
+    }
+    return true;
+}
+
+bool Iw3StereoEffect::buildMlbwVideoWindow(const OFX::RenderArguments& args,
+                                           const iw3::Settings& settings,
+                                           long long firstFrame, long long currentFrame,
+                                           const OfxRectI& window,
+                                           int depthWidth, int depthHeight, void* stream)
+{
+    iw3::OrtRuntime& ort = sharedRuntime();
+    const int width = window.x2 - window.x1;
+    const int height = window.y2 - window.y1;
+    const iw3::Mapper mapper(settings.foregroundScale, settings.mapperType);
+    int workWidth = 0, workHeight = 0;
+    iw3::math::inpaintWorkingSize(width, height, settings.inpaintMaxWidth,
+                                  workWidth, workHeight);
+    const int64_t shape[4] = {iw3::MonoBwVideoGpu::kSequence, 3, workHeight, workWidth};
+    const int64_t xShape[4] = {1, 3, depthHeight, depthWidth};
+
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        const bool rightEye = pass == 1;
+
+        for (int slot = 0; slot < iw3::MonoBwVideoGpu::kSequence; ++slot)
+        {
+            // Clip boundaries, handled exactly as the monobw window handles
+            // them: step *towards* the frame being rendered, which is the one
+            // frame guaranteed to exist, so the search clamps at both ends.
+            // Walking only backwards cannot move at slot 0, and slot 0 of the
+            // first window is frame -3 -- which is how the first six frames of a
+            // render once came out as flat 2D.
+            std::unique_ptr<OFX::Image> frameSrc;
+            std::unique_ptr<OFX::Image> frameDepth;
+            const long long wanted = firstFrame + slot;
+            const long long step = (wanted < currentFrame) ? 1 : -1;
+            for (long long time = wanted;
+                 !frameSrc && ((step > 0) ? (time <= currentFrame) : (time >= currentFrame));
+                 time += step)
+            {
+                frameSrc.reset(_srcClip->fetchImage(double(time)));
+                if (frameSrc && _depthClip && _depthClip->isConnected())
+                {
+                    frameDepth.reset(_depthClip->fetchImage(double(time)));
+                    if (!frameDepth)
+                    {
+                        frameSrc.reset();
+                    }
+                }
+            }
+            if (!frameSrc || !frameDepth)
+            {
+                report("Could not fetch the frames the temporal model needs.", true);
+                return false;
+            }
+
+            const OfxRectI& srcBounds = frameSrc->getBounds();
+            const OfxRectI& depthBounds = frameDepth->getBounds();
+            _gpu.packSource(static_cast<const float*>(frameSrc->getPixelData()),
+                            size_t(frameSrc->getRowBytes()) / sizeof(float),
+                            componentCount(frameSrc->getPixelComponents()),
+                            window.x1 - srcBounds.x1, window.y1 - srcBounds.y1,
+                            srcBounds.x2 - srcBounds.x1, srcBounds.y2 - srcBounds.y1, stream);
+            _gpu.packDepth(static_cast<const float*>(frameDepth->getPixelData()),
+                           size_t(frameDepth->getRowBytes()) / sizeof(float),
+                           componentCount(frameDepth->getPixelComponents()),
+                           window.x1 - depthBounds.x1, window.y1 - depthBounds.y1,
+                           depthBounds.x2 - depthBounds.x1, depthBounds.y2 - depthBounds.y1,
+                           settings.undoVideoRange, settings.depthInverted,
+                           mapper.params(), stream);
+            _gpu.resizeDepth(stream);
+
+            if (!mlbwWarpEye(settings, rightEye, xShape, stream))
+            {
+                return false;
+            }
+            _mlbw.prepareInpaintInput(settings.inpaintMaxWidth, stream);
+            _video.storeFrame(slot, _mlbw.inpaintEyeHalfDevice(),
+                              _mlbw.processedMaskHalfDevice(), stream);
+        }
+
+        if (cudaStreamSynchronize(static_cast<cudaStream_t>(stream)) != cudaSuccess)
+        {
+            report("CUDA stream sync failed -- falling back to the CPU.", true);
+            return false;
+        }
+
+        const float* filled = nullptr;
+        if (!ort.runInpaintDevice(kMlbwVideoFillModel,
+                                  reinterpret_cast<const float*>(_video.eyesDevice()),
+                                  reinterpret_cast<const float*>(_video.masksDevice()),
+                                  shape, &filled))
+        {
+            logRuntimeReport("mlbw video inpaint inference");
+            report("GPU temporal inpaint failed; see the log.", true);
+            return false;
+        }
+        _video.cacheOutput(rightEye, filled, stream);
+    }
+
+    (void)args;
+    return _video.ok();
+}
+
 bool Iw3StereoEffect::renderCuda(const OFX::RenderArguments& args, const iw3::Settings& settings,
                                  OFX::Image* dst, OFX::Image* src, OFX::Image* depth,
                                  int components, const OfxRectI& window)
@@ -626,7 +797,8 @@ bool Iw3StereoEffect::renderCuda(const OFX::RenderArguments& args, const iw3::Se
     _gpu.resizeDepth(stream);
     if (settings.method != iw3::Method::MonoBwInpaint &&
         settings.method != iw3::Method::MonoBwInpaintVideo &&
-        settings.method != iw3::Method::MlbwInpaint)
+        settings.method != iw3::Method::MlbwInpaint &&
+        settings.method != iw3::Method::MlbwInpaintVideo)
     {
         // monobw takes the depth directly; the three-channel input tensor with
         // its divergence and convergence planes is the row_flow contract.
@@ -820,7 +992,7 @@ bool Iw3StereoEffect::renderCuda(const OFX::RenderArguments& args, const iw3::Se
         // LightInpaintV1 fill monobw uses in slot 2. The fill is shared
         // deliberately -- nothing about it depends on which warp opened the
         // holes, and a second copy would be a second thing to keep in step.
-        constexpr size_t kFillModel = 2;
+        constexpr size_t kFillModel = kMlbwFillModel;
         if (model != settings.model || ort.outputCount(model) != 3 ||
             ort.outputCount(kFillModel) != 1)
         {
@@ -841,36 +1013,8 @@ bool Iw3StereoEffect::renderCuda(const OFX::RenderArguments& args, const iw3::Se
         for (int pass = 0; pass < 2; ++pass)
         {
             const bool rightEye = pass == 1;
-
-            // The right eye's model sees a mirrored depth, so its input tensor
-            // is built over the mirror rather than being the left eye's flipped.
-            // Flipping the tensor afterwards would give the same numbers -- the
-            // border ramp is symmetric -- but building it is one kernel either
-            // way and this reads as what iw3 does.
-            _gpu.buildInputTensor(settings.divergence, settings.convergence,
-                                  settings.preserveScreenBorder, rightEye, stream);
-            if (cudaStreamSynchronize(static_cast<cudaStream_t>(stream)) != cudaSuccess)
+            if (!mlbwWarpEye(settings, rightEye, xShape, stream))
             {
-                report("CUDA stream sync failed -- falling back to the CPU.", true);
-                return false;
-            }
-
-            const float* delta = nullptr;
-            const float* layerWeight = nullptr;
-            const float* maskLogits = nullptr;
-            if (!ort.runMlbwDevice(model, _gpu.inputTensorDevice(), xShape,
-                                   &delta, &layerWeight, &maskLogits))
-            {
-                logRuntimeReport("mlbw warp inference");
-                report("GPU mlbw inference failed; see the log.", true);
-                return false;
-            }
-
-            if (!_mlbw.prepareEye(_gpu.imageDevice(), delta, layerWeight, maskLogits,
-                                  rightEye, settings.maskInnerDilation,
-                                  settings.maskOuterDilation, stream))
-            {
-                report("mlbw warp failed: " + _mlbw.error(), true);
                 return false;
             }
 
@@ -907,6 +1051,93 @@ bool Iw3StereoEffect::renderCuda(const OFX::RenderArguments& args, const iw3::Se
                 left = eye;
             }
         }
+    }
+    else if (settings.method == iw3::Method::MlbwInpaintVideo)
+    {
+        if (ort.outputCount(kMlbwNetModel) != 3 ||
+            ort.outputCount(kMlbwVideoFillModel) != 1)
+        {
+            logRuntimeReport("mlbw video graphs");
+            report("The mlbw_l2_inpaint_video graphs did not load; see the log.", true);
+            return false;
+        }
+        int workWidth = 0, workHeight = 0;
+        iw3::math::inpaintWorkingSize(width, height, settings.inpaintMaxWidth,
+                                      workWidth, workHeight);
+        if (!_mlbw.prepare(width, height, depthWidth, depthHeight) ||
+            !_video.prepare(workWidth, workHeight))
+        {
+            report("GPU setup failed: " + _mlbw.error() + _video.error(), true);
+            return false;
+        }
+
+        // Which window this frame belongs to comes from the frame number alone,
+        // so Resolve's gaps and repeats all land on the same window and the
+        // cache is hit whatever order frames arrive in.
+        const long long frame = (long long)std::llround(args.time);
+        const long long windowIndex = iw3::MonoBwVideoGpu::windowIndex(frame);
+        const long long firstFrame = iw3::MonoBwVideoGpu::windowFirstFrame(frame);
+        const unsigned long long fingerprint = settingsFingerprint(settings, width, height);
+
+        if (!_video.holds(windowIndex, fingerprint))
+        {
+            _video.invalidate();
+            if (!buildMlbwVideoWindow(args, settings, firstFrame, frame, window,
+                                      depthWidth, depthHeight, stream))
+            {
+                return false;
+            }
+            _video.markHeld(windowIndex, fingerprint);
+
+            // The window build packs each of the twelve frames through _gpu in
+            // turn, so it leaves the last one there rather than the one being
+            // rendered. Everything below composites against the current frame's
+            // eye, so the current frame has to go back.
+            //
+            // The monobw path learned this the hard way: without it the frame
+            // that builds a window -- one in every six -- came out composited
+            // against slot eleven's warp, which is a glitch at a steady interval
+            // and was reported as exactly that.
+            _gpu.packSource(static_cast<const float*>(src->getPixelData()), sourcePitch,
+                            components, window.x1 - srcBounds.x1, window.y1 - srcBounds.y1,
+                            srcBounds.x2 - srcBounds.x1, srcBounds.y2 - srcBounds.y1, stream);
+            _gpu.packDepth(static_cast<const float*>(depth->getPixelData()), depthPitch,
+                           componentCount(depth->getPixelComponents()),
+                           window.x1 - depthBounds.x1, window.y1 - depthBounds.y1,
+                           depthBounds.x2 - depthBounds.x1, depthBounds.y2 - depthBounds.y1,
+                           settings.undoVideoRange, settings.depthInverted,
+                           mapper.params(), stream);
+            _gpu.resizeDepth(stream);
+        }
+
+        const int offset = int(frame - windowIndex * iw3::MonoBwVideoGpu::kStride);
+
+        // The cache holds the graph's output, still half and still at the
+        // working resolution. Widening it, compositing it back into the
+        // full-resolution eye and undoing the left eye's mirror all need this
+        // frame's own warp, so the warp network runs again here -- twice, once
+        // per eye. At 0.233M parameters that is cheap next to a second fill.
+        //
+        // Right eye second on purpose: finishInpaintOutput and finishEye each
+        // return a buffer the next call reuses, and mirroring the left eye back
+        // copies it out of the way.
+        if (!mlbwWarpEye(settings, false, xShape, stream))
+        {
+            return false;
+        }
+        _mlbw.prepareInpaintInput(settings.inpaintMaxWidth, stream);
+        left = _mlbw.finishEye(
+            _mlbw.finishInpaintOutput(_video.cachedFrame(false, offset), stream),
+            false, stream);
+
+        if (!mlbwWarpEye(settings, true, xShape, stream))
+        {
+            return false;
+        }
+        _mlbw.prepareInpaintInput(settings.inpaintMaxWidth, stream);
+        right = _mlbw.finishEye(
+            _mlbw.finishInpaintOutput(_video.cachedFrame(true, offset), stream),
+            true, stream);
     }
     else if (!ort.runDevice(model, _gpu.imageDevice(), imageShape, _gpu.inputTensorDevice(), xShape,
                             iw3::deltaScale(depthWidth), &left, &right))
@@ -1020,7 +1251,8 @@ void Iw3StereoEffect::render(const OFX::RenderArguments& args)
 
     if (settings.method == iw3::Method::MonoBwInpaint ||
         settings.method == iw3::Method::MonoBwInpaintVideo ||
-        settings.method == iw3::Method::MlbwInpaint)
+        settings.method == iw3::Method::MlbwInpaint ||
+        settings.method == iw3::Method::MlbwInpaintVideo)
     {
         // Deliberately GPU-only. The CPU path below implements the backward
         // warp, not this pipeline, and the missing half is a 2.26M-parameter
@@ -1298,6 +1530,7 @@ void Iw3StereoFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OFX::
     model->appendOption("monobw_inpaint");
     model->appendOption("monobw_inpaint_video");
     model->appendOption("mlbw_l2_inpaint");
+    model->appendOption("mlbw_l2_inpaint_video");
     // row_flow_v3. It is the better default on both counts that matter: cleaner
     // around edges, and slightly the faster of the two warps because it works on
     // a reduced grid. Index 1, not 0 -- the option order is the saved meaning
