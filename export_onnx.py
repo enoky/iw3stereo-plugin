@@ -78,6 +78,7 @@ CHECKPOINTS = {
     "light_inpaint_v1": os.path.join(CHECKPOINT_DIR, "iw3_light_inpaint_v1_20250919.pth"),
     "light_video_inpaint_v1": os.path.join(CHECKPOINT_DIR,
                                            "iw3_light_video_inpaint_v1_20250919.pth"),
+    "mask_mlbw_l2": os.path.join(CHECKPOINT_DIR, "iw3_mask_mlbw_l2_d1_20250903.pth"),
 }
 DEFAULT_CHECKPOINT = CHECKPOINTS["row_flow_v2"]
 
@@ -208,6 +209,89 @@ def export_pipeline_v3(model, path):
         dynamic_shapes={"image": {0: batch, 2: image_height, 3: image_width},
                         "x": {0: batch, 2: depth_height, 3: depth_width},
                         "delta_scale": {}},
+        opset_version=OPSET_V3, dynamo=True, external_data=False)
+    return path
+
+
+class MLBWNetGraph(torch.nn.Module):
+    """``mask_mlbw_l2`` itself: one input tensor in, three heads out.
+
+    The network only. Everything geometric -- the grid, the two backward warps,
+    the softmax blend -- stays outside, which is *not* what the plan called for.
+    See ``export_mlbw_net`` for the measurement that moved the boundary.
+
+    The mask leaves as raw **logits**, at the model's own resolution,
+    un-sigmoided and un-thresholded, so the closing, the upscale, the threshold
+    and the two dilations can all be plugin parameters.
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, x):
+        return self.model(x)
+
+
+def export_mlbw_net(model, path):
+    """``mask_mlbw_l2``, the network, at dynamic shapes.
+
+    Needs ``export_safe`` for the same reason ``row_flow_v3`` does, and only for
+    that reason. ``tools/probe_shifted_window.py`` crossed ``shift`` with
+    ``export_safe`` before any of this was written: the shifted and unshifted
+    columns are identical to the last digit, and both die in ``Run
+    decompositions`` without the attention rewrite. The shifted-window
+    partitioning ``docs/monobw-inpaint.md`` predicted would be the problem
+    exports cleanly.
+
+    **Why the warp is not in here, against the plan.** The plan put the whole
+    warp in one graph, on the grounds that -- unlike MonoBW's, which needs
+    ``cummax`` and ``searchsorted`` -- every operation in it has an ONNX
+    equivalent. Every operation does. One of them does not have the *same*
+    equivalent.
+
+    iw3 resizes the layer weights to the frame with
+    ``F.interpolate(..., align_corners=True, antialias=True)``. PyTorch's
+    antialiased kernel silently ignores ``align_corners`` and applies a
+    half-pixel coordinate transform regardless: upscaling 4 -> 8 it returns
+    1.0, 1.143 ... 3.714 where an align_corners resize ends at 4.0. The export
+    emits ``antialias=1`` faithfully and ONNX Runtime honours ``align_corners``
+    faithfully, and the two disagree by 3.6e-2 on the finished eye -- two orders
+    above this suite's bar. No ``Resize`` configuration reproduces PyTorch here,
+    in either direction, because the disagreement is in the coordinate
+    transform rather than in the filter.
+
+    It could be built by hand from gathers, but the antialias filter's support
+    scales with the resize ratio, so a static graph needs a fixed tap count and
+    silently blends wrongly once the ratio exceeds it. A cliff that produces a
+    picture rather than an error is this project's recurring failure mode, so
+    the resize and the warp go to CUDA instead, where the tap count can just be
+    a loop bound. That is also exactly how ``monobw_inpaint`` is already put
+    together: the network is the graph, the geometry is the kernel.
+
+    **float32, unlike the two inpaint graphs.** Half precision was measured
+    before being ruled out: the deltas this emits become grid coordinates, and
+    at 1920 wide the grid's spacing is 1.04e-3 against fp16's resolution of
+    9.77e-4 near the +/-1 edges. Neighbouring columns stop being
+    distinguishable and the warp reads the wrong pixel -- 1.0 away from fp32,
+    which is to say noise. The inpaint graphs survive fp16 because they carry
+    pixels, which have 8 bits of meaning; this one carries coordinates, which
+    do not. At 0.233M parameters there is nothing to gain anyway.
+    """
+    graph = MLBWNetGraph(model).eval()
+    # Batch 2, because torch.export specialises any dimension whose example
+    # value is 1 however the Dim is declared.
+    x = torch.rand(2, 3, 108, 192)
+
+    batch = torch.export.Dim("batch", min=1, max=64)
+    height = torch.export.Dim("height", min=16, max=8192)
+    width = torch.export.Dim("width", min=16, max=8192)
+
+    torch.onnx.export(
+        graph, (x,), path,
+        input_names=["x"],
+        output_names=["delta", "layer_weight", "mask_logits"],
+        dynamic_shapes={"x": {0: batch, 2: height, 3: width}},
         opset_version=OPSET_V3, dynamo=True, external_data=False)
     return path
 
@@ -403,6 +487,12 @@ def main():
         v3 = stereo_warp.load_row_flow_v3(CHECKPOINTS["row_flow_v3"], device="cpu", export_safe=True)
         v3_path = export_pipeline_v3(v3, os.path.join(args.output_dir, "stereo_warp_v3.onnx"))
         print(f"wrote {v3_path} ({os.path.getsize(v3_path) / 1024:.0f} KiB)")
+
+    if not args.skip_inpaint and os.path.exists(CHECKPOINTS["mask_mlbw_l2"]):
+        mlbw = stereo_warp.load_mask_mlbw_l2(CHECKPOINTS["mask_mlbw_l2"], device="cpu",
+                                             export_safe=True)
+        mlbw_path = export_mlbw_net(mlbw, os.path.join(args.output_dir, "mlbw_net.onnx"))
+        print(f"wrote {mlbw_path} ({os.path.getsize(mlbw_path) / 1024:.0f} KiB)")
 
     if not args.skip_inpaint and os.path.exists(CHECKPOINTS["light_inpaint_v1"]):
         inpaint = stereo_inpaint.load_light_inpaint_v1(CHECKPOINTS["light_inpaint_v1"], device="cpu")

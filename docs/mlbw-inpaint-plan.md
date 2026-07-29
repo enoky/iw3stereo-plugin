@@ -173,38 +173,104 @@ least one whole block even at an exact multiple), `layer_weight.to(float32)`
 before the softmax, and the fact that `delta` is one channel per layer until
 `pad_delta_y` widens it.
 
-**2 — the ONNX graph.** Boundary by the rule the other two exports already
-follow: fixed arithmetic in, anything whose *amount* is a runtime parameter out.
+**2 — the ONNX graph.** **Done**, but not the graph this plan asked for. The
+boundary moved, for a measured reason.
 
-- **In**: the network, `pad_delta_y`, the grid, both backward warps, the softmax
-  weighting and sum, both eyes by mirroring, and the mask logits passed straight
-  out.
-- **Out**: the input tensor (its `preserve_screen_border` ramp is `round()`ed at
-  runtime), the mapper, the depth resize, and all mask morphology.
+The plan put the whole warp in one graph, reasoning that — unlike MonoBW's,
+which needs `cummax` and `searchsorted` — every operation in it has an ONNX
+equivalent. Every operation does. One of them does not have the *same*
+equivalent.
 
-Signature: `(image, x, delta_scale) -> (left, right, left_mask, right_mask)` —
-`stereo_warp.onnx`'s exact inputs with two more outputs. `OrtRuntime` already
-binds outputs by the names the graph declares, so a four-output graph needs no
-runtime change.
+iw3 resizes the layer weights with
+`F.interpolate(..., align_corners=True, antialias=True)`. **PyTorch's
+antialiased kernel silently ignores `align_corners`** and applies a half-pixel
+coordinate transform regardless. Upscaling 4 → 8 it returns 1.0, 1.143 … 3.714
+where an align_corners resize ends at 4.0. The export emits `antialias=1`
+faithfully and ONNX Runtime honours `align_corners` faithfully, and the two
+disagree by **3.6e-2** on the finished eye. No `Resize` configuration
+reproduces PyTorch here, in either direction, because the disagreement is in
+the coordinate transform rather than in the filter.
 
-Export in **fp16**, and give the session `enable_mem_pattern = false`. Both are
-already plumbed per-model. The warp model is small enough that neither is
-forced, but matching the inpaint graphs costs nothing and iw3 runs everything
-under autocast anyway.
+It could be built by hand from gathers, but the antialias filter's support
+scales with the resize ratio, so a static graph needs a fixed tap count and
+blends wrongly once the ratio exceeds it — silently, producing a picture rather
+than an error. That is this project's documented failure mode, so it was not
+built. The resize, both warps and the blend go to CUDA, where the tap count is
+just a loop bound.
 
-Bar: within **2e-5** of the PyTorch, six sizes including 1036x1920, plus a test
-that the mask output actually varies with the input — a graph that dropped the
-third head would pass every tolerance otherwise.
+This is not a retreat to a worse position. It is the split `monobw_inpaint`
+already uses — network in the graph, geometry in the kernel — and it makes
+stage 2 smaller and stage 3 larger rather than adding work overall.
 
-**3 — the mask post-process in CUDA.** Four kernels, three of which exist in
-some form: `closing` on logits (reuse `maskDilateAt`/`maskErodeAt`), a bilinear
-upscale from depth to frame resolution, `sigmoid > 0.15`, and the two
-directional dilations (the existing single-window `maskFinishAt`, with the
-arguments swapped for the reversed order).
+So: `mlbw_net.onnx`, signature `x -> (delta, layer_weight, mask_logits)`.
+
+- **In**: the network, and nothing else.
+- **Out**: the input tensor, the mapper, the grid, both backward warps, the
+  weight resize, the blend, the mirroring, and all mask morphology.
+
+**float32, not fp16.** Also measured rather than assumed. The deltas this
+emits become grid coordinates, and at 1920 wide the grid's spacing is 1.04e-3
+against fp16's resolution of 9.77e-4 near the ±1 edges — the same order, so
+neighbouring columns stop being distinguishable and the warp reads the wrong
+pixel. End to end the fp16 warp lands **1.0** from the fp32 one. The inpaint
+graphs survive fp16 because they carry pixels, which have 8 bits of meaning;
+this one carries coordinates, which do not. At 0.233M parameters there is
+nothing to gain anyway.
+
+Measured against PyTorch across six sizes to 1036x1920: **2.3e-5** on the
+deltas, 9.5e-6 on the weights, 4.8e-5 on the logits, and **1.3e-6** on a
+finished eye — the eye is tighter than the heads that made it, because a 2e-5
+delta is a sub-pixel shift. Four mutations of the export were run and all four
+were caught, one of them by the export refusing to run at all.
+
+**One finding that outlives this stage.** Through the fill, the comparison
+changes in kind: the mask is `sigmoid(logits) > 0.15`, and a threshold has no
+tolerance. At HD exactly **one pixel in 1,989,120** sat close enough to the
+boundary to land on the other side of it, and because a flipped mask pixel gets
+*filled*, that one pixel is a 1.1e-2 difference on its own, with about 17
+neighbours dragged past 2e-4 by the fill's feather. Everything else agrees to
+1e-6, and the mean over the frame is 8.8e-8.
+
+A max-abs bar is therefore the wrong instrument end to end, and the suite uses
+the mean and a count of materially-different pixels instead. **The same thing
+will happen between the plugin's CUDA mask and iw3's**, for the same reason. It
+is inherent to any two implementations that differ at all, and it is not a
+defect in either — worth knowing before it is discovered as a bug in stage 4.
+
+**3 — the geometry and the mask post-process in CUDA.** Bigger than planned,
+because stage 2 handed it the warp. Two groups of kernels.
+
+*The mask post-process*, as originally scoped. Four steps, three of which exist
+in some form: `closing` on logits (reuse `maskDilateAt`/`maskErodeAt`), a
+bilinear upscale from depth to frame resolution, `sigmoid > 0.15`, and the two
+directional dilations (the existing single-window `maskFinishAt` — and since
+the order provably does not matter, either order will do).
+
+*The geometry*, newly arrived:
+
+- the **antialiased layer-weight resize**, which is why any of this is here.
+  Reproduce ATen's `upsample_bilinear2d_aa` exactly: `scale = (in-1)/(out-1)`,
+  `support = max(scale, 1)`, `center = scale*(i+0.5)`, taps from
+  `xmin = max(int(center - support + 0.5), 0)` to
+  `min(int(center + support + 0.5), in)`, triangle weights
+  `max(0, 1 - |(j + xmin - center + 0.5) * invscale|)` normalised by their sum,
+  with `invscale = 1/scale` when downscaling and 1 when up. Separable, so one
+  pass per axis. **Note it uses the align_corners scale with a half-pixel
+  centre** — that hybrid is the whole reason it is not an ONNX Resize.
+- two **backward warps** per eye: grid plus `delta * delta_scale`, the grid
+  bilinearly resized to the frame (ordinary bilinear, `align_corners=True`,
+  *no* antialias), then a border-clamped bilinear sample. `bilinearSampleBorder`
+  already exists.
+- the **softmax blend**, a two-term weighted sum, and the mirroring for the
+  right eye.
 
 Bar: exact agreement on the thresholded mask against Python reference data from
-`tools/dump_pipeline_reference.py`, as the monobw morphology already is. A mask
-is a threshold on a value and cannot be checked with a tolerance.
+`tools/dump_pipeline_reference.py`, as the monobw morphology already is — a mask
+is a threshold and cannot be checked with a tolerance — and float32 epsilon on
+the warp, which is how the existing numeric core is judged. Reference data must
+record the **antialias tap weights** for at least one upscale and one downscale
+ratio; getting that filter subtly wrong is the single most likely way this stage
+produces a plausible picture that is not iw3's.
 
 **4 — the plugin.** A fifth Model option, and a sixth if the temporal variant is
 wanted — `MLBWInpaintVideo` exists upstream and the twelve-frame machinery here
