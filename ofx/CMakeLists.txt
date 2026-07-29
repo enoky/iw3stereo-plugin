@@ -154,12 +154,17 @@ endif()
 stage_runtime(iw3stereo)
 
 # The user-facing README goes at the bundle root, which is where someone poking
-# around in the OFX plugins directory will actually look.
+# around in the OFX plugins directory will actually look. The CUDA fetch script
+# goes beside it, because that README tells people to run it and a user should
+# not have to find the source repository to do that.
 add_custom_command(TARGET iw3stereo POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/plugin/README.txt"
             "${CMAKE_BINARY_DIR}/bundles/iw3stereo.ofx.bundle/README.txt"
-    COMMENT "Staging the user README into the iw3stereo bundle")
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/fetch-cuda-runtime.ps1"
+            "${CMAKE_BINARY_DIR}/bundles/iw3stereo.ofx.bundle/fetch-cuda-runtime.ps1"
+    COMMENT "Staging the user README and the CUDA fetch script into the iw3stereo bundle")
 
 # --- the numeric core's test, built as a plain executable --------------------
 add_executable(test_pipeline ../tests/cpp/test_pipeline.cpp plugin/stereo_pipeline.cpp)

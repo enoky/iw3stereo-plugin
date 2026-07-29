@@ -30,6 +30,7 @@ builds it into a tool creators already use.
 | `tests/cpp/` | Checks the C++ numeric core against the Python implementation. |
 | `docs/phase3-interface.md` | The agreed plugin interface. |
 | `scripts/install-ofx.ps1` | Copies built bundles to Resolve's OFX directory (needs elevation). |
+| `scripts/fetch-cuda-runtime.ps1` | Downloads cuBLAS and cuDNN into an installed bundle. Not shipped: ~930 MB. |
 | `scripts/resolve_probe.py` | Queries a running Resolve via the scripting API. |
 | `docs/phase0-findings.md` | What Resolve can and cannot do, with evidence. |
 | `docs/phase2-onnx.md` | What exported, what did not, and the timing table. |
@@ -110,6 +111,14 @@ Three constraints worth knowing before reading further, each with evidence in
   units and is refused in code.
 - **Never link ONNX Runtime** — Resolve ships its own `onnxruntime.dll` (1.13,
   CPU-only) in the application directory, and a normal import would bind to it.
+- **cuBLAS and cuDNN are fetched, not shipped** — ~930 MB, against a 284 MB
+  bundle. `scripts/fetch-cuda-runtime.ps1` pulls them from NVIDIA's packages on
+  PyPI into the installed bundle, and the plugin pre-loads whatever it finds
+  there by absolute path. That pre-load is what makes it work: cuBLAS is a static
+  import and resolves from the bundle anyway, but ORT reaches cuDNN with a plain
+  `LoadLibrary` by name, which never searches a plugin's private folder — so a
+  bundled cuDNN without the pre-load gives a CUDA provider that starts and then
+  fails every convolution.
 
 ## Running the tests
 

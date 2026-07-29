@@ -90,31 +90,59 @@ bool OrtRuntime::open(const std::wstring& directory, const std::vector<std::wstr
     // resolution for the whole of Resolve's process, and this needs to change it
     // for nothing but these files.
     //
-    // Absent files are not an error. A machine with the CUDA toolkit installed
-    // has none of these in the bundle and resolves them from PATH as before.
-    for (const wchar_t* name : {
-            // cuBLAS first: cublas64 statically imports cublasLt64.
-            L"cublasLt64_13.dll", L"cublas64_13.dll",
-            // cuDNN's loader shim and the pieces it pulls in.
-            L"cudnn_graph64_9.dll", L"cudnn_engines_precompiled64_9.dll",
-            L"cudnn_engines_runtime_compiled64_9.dll", L"cudnn_heuristic64_9.dll",
-            L"cudnn_ops64_9.dll", L"cudnn_cnn64_9.dll", L"cudnn_adv64_9.dll",
-            L"cudnn64_9.dll"})
+    // Whatever is there is what gets loaded: the directory is enumerated rather
+    // than a list of names being hardcoded. That is not tidiness -- cuDNN splits
+    // itself differently between releases (9.24 moved most of cudnn_graph's bulk
+    // around and added two more DLLs), and cudnn64_9.dll has no static imports at
+    // all, so it reaches its own pieces by name at runtime too. A hardcoded list
+    // would silently miss whichever piece a future release adds, and the symptom
+    // would again be a working provider that cannot do convolutions.
+    //
+    // An empty or absent directory is not an error. A machine with CUDA
+    // installed has none of these in the bundle and resolves them from PATH
+    // exactly as before.
+    WIN32_FIND_DATAW found = {};
+    HANDLE search = FindFirstFileW((directory + L"\\*.dll").c_str(), &found);
+    std::vector<std::wstring> pending;
+    if (search != INVALID_HANDLE_VALUE)
     {
-        const std::wstring path = directory + L"\\" + name;
-        if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES)
+        do
         {
-            continue;
-        }
-        if (LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH))
+            const std::wstring name(found.cFileName);
+            // ORT's own DLLs are loaded below, and by ORT itself; leave them.
+            if (name.rfind(L"onnxruntime", 0) == 0)
+            {
+                continue;
+            }
+            pending.push_back(name);
+        } while (FindNextFileW(search, &found));
+        FindClose(search);
+    }
+
+    // Two passes, because these libraries import each other and the enumeration
+    // order is the filesystem's. A second attempt is cheap and removes the need
+    // to know the dependency order.
+    for (int attempt = 0; attempt < 2 && !pending.empty(); ++attempt)
+    {
+        std::vector<std::wstring> stillPending;
+        for (const std::wstring& name : pending)
         {
-            note("pre-loaded " + narrow(name));
+            if (LoadLibraryExW((directory + L"\\" + name).c_str(), nullptr,
+                               LOAD_WITH_ALTERED_SEARCH_PATH))
+            {
+                note("pre-loaded " + narrow(name));
+            }
+            else
+            {
+                stillPending.push_back(name);
+            }
         }
-        else
-        {
-            note("pre-load FAILED for " + narrow(name) +
-                 ", GetLastError=" + std::to_string(GetLastError()));
-        }
+        pending.swap(stillPending);
+    }
+    for (const std::wstring& name : pending)
+    {
+        note("pre-load FAILED for " + narrow(name) +
+             ", GetLastError=" + std::to_string(GetLastError()));
     }
 
     const std::wstring dllPath = directory + L"\\onnxruntime.dll";

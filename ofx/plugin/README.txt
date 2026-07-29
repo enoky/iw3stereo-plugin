@@ -15,6 +15,18 @@ REQUIREMENTS
   * An NVIDIA GPU. There is a CPU fallback, but it is roughly twenty times
     slower and is not usable for preview.
 
+  * The CUDA runtime libraries -- cuBLAS and cuDNN. The plugin does not ship
+    these: they are about a gigabyte, four times the rest of it. Run
+
+        powershell -ExecutionPolicy Bypass -File fetch-cuda-runtime.ps1
+
+    from an elevated prompt, once, and restart Resolve. It downloads them from
+    NVIDIA's own packages and puts them next to the plugin. Nothing is installed
+    system-wide and no Python is involved.
+
+    You do NOT need the CUDA Toolkit, and installing it would not be enough on
+    its own -- cuDNN is a separate product the Toolkit does not include.
+
 Tested on Resolve 21 and an RTX 5080, where a 1920x800 frame takes about 5 ms.
 
 
@@ -288,8 +300,15 @@ Common cases:
       than Fusion.
 
   Warning about running on the CPU
-      The CUDA runtime did not start. The log says why. Check your NVIDIA
-      driver.
+      The CUDA runtime did not start. The log says why. If it mentions
+      cublasLt64_13.dll, run fetch-cuda-runtime.ps1 -- see REQUIREMENTS.
+      Otherwise check your NVIDIA driver.
+
+  Anaglyph looks right but the inpaint models produce nothing
+      If the log says "cuDNN is unavailable or disabled", cuBLAS is present but
+      cuDNN is not. That is the same fix: fetch-cuda-runtime.ps1. The two
+      libraries fail differently -- cuBLAS stops the GPU path from starting at
+      all, cuDNN lets it start and then fails every convolution.
 
   3D looks inside-out
       Turn on Depth Is Inverted.
