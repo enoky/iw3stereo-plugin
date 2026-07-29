@@ -68,6 +68,55 @@ bool OrtRuntime::failed(OrtStatus* status, const char* what)
 bool OrtRuntime::open(const std::wstring& directory, const std::vector<std::wstring>& modelPaths,
                       bool preferCuda, const std::vector<bool>& conserveMemory)
 {
+    // Pre-load any CUDA runtime libraries sitting beside onnxruntime.dll, by
+    // absolute path, before ONNX Runtime can look for them.
+    //
+    // This is what makes bundling them work at all, and the reason is a
+    // difference in how ORT reaches its two kinds of dependency. cuBLAS is a
+    // *static* import of onnxruntime_providers_cuda.dll, so
+    // LOAD_WITH_ALTERED_SEARCH_PATH below already resolves it from this folder.
+    // cuDNN is not: the CUDA provider calls LoadLibrary("cudnn64_9.dll") at the
+    // point it first needs a convolution, and that uses the standard search
+    // order -- the *process* directory, System32, PATH -- which never includes a
+    // plugin's private subfolder. Bundling cuDNN without this gets you a CUDA
+    // provider that attaches happily and then fails every Conv node with
+    // "cuDNN is unavailable", which reads like a broken plugin rather than a
+    // missing file.
+    //
+    // Loading by absolute path first sidesteps it, because a later
+    // LoadLibrary("cudnn64_9.dll") finds the already-loaded module by its base
+    // name and returns that. Deliberately *not* done with
+    // SetDefaultDllDirectories or by appending to PATH: both change DLL
+    // resolution for the whole of Resolve's process, and this needs to change it
+    // for nothing but these files.
+    //
+    // Absent files are not an error. A machine with the CUDA toolkit installed
+    // has none of these in the bundle and resolves them from PATH as before.
+    for (const wchar_t* name : {
+            // cuBLAS first: cublas64 statically imports cublasLt64.
+            L"cublasLt64_13.dll", L"cublas64_13.dll",
+            // cuDNN's loader shim and the pieces it pulls in.
+            L"cudnn_graph64_9.dll", L"cudnn_engines_precompiled64_9.dll",
+            L"cudnn_engines_runtime_compiled64_9.dll", L"cudnn_heuristic64_9.dll",
+            L"cudnn_ops64_9.dll", L"cudnn_cnn64_9.dll", L"cudnn_adv64_9.dll",
+            L"cudnn64_9.dll"})
+    {
+        const std::wstring path = directory + L"\\" + name;
+        if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES)
+        {
+            continue;
+        }
+        if (LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH))
+        {
+            note("pre-loaded " + narrow(name));
+        }
+        else
+        {
+            note("pre-load FAILED for " + narrow(name) +
+                 ", GetLastError=" + std::to_string(GetLastError()));
+        }
+    }
+
     const std::wstring dllPath = directory + L"\\onnxruntime.dll";
     note("loading " + narrow(dllPath));
 
