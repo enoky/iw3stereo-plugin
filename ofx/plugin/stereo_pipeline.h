@@ -219,4 +219,39 @@ void maskPreprocess(const float* mask, int width, int height,
                     int innerDilation, int outerDilation, int baseWidth,
                     std::vector<float>& out);
 
+// --- mlbw_l2_inpaint ---------------------------------------------------------
+//
+// The half of mask_mlbw_l2 that is not the network. Arithmetic in mlbw_math.h,
+// shared with the CUDA kernels; these are the CPU drivers around it, and the
+// ones tests/cpp/test_pipeline.cpp can run.
+//
+//     stereo_warp.py     _warp_one_view_mlbw (after the model) -> mlbwWarp
+//     stereo_inpaint.py  _postprocess_hole_mask                -> mlbwMask
+//
+// Both take the network's outputs as arguments rather than running it, because
+// in the plugin the network is an ORT call and these are what surround it.
+
+// The two backward warps and the softmax blend, for one eye.
+//
+// `delta` and `layerWeight` are the model's, each two planes at the depth's
+// resolution. `eye` comes back as width * height * 3, in the same orientation
+// as `image` -- this does no mirroring, because which eye is being built is the
+// caller's business and getting a flip wrong here would be invisible.
+//
+// The weights are resized to the frame with the *antialiased* resampler, the
+// deltas are not. That asymmetry is iw3's; see mlbw_math.h.
+void mlbwWarp(const float* image, int width, int height,
+              const float* delta, const float* layerWeight,
+              int depthWidth, int depthHeight,
+              std::vector<float>& eye);
+
+// postprocess_hole_mask: closing on the logits, upscale, threshold, dilate.
+//
+// `logits` is the mask head's output at the depth's resolution and is *not* a
+// mask yet -- it has not been through a sigmoid. The dilation counts are quoted
+// against the logits' width, which is what iw3 reads them off.
+void mlbwMask(const float* logits, int depthWidth, int depthHeight,
+              int width, int height, int innerDilation, int outerDilation,
+              std::vector<float>& out);
+
 }  // namespace iw3

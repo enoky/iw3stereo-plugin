@@ -282,6 +282,87 @@ int main(int argc, char** argv)
                             entry.name.c_str(), set, entry.outputs.size());
             }
         }
+        else if (entry.name.rfind("mlbw_weight_resize_", 0) == 0)
+        {
+            // The same resampler the depth resize uses, at the ratios the
+            // layer-weight resize produces. Worth its own cases because
+            // Inpaint Max Width makes downscaling normal here, where the depth
+            // path only ever upscales.
+            const int inWidth = entry.ints[0], inHeight = entry.ints[1];
+            const int outWidth = entry.ints[2], outHeight = entry.ints[3];
+
+            iw3::DepthResizer resizer;
+            std::vector<float> got;
+            resizer.resize(entry.inputs.data(), inWidth, inHeight, got, outWidth, outHeight);
+            // Looser than the 2e-6 the depth cases use, and for a stated
+            // reason: those compare against numpy in float64, these against
+            // torch in float32, which sums the taps in a different order. The
+            // torch answer is the one iw3 actually computes, so it is the
+            // better reference even though it agrees slightly less closely.
+            expectClose(entry.name, got, entry.outputs, 1e-5);
+        }
+        else if (entry.name.rfind("mlbw_warp_", 0) == 0)
+        {
+            const int width = entry.ints[0], height = entry.ints[1];
+            const int depthWidth = entry.ints[2], depthHeight = entry.ints[3];
+
+            const size_t pixels = size_t(width) * size_t(height);
+            const size_t depthPixels = size_t(depthWidth) * size_t(depthHeight);
+            const float* image = entry.inputs.data();
+            const float* delta = image + pixels * 3;
+            const float* layerWeight = delta + depthPixels * 2;
+
+            std::vector<float> got;
+            iw3::mlbwWarp(image, width, height, delta, layerWeight,
+                          depthWidth, depthHeight, got);
+
+            // Same bar as monobw's warped eye. The sample lands between pixels,
+            // so what is being compared is a sub-pixel position difference
+            // times the local gradient.
+            expectClose(entry.name, got, entry.outputs, 1e-5);
+        }
+        else if (entry.name.rfind("mlbw_mask_", 0) == 0)
+        {
+            const int width = entry.ints[0], height = entry.ints[1];
+            const int depthWidth = entry.ints[2], depthHeight = entry.ints[3];
+            const int inner = entry.ints[4], outer = entry.ints[5];
+
+            std::vector<float> got;
+            iw3::mlbwMask(entry.inputs.data(), depthWidth, depthHeight,
+                          width, height, inner, outer, got);
+
+            // Exact, and here that is a stronger claim than it is for monobw.
+            // This mask is a threshold on a *resized* continuous value, so a
+            // pixel disagrees whenever the upscale differs in its last bit
+            // near the boundary. Anything above zero means the resize or the
+            // sigmoid is not iw3's, not that floating point drifted.
+            ++checks;
+            size_t wrong = 0;
+            for (size_t i = 0; i < got.size() && i < entry.outputs.size(); ++i)
+            {
+                if (got[i] != entry.outputs[i]) ++wrong;
+            }
+            if (got.size() != entry.outputs.size() || wrong != 0)
+            {
+                std::printf("  FAIL %-44s %zu of %zu pixels differ\n",
+                            entry.name.c_str(), wrong, entry.outputs.size());
+                ++failures;
+            }
+            else
+            {
+                size_t set = 0;
+                for (float value : entry.outputs) if (value != 0.0f) ++set;
+                std::printf("  ok   %-44s %zu of %zu pixels, exact\n",
+                            entry.name.c_str(), set, entry.outputs.size());
+            }
+        }
+        else if (entry.name.rfind("mlbw_eye_", 0) == 0)
+        {
+            // Handled by the GPU test, which is where the mirroring lives.
+            // Skipped rather than reported as unhandled so the count stays
+            // honest about what this binary actually checks.
+            continue;
+        }
         else
         {
             std::printf("  ??   %s (no handler)\n", entry.name.c_str());

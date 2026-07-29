@@ -1,5 +1,6 @@
 #include "stereo_pipeline.h"
 
+#include "mlbw_math.h"
 #include "monobw_math.h"
 #include "numeric_math.h"
 
@@ -424,6 +425,136 @@ void maskPreprocess(const float* mask, int width, int height,
         {
             out[size_t(y) * size_t(width) + size_t(x)] =
                 iw3::math::maskFinishAt(source, mask, width, x, y, outer, inner);
+        }
+    }
+}
+
+// --- mlbw_l2_inpaint ---------------------------------------------------------
+
+void mlbwWarp(const float* image, int width, int height,
+              const float* delta, const float* layerWeight,
+              int depthWidth, int depthHeight,
+              std::vector<float>& eye)
+{
+    const size_t depthPixels = size_t(depthWidth) * size_t(depthHeight);
+    const size_t pixels = size_t(width) * size_t(height);
+    const float deltaScale = float(1.0 / double(depthWidth / 2 - 1));
+
+    // The grid, at the depth's resolution, one plane per layer for x and one
+    // shared for y. Built here rather than per pixel because every output pixel
+    // reads four of its taps, so recomputing it would be four times the work
+    // and, more to the point, would not be the same rounding.
+    std::vector<float> gridX(depthPixels * size_t(iw3::math::kMlbwLayers));
+    std::vector<float> gridY(depthPixels);
+    for (int layer = 0; layer < iw3::math::kMlbwLayers; ++layer)
+    {
+        const float* deltaPlane = delta + size_t(layer) * depthPixels;
+        float* out = gridX.data() + size_t(layer) * depthPixels;
+        for (int y = 0; y < depthHeight; ++y)
+        {
+            for (int x = 0; x < depthWidth; ++x)
+            {
+                out[size_t(y) * size_t(depthWidth) + size_t(x)] =
+                    iw3::math::mlbwGridXAt(deltaPlane, depthWidth, depthHeight,
+                                           x, y, deltaScale);
+            }
+        }
+    }
+    for (int y = 0; y < depthHeight; ++y)
+    {
+        const float value = iw3::math::mlbwGridYAt(depthHeight, y);
+        for (int x = 0; x < depthWidth; ++x)
+        {
+            gridY[size_t(y) * size_t(depthWidth) + size_t(x)] = value;
+        }
+    }
+
+    // The weights, resized to the frame with the antialiased resampler -- the
+    // same buildResampleAxis the depth resize uses. Unconditional would be
+    // wrong here: iw3 skips the resize entirely when the sizes already match,
+    // and while an antialiased resize to the same size *is* the identity, going
+    // through it would still round.
+    std::vector<float> weights;
+    const float* weightPlanes = layerWeight;
+    if (width != depthWidth || height != depthHeight)
+    {
+        DepthResizer resizer;
+        std::vector<float> plane;
+        weights.resize(pixels * size_t(iw3::math::kMlbwLayers));
+        for (int layer = 0; layer < iw3::math::kMlbwLayers; ++layer)
+        {
+            resizer.resize(layerWeight + size_t(layer) * depthPixels,
+                           depthWidth, depthHeight, plane, width, height);
+            std::copy(plane.begin(), plane.end(),
+                      weights.begin() + ptrdiff_t(size_t(layer) * pixels));
+        }
+        weightPlanes = weights.data();
+    }
+
+    eye.assign(pixels * 3, 0.0f);
+    for (int channel = 0; channel < 3; ++channel)
+    {
+        const float* plane = image + size_t(channel) * pixels;
+        float* out = eye.data() + size_t(channel) * pixels;
+        for (int y = 0; y < height; ++y)
+        {
+            for (int x = 0; x < width; ++x)
+            {
+                const size_t index = size_t(y) * size_t(width) + size_t(x);
+                float layerValues[iw3::math::kMlbwLayers];
+                for (int layer = 0; layer < iw3::math::kMlbwLayers; ++layer)
+                {
+                    layerValues[layer] = iw3::math::mlbwWarpSampleAt(
+                        plane, width, height,
+                        gridX.data() + size_t(layer) * depthPixels, gridY.data(),
+                        depthWidth, depthHeight, x, y);
+                }
+                out[index] = iw3::math::mlbwBlendAt(layerValues, weightPlanes,
+                                                    pixels, index,
+                                                    iw3::math::kMlbwLayers);
+            }
+        }
+    }
+}
+
+void mlbwMask(const float* logits, int depthWidth, int depthHeight,
+              int width, int height, int innerDilation, int outerDilation,
+              std::vector<float>& out)
+{
+    const size_t depthPixels = size_t(depthWidth) * size_t(depthHeight);
+    const int outer = iw3::math::maskDilateIterations(outerDilation, width, depthWidth);
+    const int inner = iw3::math::maskDilateIterations(innerDilation, width, depthWidth);
+
+    // closing(n_iter=1) on the logits: one dilate then one erode, on the
+    // greyscale values, before any sigmoid. Two buffers because each pass reads
+    // its input's whole 3x3 neighbourhood.
+    std::vector<float> dilated(depthPixels, 0.0f);
+    std::vector<float> closed(depthPixels, 0.0f);
+    for (int y = 0; y < depthHeight; ++y)
+    {
+        for (int x = 0; x < depthWidth; ++x)
+        {
+            dilated[size_t(y) * size_t(depthWidth) + size_t(x)] =
+                iw3::math::maskDilateAt(logits, depthWidth, depthHeight, x, y);
+        }
+    }
+    for (int y = 0; y < depthHeight; ++y)
+    {
+        for (int x = 0; x < depthWidth; ++x)
+        {
+            closed[size_t(y) * size_t(depthWidth) + size_t(x)] =
+                iw3::math::maskErodeAt(dilated.data(), depthWidth, depthHeight, x, y);
+        }
+    }
+
+    out.assign(size_t(width) * size_t(height), 0.0f);
+    for (int y = 0; y < height; ++y)
+    {
+        for (int x = 0; x < width; ++x)
+        {
+            out[size_t(y) * size_t(width) + size_t(x)] =
+                iw3::math::mlbwMaskAt(closed.data(), depthWidth, depthHeight,
+                                      width, height, x, y, outer, inner);
         }
     }
 }
