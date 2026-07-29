@@ -92,9 +92,15 @@ something else.
 4. dilates **inner then outer** — the opposite order to `monobw`'s
    `preprocess_mask`, which does outer then inner.
 
-Step 4 does not commute in general, and step 1 operating on logits rather than
-on a binary mask means the existing `mask_closing` is the wrong function. Both
-are the kind of detail that a diff-0 test catches and a reading does not.
+Steps 1–3 each change the answer, and step 1 operating on logits rather than on
+a binary mask means the existing `mask_closing` is the wrong function — the kind
+of detail a diff-0 test catches and a reading does not.
+
+Step 4 turns out not to matter, which is worth recording because the first draft
+of this plan asserted the opposite. They are two morphological dilations by
+opposite unit structuring elements, and dilation commutes; measured over 3200
+cases including ones saturating against the frame edge, swapping the order
+changes nothing. Keep iw3's order, but do not spend a test on it.
 
 ## The gating unknown: shifted-window attention through ONNX — ANSWERED, green
 
@@ -143,7 +149,20 @@ Each stage ends somewhere committable, and each has a bar that is a number.
 
 **0 — probe the export.** **Done**, green. Above.
 
-**1 — `MLBW` standalone in PyTorch, diff 0.** Into `stereo_warp.py` beside
+**1 — `MLBW` standalone in PyTorch, diff 0.** **Done.** 22 cases at max absolute
+difference **0** against `create_stereo_model("mlbw_l2_inpaint", ...)` driven
+through `apply_divergence`, sharing the axis sweep with the monobw suite.
+
+Nine mutations were run against the finished port to check the suite has teeth;
+seven were caught, by 1 to 54 failing cases each. The two survivors were both
+the test suite telling the truth: the dilation order genuinely does not matter
+(above), and iw3's float32 cast before the softmax is a no-op under autocast,
+because autocast already promotes softmax to fp32. That cast is not dead code —
+it is what keeps stage 2's fp16 graph honest, where the same softmax lands
+2.4e-4 away — but nothing at stage 1 can observe it, and a test pretending
+otherwise would have been a test of nothing.
+
+Original plan for this stage, kept for the record: into `stereo_warp.py` beside
 `RowFlowV3`, not `stereo_inpaint.py`: it is a warp network and it shares
 `RowFlowV3`'s attention machinery. Bar: max absolute difference **0** against
 `create_stereo_model("mlbw_l2_inpaint", ...)` driven through `apply_divergence`,

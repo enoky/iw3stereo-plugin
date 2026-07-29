@@ -28,6 +28,7 @@ sys.path.insert(0, REPO_ROOT)
 sys.path.insert(0, NUNIF_ROOT)
 
 import stereo_inpaint  # noqa: E402
+import stereo_warp  # noqa: E402
 
 from iw3 import models as _iw3_models  # noqa: E402,F401  (registers sbs.monobw)
 from iw3.stereo_model_factory import create_stereo_model  # noqa: E402
@@ -35,6 +36,8 @@ from iw3.utils import apply_divergence  # noqa: E402
 
 CHECKPOINT = os.path.join(NUNIF_ROOT, "iw3", "pretrained_models", "hub", "checkpoints",
                           "iw3_light_inpaint_v1_20250919.pth")
+MASK_MLBW_CHECKPOINT = os.path.join(NUNIF_ROOT, "iw3", "pretrained_models", "hub", "checkpoints",
+                                    "iw3_mask_mlbw_l2_d1_20250903.pth")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DEVICE_ID = 0 if DEVICE == "cuda" else -1
@@ -84,17 +87,23 @@ def make_pair(height, width, depth_height=None, depth_width=None, batch=1, seed=
     return image.to(device), depth.to(device)
 
 
-class GoldenInpaintTest(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        if not os.path.exists(CHECKPOINT):
-            raise unittest.SkipTest(f"checkpoint not downloaded: {CHECKPOINT}")
-        cls.reference_model = create_stereo_model("monobw_inpaint", divergence=2.0, device_id=DEVICE_ID)
-        cls.reference_model.set_mode("image")
-        cls.model = stereo_inpaint.load_monobw_inpaint(CHECKPOINT, device=DEVICE)
+class _GoldenInpaintCases:
+    """The axis sweep, run against both inpaint pipelines.
+
+    They share the fill, the mirroring and the compositing, and differ only in
+    how the eyes and the holes are produced. So a case that passes for one and
+    fails for the other is pointing straight at the warp or the mask -- which
+    is the only half that differs.
+
+    Not a TestCase itself, so unittest does not collect it directly.
+    """
+
+    METHOD = None
+    model = None
+    reference_model = None
 
     def assert_identical(self, image, depth, **settings):
-        args = Args(**settings)
+        args = Args(method=self.METHOD, **settings)
 
         with torch.inference_mode():
             reference = apply_divergence(depth.clone(), image.clone(), args, self.reference_model)
@@ -222,19 +231,6 @@ class GoldenInpaintTest(unittest.TestCase):
         image, depth = make_pair(96, 160, device=DEVICE)
         self.assert_identical(image, depth, disable_amp=True)
 
-    def test_cpu(self):
-        image, depth = make_pair(96, 160, device="cpu")
-        model = stereo_inpaint.load_monobw_inpaint(CHECKPOINT, device="cpu")
-        reference_model = create_stereo_model("monobw_inpaint", divergence=2.0, device_id=-1)
-        reference_model.set_mode("image")
-        args = Args()
-        with torch.inference_mode():
-            reference = apply_divergence(depth.clone(), image.clone(), args, reference_model)
-            actual = stereo_inpaint.synthesize_stereo_inpaint(image.clone(), depth.clone(), model)
-        for eye, expected, got in zip(("left", "right"), reference, actual):
-            diff = (expected.float() - got.float()).abs().max().item()
-            self.assertEqual(diff, 0.0, f"cpu {eye} diff {diff} != 0")
-
     # -- combinations ------------------------------------------------------
 
     def test_combinations(self):
@@ -278,21 +274,32 @@ class GoldenInpaintTest(unittest.TestCase):
                          "synthetic_view='left' must pass the right eye through untouched")
         self.assertGreater((left_only - image).abs().max().item(), 0.05)
 
+    # -- the warp half, reached without the fill ---------------------------
+
+    def bare_left_warp(self, image, depth, divergence):
+        """The left eye and its binary hole mask, with the inpaint skipped.
+
+        ``divergence`` is the user-facing value; each pipeline applies whatever
+        doubling its own ``synthetic_view="left"`` path applies. How the mask is
+        arrived at differs completely between the two -- computed for monobw,
+        predicted for mlbw -- which is exactly why this is a hook.
+        """
+        raise NotImplementedError
+
     def test_inpaint_changes_the_warp(self):
         """The inpaint half must contribute, not just pass the warp through.
 
         Every case above loads the same checkpoint on both sides, so a wiring
         mistake that skipped the network entirely -- an all-zero mask, say --
         would agree with iw3 only if iw3 skipped it too. It does not: compare
-        against the bare MonoBW warp and the two must disagree.
+        against the bare warp and the two must disagree.
         """
         image, depth = make_pair(96, 160, device=DEVICE)
         with torch.inference_mode():
             inpainted, _ = stereo_inpaint.synthesize_stereo_inpaint(
                 image, depth, self.model, divergence=10.0, convergence=0.5,
                 synthetic_view="left")
-            warped, mask = self.model.monobw(
-                image, depth, divergence=20.0, convergence=0.5, return_mask=True)
+            warped, mask = self.bare_left_warp(image, depth, divergence=10.0)
 
         self.assertGreater(mask.float().mean().item(), 0.0, "no holes to fill; the test proves nothing")
         difference = (inpainted - warped).abs().max().item()
@@ -303,11 +310,95 @@ class GoldenInpaintTest(unittest.TestCase):
         """The mask must track the occluders, not be uniform or empty."""
         image, depth = make_pair(96, 160, device=DEVICE)
         with torch.inference_mode():
-            _, mask = self.model.monobw(image, depth, divergence=10.0, convergence=0.5,
-                                        return_mask=True)
+            _, mask = self.bare_left_warp(image, depth, divergence=10.0)
         coverage = mask.float().mean().item()
         self.assertGreater(coverage, 0.001, "mask is empty")
         self.assertLess(coverage, 0.5, "mask covers half the frame; that is not a hole mask")
+
+
+class GoldenInpaintTest(_GoldenInpaintCases, unittest.TestCase):
+    METHOD = "monobw_inpaint"
+
+    @classmethod
+    def setUpClass(cls):
+        if not os.path.exists(CHECKPOINT):
+            raise unittest.SkipTest(f"checkpoint not downloaded: {CHECKPOINT}")
+        cls.reference_model = create_stereo_model("monobw_inpaint", divergence=2.0, device_id=DEVICE_ID)
+        cls.reference_model.set_mode("image")
+        cls.model = stereo_inpaint.load_monobw_inpaint(CHECKPOINT, device=DEVICE)
+
+    def test_cpu(self):
+        image, depth = make_pair(96, 160, device="cpu")
+        model = stereo_inpaint.load_monobw_inpaint(CHECKPOINT, device="cpu")
+        reference_model = create_stereo_model("monobw_inpaint", divergence=2.0, device_id=-1)
+        reference_model.set_mode("image")
+        args = Args()
+        with torch.inference_mode():
+            reference = apply_divergence(depth.clone(), image.clone(), args, reference_model)
+            actual = stereo_inpaint.synthesize_stereo_inpaint(image.clone(), depth.clone(), model)
+        for eye, expected, got in zip(("left", "right"), reference, actual):
+            diff = (expected.float() - got.float()).abs().max().item()
+            self.assertEqual(diff, 0.0, f"cpu {eye} diff {diff} != 0")
+
+    def bare_left_warp(self, image, depth, divergence):
+        warped, mask = self.model.monobw(image, depth, divergence=divergence * 2,
+                                         convergence=0.5, return_mask=True)
+        return warped, mask > 0
+
+
+class GoldenMLBWInpaintTest(_GoldenInpaintCases, unittest.TestCase):
+    """The same sweep against ``mlbw_l2_inpaint``.
+
+    The two pipelines put pressure on different things, which is why running
+    both is worth more than running either twice. MonoBW's holes are arithmetic
+    -- where inverting the index map had to stretch, there is one -- so its mask
+    can be reasoned about independently. This one's holes are a network output,
+    and diff 0 against iw3 is the *only* check on them there is.
+    """
+
+    METHOD = "mlbw_l2_inpaint"
+
+    @classmethod
+    def setUpClass(cls):
+        for path in (CHECKPOINT, MASK_MLBW_CHECKPOINT):
+            if not os.path.exists(path):
+                raise unittest.SkipTest(f"checkpoint not downloaded: {path}")
+        cls.reference_model = create_stereo_model("mlbw_l2_inpaint", divergence=2.0, device_id=DEVICE_ID)
+        cls.reference_model.set_mode("image")
+        cls.model = stereo_inpaint.load_mlbw_inpaint(CHECKPOINT, MASK_MLBW_CHECKPOINT, device=DEVICE)
+
+    def bare_left_warp(self, image, depth, divergence):
+        left_eye, _, mask_logits, _ = stereo_warp.apply_divergence_mlbw(
+            self.model.mask_mlbw, image, depth,
+            divergence=divergence, convergence=0.5, synthetic_view="left")
+        mask = stereo_inpaint._postprocess_hole_mask(
+            mask_logits, target_size=left_eye.shape[-2:],
+            threshold=stereo_inpaint.MASK_MLBW_THRESHOLD)
+        return left_eye, mask
+
+    def test_the_two_layers_are_both_used(self):
+        """A single-layer warp would pass every case above.
+
+        The eye is a softmax-weighted sum of two backward warps. If the port
+        collapsed to one layer -- taking an argmax, or dropping the second
+        channel -- it would still be a plausible-looking warp, and every diff-0
+        case here compares against iw3 rather than against a warp with one
+        layer. So check the weights themselves: both layers have to carry real
+        weight somewhere in the frame.
+        """
+        image, depth = make_pair(96, 160, device=DEVICE)
+        x = stereo_warp._make_input_tensor(
+            depth, divergence=2.0, convergence=0.5,
+            image_width=max(depth.shape[-2:]), preserve_screen_border=False)
+        with torch.inference_mode():
+            _, layer_weight, _ = self.model.mask_mlbw(x)
+
+        self.assertEqual(layer_weight.shape[1], 2)
+        # softmax, so they sum to 1 everywhere by construction; the question is
+        # whether either one is dead.
+        for layer in range(2):
+            peak = layer_weight[:, layer].max().item()
+            self.assertGreater(peak, 0.5, f"layer {layer} never leads anywhere")
 
 
 class GoldenVideoInpaintTest(unittest.TestCase):

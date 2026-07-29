@@ -34,21 +34,27 @@ import torch.nn.functional as F
 __all__ = [
     "RowFlowV2",
     "RowFlowV3",
+    "MLBW",
     "load_row_flow_v2",
     "load_row_flow_v3",
+    "load_mask_mlbw_l2",
     "load_stereo_model",
+    "apply_divergence_mlbw",
     "get_mapper",
     "synthesize_stereo",
     "ROW_FLOW_V2_URL",
     "ROW_FLOW_V3_URL",
+    "MASK_MLBW_L2_D1_URL",
 ]
 
 _RELEASE = "https://github.com/nagadomi/nunif/releases/download/0.0.0/"
 ROW_FLOW_V2_URL = _RELEASE + "iw3_row_flow_v2_20240130.pth"
 ROW_FLOW_V3_URL = _RELEASE + "iw3_row_flow_v3_20250627.pth"
+MASK_MLBW_L2_D1_URL = _RELEASE + "iw3_mask_mlbw_l2_d1_20250903.pth"
 
 MODEL_NAME = "sbs.row_flow_v2"
 MODEL_NAME_V3 = "sbs.row_flow_v3"
+MODEL_NAME_MLBW = "sbs.mlbw"
 
 # The model is trained with a 28 pixel replication pad, cropped off again after
 # inference, so the convolutions never see the frame edge.
@@ -272,16 +278,29 @@ class _MHA(nn.Module):
 
 
 class _WindowMHA2d(nn.Module):
-    def __init__(self, channels, num_heads, window):
+    def __init__(self, channels, num_heads, window, shift=(False, False)):
         super().__init__()
         self.window = window
+        # iw3's "shift" is not a roll. It pads half a window of zeros onto each
+        # shifted axis, which moves every window boundary by half a window, and
+        # crops the padding off again afterwards. row_flow_v3 never shifts;
+        # MLBW alternates shifted and unshifted blocks so that tokens are not
+        # always partitioned along the same lines.
+        self.pad_h = window[0] // 2 if shift[0] else 0
+        self.pad_w = window[1] // 2 if shift[1] else 0
         self.mha = _MHA(channels, num_heads)
 
     def forward(self, x, attn_mask=None, export_safe=False):
+        if self.pad_h or self.pad_w:
+            x = F.pad(x, (self.pad_w, self.pad_w, self.pad_h, self.pad_h),
+                      mode="constant", value=0)
         shape = x.shape
         x = _window_partition(x, self.window)
         x = self.mha(x, attn_mask=attn_mask, export_safe=export_safe)
-        return _window_merge(x, shape, self.window)
+        x = _window_merge(x, shape, self.window)
+        if self.pad_h or self.pad_w:
+            x = F.pad(x, (-self.pad_w, -self.pad_w, -self.pad_h, -self.pad_h))
+        return x
 
 
 class _WABlock(nn.Module):
@@ -376,12 +395,155 @@ def load_row_flow_v3(path=None, device="cpu", export_safe=False):
     return model.eval().to(device)
 
 
+class _MLBWBlock(nn.Module):
+    """MLBW's WABlock.
+
+    ``_WABlock`` with two differences that both matter: the window attention can
+    shift, and the MLP has no trailing activation.
+    """
+
+    def __init__(self, channels, window, shift, num_heads):
+        super().__init__()
+        self.mha = _WindowMHA2d(channels, num_heads=num_heads, window=window, shift=shift)
+        self.conv_mlp = nn.Sequential(*[
+            nn.Conv2d(channels, channels, kernel_size=1, stride=1, padding=0),
+            nn.GELU(),
+            nn.ReplicationPad2d((1, 1, 1, 1)),
+            nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=0),
+        ])
+        self.bias = _WindowScoreBias(window)
+
+    def forward(self, x, export_safe=False):
+        x = x + self.mha(x, attn_mask=self.bias(), export_safe=export_safe)
+        return x + self.conv_mlp(x)
+
+
+class MLBW(nn.Module):
+    """iw3's ``mask_mlbw_l2``, inference path only, in ``delta_output`` mode.
+
+    Input is the same (B, 3, H, W) as RowFlowV3 -- disparity, divergence
+    feature, convergence feature -- but the output is three tensors rather than
+    one, and none of them is a finished delta:
+
+      ``delta``             (B, num_layers, H, W), one x-shift per layer
+      ``layer_weight``      (B, num_layers, H, W), softmax over the layer axis
+      ``hole_mask_logits``  (B, 1, H, W), *logits*, at this input's resolution
+
+    "Multi-layer backward warp" means the eye is a weighted sum of one backward
+    warp per layer, not a single warp. That is how the model expresses a pixel
+    that could plausibly come from two places -- a foreground edge and the
+    background behind it -- instead of having to choose. The hole mask is the
+    third head, and it is a prediction rather than the geometric fact MonoBW
+    computes.
+    """
+
+    DOWNSCALE = (1, 8)
+    MOD = 4
+
+    def __init__(self, num_layers=2, base_dim=32, hole_mask=True):
+        super().__init__()
+        self.num_layers = num_layers
+        self.hole_mask = hole_mask
+        channels = base_dim * num_layers
+        pack = self.DOWNSCALE[0] * self.DOWNSCALE[1]
+        self.lv1_in = nn.Sequential(*[
+            nn.ReplicationPad2d((4, 4, 0, 0)),
+            nn.Conv2d(3, channels // pack, kernel_size=(1, 9), stride=1, padding=0),
+            nn.LeakyReLU(0.2, inplace=False),
+        ])
+        self.lv2 = nn.Sequential(*[
+            _MLBWBlock(channels, (4, 4), shift=(True, True), num_heads=num_layers),
+            _MLBWBlock(channels, (4, 4), shift=(False, False), num_heads=num_layers),
+            _MLBWBlock(channels, (4, 4), shift=(True, True), num_heads=num_layers),
+            _MLBWBlock(channels, (4, 4), shift=(False, False), num_heads=num_layers),
+        ])
+        self.lv1_out = nn.Sequential(*[
+            nn.ReplicationPad2d((4, 4, 0, 0)),
+            nn.Conv2d(channels // pack, num_layers * 2 + (1 if hole_mask else 0),
+                      kernel_size=(1, 9), stride=1, padding=0),
+        ])
+        self.export_safe = False
+
+    def forward(self, x):
+        height, width = x.shape[2], x.shape[3]
+        mod_h = self.MOD * self.DOWNSCALE[0]
+        mod_w = self.MOD * self.DOWNSCALE[1]
+
+        # Symmetric, and never zero: at an exact multiple of the block size iw3
+        # still pads a whole block rather than none, because the amount is
+        # `mod - width % mod` and not `-width % mod`. That looks like an
+        # oversight and is not one to fix here -- the network was trained with
+        # it, so the output depends on it.
+        pad_w = mod_w - width % mod_w
+        pad_h = mod_h - height % mod_h
+        pad_w1, pad_h1 = pad_w // 2, pad_h // 2
+        x = F.pad(x, (pad_w1, pad_w - pad_w1, pad_h1, pad_h - pad_h1), mode="replicate")
+
+        x = x1 = self.lv1_in(x)
+        x = _pixel_unshuffle(x, self.DOWNSCALE)
+        for block in self.lv2:
+            x = block(x, export_safe=self.export_safe)
+        x = _pixel_shuffle(x, self.DOWNSCALE)
+        x = self.lv1_out(x + x1)
+        # iw3 crops with a negative F.pad. A slice is the same values and, being
+        # data rather than a Python int tuple, stays dynamic under export.
+        x = x[:, :, pad_h1:pad_h1 + height, pad_w1:pad_w1 + width]
+
+        layers = self.num_layers
+        delta = x[:, :layers]
+        layer_weight = x[:, layers:layers * 2]
+        hole_mask_logits = x[:, layers * 2:]
+
+        # iw3's float32 cast. Under autocast it does nothing -- softmax is on
+        # autocast's promote-to-fp32 list, so the cast has already happened.
+        # It earns its place in a half-precision graph running *without*
+        # autocast, which is what the ONNX export is: there, softmax over fp16
+        # lands about 2.4e-4 from the fp32 answer, which is a visible amount of
+        # a blend weight. Kept for that case, not for this one.
+        layer_weight = F.softmax(layer_weight.to(torch.float32), dim=1)
+
+        return delta.to(torch.float32), layer_weight, hole_mask_logits.to(torch.float32)
+
+
+def load_mask_mlbw_l2(path=None, device="cpu", export_safe=False):
+    """Load the published ``mask_mlbw_l2`` checkpoint.
+
+    Only a ``d1`` checkpoint exists for the masked variant, so unlike plain
+    ``mlbw_l2`` -- which ships d1/d2/d3 and picks between them by divergence --
+    one set of weights covers every divergence.
+    """
+    if path is None:
+        data = torch.hub.load_state_dict_from_url(MASK_MLBW_L2_D1_URL, weights_only=True,
+                                                  map_location="cpu")
+    else:
+        data = torch.load(path, map_location="cpu", weights_only=True)
+
+    if "nunif_model" not in data:
+        raise ValueError("not a nunif checkpoint")
+    # The checkpoint is named for the class rather than the factory: every MLBW
+    # variant says "sbs.mlbw" and they are told apart by kwargs.
+    if data.get("name") != MODEL_NAME_MLBW:
+        raise ValueError(f"expected {MODEL_NAME_MLBW}, got {data.get('name')!r}")
+    kwargs = data.get("kwargs") or {}
+    if not kwargs.get("hole_mask"):
+        raise ValueError("expected a hole_mask checkpoint, got plain mlbw")
+
+    model = MLBW(num_layers=kwargs.get("num_layers", 2),
+                 base_dim=kwargs.get("base_dim", 32),
+                 hole_mask=True)
+    model.load_state_dict(data["state_dict"], strict=True)
+    model.export_safe = export_safe
+    return model.eval().to(device)
+
+
 def load_stereo_model(name, path=None, device="cpu", **kwargs):
-    """``"row_flow_v2"`` or ``"row_flow_v3"``."""
+    """``"row_flow_v2"``, ``"row_flow_v3"`` or ``"mask_mlbw_l2"``."""
     if name == "row_flow_v2":
         return load_row_flow_v2(path, device=device)
     elif name == "row_flow_v3":
         return load_row_flow_v3(path, device=device, **kwargs)
+    elif name == "mask_mlbw_l2":
+        return load_mask_mlbw_l2(path, device=device, **kwargs)
     raise ValueError(f"unknown model {name!r}")
 
 
@@ -639,6 +801,101 @@ def _warp_one_view(model, c, depth, divergence, convergence, steps, shift,
         z = torch.flip(z, (3,))
 
     return z
+
+
+def _pad_delta_y(delta_x):
+    """(B, L, H, W) -> (B, L*2, H, W), interleaving a zero y-shift after each x.
+
+    ``_backward_warp`` wants a two-channel delta per layer. The model predicts
+    only the horizontal half, because the disparity it models is horizontal.
+    """
+    return torch.stack([delta_x, torch.zeros_like(delta_x)], dim=2).flatten(1, 2)
+
+
+def _warp_one_view_mlbw(model, c, depth, divergence, convergence, shift,
+                        preserve_screen_border, enable_amp):
+    """One synthetic eye from MLBW, plus that eye's hole-mask logits.
+
+    Same mirror-and-mirror-back trick as ``_warp_one_view``: the model is
+    trained for the left eye only, so the right one is made by flipping the
+    inputs, warping, and flipping the result. The mask travels with it.
+
+    The eye is a *weighted sum* of one backward warp per layer rather than a
+    single warp, which is the whole point of the architecture.
+
+    Returns ``(eye, hole_mask_logits)``. The logits are raw -- not sigmoided,
+    not thresholded, and still at the depth's resolution. Turning them into a
+    mask is ``_postprocess_hole_mask``'s job, and it needs them in this form.
+    """
+    if shift > 0:
+        c = torch.flip(c, (3,))
+        depth = torch.flip(depth, (3,))
+
+    B, _, H, W = depth.shape
+    base_size = max(H, W)
+
+    x = _make_input_tensor(depth,
+                           divergence=divergence,
+                           convergence=convergence,
+                           image_width=base_size,
+                           preserve_screen_border=preserve_screen_border)
+    with _autocast(device=depth.device, enabled=enable_amp):
+        delta, layer_weight, hole_mask_logits = model(x)
+
+    # The weights are blended up to the frame's size, the deltas are not --
+    # _backward_warp interpolates the finished grid instead. Note antialias=True
+    # here against the grid's antialias=False: iw3 treats a weight map as an
+    # image to be resampled and a grid as a coordinate field to be resampled,
+    # and they are not the same operation.
+    if c.shape[2] != layer_weight.shape[2] or c.shape[3] != layer_weight.shape[3]:
+        layer_weight = F.interpolate(layer_weight, size=c.shape[-2:],
+                                     mode="bilinear", align_corners=True, antialias=True)
+
+    # The depth's width, not the image's, as everywhere else in this pipeline.
+    delta_scale = torch.tensor(1.0 / (W // 2 - 1), dtype=c.dtype, device=c.device)
+    delta = _pad_delta_y(delta)
+    grid = _make_grid(B, W, H, c.device)
+
+    z = torch.zeros_like(c)
+    for layer in range(model.num_layers):
+        d = delta[:, layer * 2:layer * 2 + 2]
+        w = layer_weight[:, layer:layer + 1]
+        z = z + _backward_warp(c, grid, d, delta_scale) * w
+    z = z.clamp(0, 1)
+
+    if shift > 0:
+        z = z.flip((3,))
+        hole_mask_logits = hole_mask_logits.flip((3,))
+
+    return z, hole_mask_logits
+
+
+def apply_divergence_mlbw(model, c, depth, divergence, convergence, synthetic_view,
+                          preserve_screen_border=False, enable_amp=True):
+    """Both eyes out of one MLBW, plus the hole-mask logits for each synthesised one.
+
+    A non-synthesised eye is the source frame itself and has no mask, which is
+    what tells the inpaint half to leave it alone.
+    """
+    if synthetic_view == "both":
+        left_eye, left_mask = _warp_one_view_mlbw(
+            model, c, depth, divergence=divergence, convergence=convergence, shift=-1,
+            preserve_screen_border=preserve_screen_border, enable_amp=enable_amp)
+        right_eye, right_mask = _warp_one_view_mlbw(
+            model, c, depth, divergence=divergence, convergence=convergence, shift=1,
+            preserve_screen_border=preserve_screen_border, enable_amp=enable_amp)
+    elif synthetic_view == "right":
+        left_eye, left_mask = c, None
+        right_eye, right_mask = _warp_one_view_mlbw(
+            model, c, depth, divergence=divergence * 2, convergence=convergence, shift=1,
+            preserve_screen_border=preserve_screen_border, enable_amp=enable_amp)
+    else:
+        left_eye, left_mask = _warp_one_view_mlbw(
+            model, c, depth, divergence=divergence * 2, convergence=convergence, shift=-1,
+            preserve_screen_border=preserve_screen_border, enable_amp=enable_amp)
+        right_eye, right_mask = c, None
+
+    return left_eye, right_eye, left_mask, right_mask
 
 
 def _resize_depth(depth, image_shape, stereo_width):

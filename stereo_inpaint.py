@@ -65,7 +65,9 @@ from stereo_warp import (
     _pixel_unshuffle,
     _window_merge,
     _window_partition,
+    apply_divergence_mlbw,
     get_mapper,
+    load_mask_mlbw_l2,
 )
 
 __all__ = [
@@ -73,12 +75,15 @@ __all__ = [
     "LightInpaintV1",
     "LightVideoInpaintV1",
     "MonoBWInpaintImage",
+    "MLBWInpaintImage",
     "load_light_inpaint_v1",
     "load_light_video_inpaint_v1",
     "load_monobw_inpaint",
+    "load_mlbw_inpaint",
     "synthesize_stereo_inpaint",
     "LIGHT_INPAINT_V1_URL",
     "LIGHT_VIDEO_INPAINT_V1_URL",
+    "MASK_MLBW_THRESHOLD",
     "SEQ_LEN",
 ]
 
@@ -88,6 +93,10 @@ LIGHT_VIDEO_INPAINT_V1_URL = _RELEASE + "iw3_light_video_inpaint_v1_20250919.pth
 
 MODEL_NAME = "inpaint.light_inpaint_v1"
 VIDEO_MODEL_NAME = "inpaint.light_video_inpaint_v1"
+
+# iw3's MASK_MLBW_THRESHOLD. The mask_mlbw head is calibrated to fire well below
+# an even split, so this is not 0.5 and moving it towards 0.5 loses holes.
+MASK_MLBW_THRESHOLD = 0.15
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +224,44 @@ def _dilate_inner(mask, n_iter, base_width=None):
     for _ in range(n_iter):
         mask = mask | F.pad(mask, (0, 1, 0, 0))[:, :, :, 1:]
     return mask.to(mask_dtype)
+
+
+def _postprocess_hole_mask(mask_logits, target_size, threshold,
+                           inner_dilation=0, outer_dilation=0):
+    """iw3's ``postprocess_hole_mask``: predicted logits -> a binary hole mask.
+
+    This is *not* ``MonoBWInpaintImage.preprocess_mask`` with different
+    constants. Three things differ, and each of them changes the answer:
+
+      1. the closing runs on the **logits**, before any sigmoid, so it is a
+         greyscale morphological closing rather than a binary one;
+      2. the upscale to the frame's size is bilinear rather than nearest, and
+         happens while the value is still continuous;
+      3. the threshold is a sigmoid against 0.15, not "> 0".
+
+    A fourth difference is only apparent: the dilations run inner then outer,
+    the opposite order to the monobw path. That one is free. They are two
+    morphological dilations by opposite unit structuring elements, and dilation
+    commutes, so the order cannot change the mask -- measured over 3200 cases
+    including ones saturating against the frame edge, the disagreement is zero.
+    iw3's order is kept because there is no reason not to, but nothing rests on
+    it, and a test that claimed to pin it down would be testing nothing.
+
+    ``base_width`` is read off the logits rather than passed in, because the
+    dilation counts are quoted against the resolution the mask was *predicted*
+    at. That happens to equal the depth's width, which is what the monobw path
+    passes -- but it is the same number for a different reason, so do not assume
+    the two stay equal if either side ever resizes.
+    """
+    base_width = mask_logits.shape[-1]
+    mask_logits = _closing(mask_logits, n_iter=1)
+    if tuple(mask_logits.shape[-2:]) != tuple(target_size):
+        mask_logits = F.interpolate(mask_logits, size=target_size,
+                                    mode="bilinear", align_corners=True, antialias=False)
+    mask = torch.sigmoid(mask_logits) > threshold
+    mask = _dilate_inner(mask, n_iter=inner_dilation, base_width=base_width)
+    mask = _dilate_outer(mask, n_iter=outer_dilation, base_width=base_width)
+    return mask
 
 
 # ---------------------------------------------------------------------------
@@ -1035,19 +1082,29 @@ def _apply_divergence_monobw(model, c, depth, divergence, convergence, synthetic
     return left_eye, right_eye, left_mask, right_mask
 
 
-class MonoBWInpaintImage(nn.Module):
-    """iw3's ``MonoBWInpaintImage``, with ``BaseImageInpaint`` folded in.
+class _BaseImageInpaint(nn.Module):
+    """iw3's ``BaseImageInpaint``: everything the inpaint pipelines share.
 
-    Holds the two halves of the pipeline: a ``MonoBW`` with no weights and a
-    ``LightInpaintV1`` with 2.26M of them.
+    A subclass supplies the two halves that differ. ``apply_warp`` makes the
+    two eyes and a hole mask for each synthesised one; ``preprocess_mask`` turns
+    one of those masks into the binary form the network wants. Everything
+    between and after -- the resize, the mirroring, the fill, the composite --
+    is the same whichever warp produced the holes.
     """
 
     def __init__(self, model, device="cpu"):
         super().__init__()
         self.model = model
-        self.monobw = MonoBW().eval().to(device)
         self.device = torch.device(device) if isinstance(device, str) else device
         self.eval()
+
+    def apply_warp(self, x, depth, divergence, convergence, synthetic_view,
+                   preserve_screen_border=False, enable_amp=True):
+        raise NotImplementedError
+
+    @staticmethod
+    def preprocess_mask(mask, target_size, inner_dilation=0, outer_dilation=0, base_width=None):
+        raise NotImplementedError
 
     @staticmethod
     def _resize(x, max_width):
@@ -1065,26 +1122,6 @@ class MonoBWInpaintImage(nn.Module):
                 new_h += 1
             x = F.interpolate(x, size=(new_h, new_w), mode="bilinear", antialias=True, align_corners=False)
         return x
-
-    def apply_warp(self, x, depth, divergence, convergence, synthetic_view, preserve_screen_border=False):
-        return _apply_divergence_monobw(
-            self.monobw, x, depth,
-            divergence=divergence,
-            convergence=convergence,
-            synthetic_view=synthetic_view,
-            preserve_screen_border=preserve_screen_border,
-            fix_screen_border_mask=1,  # fix the uninpaintable side
-        )
-
-    @staticmethod
-    def preprocess_mask(mask, target_size, inner_dilation=0, outer_dilation=0, base_width=None):
-        if mask.shape[-2:] != target_size:
-            mask = F.interpolate(mask, size=target_size, mode="nearest")
-        mask = mask > 0
-        mask = _mask_closing(mask)
-        mask = _dilate_outer(mask, n_iter=outer_dilation, base_width=base_width)
-        mask = _dilate_inner(mask, n_iter=inner_dilation, base_width=base_width)
-        return mask
 
     def _inpaint_single(self, eye, mask, is_left, inner_dilation=0, outer_dilation=0, base_width=None):
         # The network is trained for one handedness, so the left eye goes
@@ -1118,13 +1155,15 @@ class MonoBWInpaintImage(nn.Module):
         return left_eye, right_eye
 
     def forward(self, x, depth, divergence, convergence, synthetic_view="both",
-                inner_dilation=0, outer_dilation=0, preserve_screen_border=False):
+                inner_dilation=0, outer_dilation=0, preserve_screen_border=False,
+                enable_amp=True):
         left_eye, right_eye, left_mask, right_mask = self.apply_warp(
             x, depth,
             divergence=divergence,
             convergence=convergence,
             synthetic_view=synthetic_view,
             preserve_screen_border=preserve_screen_border,
+            enable_amp=enable_amp,
         )
         return self._inpaint(
             left_eye, right_eye, left_mask, right_mask, synthetic_view,
@@ -1148,12 +1187,95 @@ class MonoBWInpaintImage(nn.Module):
                 inner_dilation=inner_dilation,
                 outer_dilation=outer_dilation,
                 preserve_screen_border=preserve_screen_border,
+                enable_amp=enable_amp,
             )
+
+
+class MonoBWInpaintImage(_BaseImageInpaint):
+    """iw3's ``MonoBWInpaintImage``.
+
+    Holds the two halves of the pipeline: a ``MonoBW`` with no weights and a
+    ``LightInpaintV1`` with 2.26M of them.
+    """
+
+    def __init__(self, model, device="cpu"):
+        super().__init__(model, device=device)
+        self.monobw = MonoBW().eval().to(device)
+
+    def apply_warp(self, x, depth, divergence, convergence, synthetic_view,
+                   preserve_screen_border=False, enable_amp=True):
+        # enable_amp is ignored here and that is not an oversight: MonoBW has no
+        # weights, so there is no half-precision decision to make. Only the fill
+        # is a network, and infer() has already put that under autocast.
+        return _apply_divergence_monobw(
+            self.monobw, x, depth,
+            divergence=divergence,
+            convergence=convergence,
+            synthetic_view=synthetic_view,
+            preserve_screen_border=preserve_screen_border,
+            fix_screen_border_mask=1,  # fix the uninpaintable side
+        )
+
+    @staticmethod
+    def preprocess_mask(mask, target_size, inner_dilation=0, outer_dilation=0, base_width=None):
+        if mask.shape[-2:] != target_size:
+            mask = F.interpolate(mask, size=target_size, mode="nearest")
+        mask = mask > 0
+        mask = _mask_closing(mask)
+        mask = _dilate_outer(mask, n_iter=outer_dilation, base_width=base_width)
+        mask = _dilate_inner(mask, n_iter=inner_dilation, base_width=base_width)
+        return mask
+
+
+class MLBWInpaintImage(_BaseImageInpaint):
+    """iw3's ``MLBWInpaintImage``.
+
+    A ``mask_mlbw_l2`` supplies both the warp and the holes; the fill is the
+    same ``LightInpaintV1`` the monobw pipeline uses. Where MonoBW *computes*
+    its holes -- wherever inverting the index map had to stretch, there is one
+    -- this model *predicts* them, as a third output head.
+    """
+
+    def __init__(self, model, mask_mlbw, device="cpu"):
+        super().__init__(model, device=device)
+        self.mask_mlbw = mask_mlbw.eval().to(device)
+
+    def apply_warp(self, x, depth, divergence, convergence, synthetic_view,
+                   preserve_screen_border=False, enable_amp=True):
+        return apply_divergence_mlbw(
+            self.mask_mlbw, x, depth,
+            divergence=divergence,
+            convergence=convergence,
+            synthetic_view=synthetic_view,
+            preserve_screen_border=preserve_screen_border,
+            enable_amp=enable_amp,
+        )
+
+    @staticmethod
+    def preprocess_mask(mask, target_size, inner_dilation=0, outer_dilation=0, base_width=None):
+        # base_width arrives and is dropped, following iw3: this path takes it
+        # from the logits instead. See _postprocess_hole_mask.
+        return _postprocess_hole_mask(
+            mask,
+            target_size=target_size,
+            threshold=MASK_MLBW_THRESHOLD,
+            inner_dilation=inner_dilation,
+            outer_dilation=outer_dilation,
+        )
 
 
 def load_monobw_inpaint(path=None, device="cpu"):
     """The whole pipeline: a ``MonoBW`` plus a loaded ``LightInpaintV1``."""
     return MonoBWInpaintImage(load_light_inpaint_v1(path, device=device), device=device)
+
+
+def load_mlbw_inpaint(path=None, mask_mlbw_path=None, device="cpu"):
+    """The whole pipeline: a ``mask_mlbw_l2`` plus a loaded ``LightInpaintV1``."""
+    return MLBWInpaintImage(
+        load_light_inpaint_v1(path, device=device),
+        load_mask_mlbw_l2(mask_mlbw_path, device=device),
+        device=device,
+    )
 
 
 def synthesize_stereo_inpaint(
