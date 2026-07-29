@@ -28,7 +28,15 @@
     cuDNN is a separate product that the Toolkit installer does not include.
 
 .PARAMETER BundleDirectory
-    The installed plugin bundle. Defaults to the usual system location.
+    The installed plugin bundle's Contents\Win64 folder.
+
+    Not usually needed. This script ships inside the bundle, so by default it
+    works out where it is and targets the bundle it came from -- which also means
+    it works when the plugin is installed somewhere other than the standard
+    directory. Only pass this if you are running a copy from outside a bundle
+    and the standard location is not where the plugin lives.
+
+    It does not matter what directory you run this from.
 
 .PARAMETER IncludeAdv
     Also fetch cudnn_adv64_9.dll (about 100 MB). Skipped by default: it holds
@@ -41,7 +49,9 @@
     Re-download and overwrite files that are already present.
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File scripts\fetch-cuda-runtime.ps1
+    From an elevated PowerShell, from any directory:
+
+    powershell -ExecutionPolicy Bypass -File "C:\Program Files\Common Files\OFX\Plugins\iw3stereo.ofx.bundle\fetch-cuda-runtime.ps1"
 
 .NOTES
     These libraries are NVIDIA's and are covered by NVIDIA's licence terms, not
@@ -51,14 +61,37 @@
 
 [CmdletBinding()]
 param(
-    [string] $BundleDirectory =
-        "C:\Program Files\Common Files\OFX\Plugins\iw3stereo.ofx.bundle\Contents\Win64",
+    [string] $BundleDirectory,
     [switch] $IncludeAdv,
     [switch] $Force
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+
+# Work out which bundle to fill, so that running this needs no arguments and no
+# particular working directory.
+#
+# $PSScriptRoot is deliberately resolved here and not in the param() default
+# above: under Windows PowerShell 5.1 it is not populated while parameter
+# defaults are being evaluated, which would silently leave this empty. Same trap
+# and same workaround as install-ofx.ps1.
+if (-not $BundleDirectory) {
+    $scriptDir = $PSScriptRoot
+    if (-not $scriptDir) { $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path }
+
+    # Shipped inside the bundle: the sibling of this script is Contents\Win64.
+    # Preferring this over the standard path is what makes a non-default install
+    # location work without anyone having to notice.
+    $beside = if ($scriptDir) { Join-Path $scriptDir "Contents\Win64" } else { $null }
+    if ($beside -and (Test-Path (Join-Path $beside "ort"))) {
+        $BundleDirectory = $beside
+    }
+    else {
+        $BundleDirectory =
+            "C:\Program Files\Common Files\OFX\Plugins\iw3stereo.ofx.bundle\Contents\Win64"
+    }
+}
 
 # The runtime lives in a subdirectory of the bundle so that its provider DLLs
 # resolve from there rather than from Resolve's application directory. These go

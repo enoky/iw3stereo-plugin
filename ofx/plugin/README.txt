@@ -16,13 +16,20 @@ REQUIREMENTS
     slower and is not usable for preview.
 
   * The CUDA runtime libraries -- cuBLAS and cuDNN. The plugin does not ship
-    these: they are about a gigabyte, four times the rest of it. Run
+    these: they are about a gigabyte, four times the rest of it.
 
-        powershell -ExecutionPolicy Bypass -File fetch-cuda-runtime.ps1
+    Open PowerShell as administrator (right-click the Start button > Terminal
+    (Admin), or search for PowerShell, right-click, Run as administrator) and
+    paste this in, quotes included:
 
-    from an elevated prompt, once, and restart Resolve. It downloads them from
-    NVIDIA's own packages and puts them next to the plugin. Nothing is installed
-    system-wide and no Python is involved.
+        powershell -ExecutionPolicy Bypass -File "C:\Program Files\Common Files\OFX\Plugins\iw3stereo.ofx.bundle\fetch-cuda-runtime.ps1"
+
+    It does not matter which directory you run it from, and there is nothing to
+    fill in -- the script sits inside the plugin bundle and fills in the bundle
+    it came from. Do it once, then restart Resolve.
+
+    It downloads the libraries from NVIDIA's own packages and puts them next to
+    the plugin. Nothing is installed system-wide and no Python is involved.
 
     You do NOT need the CUDA Toolkit, and installing it would not be enough on
     its own -- cuDNN is a separate product the Toolkit does not include.
