@@ -164,6 +164,24 @@ static __global__ void maskBlurKernel(const float* __restrict__ source, int widt
 // mask, and this is that same expression at full resolution: where the mask is
 // zero the original eye survives untouched, so only the invented pixels are the
 // ones that were computed small.
+// Cubic convolution weight, a = -0.75 -- PyTorch's bicubic constant, which is
+// what makes the reference generatable from F.interpolate rather than from a
+// second hand-written copy of this.
+__device__ inline float cubicWeight(float t)
+{
+    const float a = -0.75f;
+    t = fabsf(t);
+    if (t < 1.0f)
+    {
+        return ((a + 2.0f) * t - (a + 3.0f)) * t * t + 1.0f;
+    }
+    if (t < 2.0f)
+    {
+        return ((a * t - 5.0f * a) * t + 8.0f * a) * t - 4.0f * a;
+    }
+    return 0.0f;
+}
+
 static __global__ void compositeUpscaledKernel(const float* __restrict__ eye,
                                         const __half* __restrict__ filled,
                                         const float* __restrict__ maskBlur,
@@ -194,24 +212,40 @@ static __global__ void compositeUpscaledKernel(const float* __restrict__ eye,
     const float scaleY = inHeight > 1 ? float(inHeight - 1) / float(max(height - 1, 1)) : 0.0f;
     const float sx = float(x) * scaleX;
     const float sy = float(y) * scaleY;
-    const int x0 = math::clampInt(int(sx), 0, inWidth - 1);
-    const int y0 = math::clampInt(int(sy), 0, inHeight - 1);
-    const int x1 = math::clampInt(x0 + 1, 0, inWidth - 1);
-    const int y1 = math::clampInt(y0 + 1, 0, inHeight - 1);
+    // Bicubic rather than bilinear. A hole narrow enough to matter is exactly
+    // where four taps show their blockiness, and the sixteen-tap cost is paid
+    // only here -- the short-circuit above has already returned for every pixel
+    // outside the feather, which is nearly all of them.
+    const int x0 = int(floorf(sx));
+    const int y0 = int(floorf(sy));
     const float fx = sx - float(x0);
     const float fy = sy - float(y0);
+
+    float wx[4], wy[4];
+    for (int i = 0; i < 4; ++i)
+    {
+        wx[i] = cubicWeight(float(i - 1) - fx);
+        wy[i] = cubicWeight(float(i - 1) - fy);
+    }
 
     const size_t inPixels = size_t(inWidth) * size_t(inHeight);
     for (int plane = 0; plane < 3; ++plane)
     {
         const __half* p = filled + size_t(plane) * inPixels;
-        const float v00 = __half2float(p[size_t(y0) * size_t(inWidth) + size_t(x0)]);
-        const float v01 = __half2float(p[size_t(y0) * size_t(inWidth) + size_t(x1)]);
-        const float v10 = __half2float(p[size_t(y1) * size_t(inWidth) + size_t(x0)]);
-        const float v11 = __half2float(p[size_t(y1) * size_t(inWidth) + size_t(x1)]);
-        const float top = v00 + (v01 - v00) * fx;
-        const float bottom = v10 + (v11 - v10) * fx;
-        const float value = top + (bottom - top) * fy;
+        float value = 0.0f;
+        for (int j = 0; j < 4; ++j)
+        {
+            // Out of range replicates the edge, which is what
+            // upsample_bicubic2d does with its bounded fetch.
+            const int sampleY = math::clampInt(y0 + j - 1, 0, inHeight - 1);
+            float row = 0.0f;
+            for (int i = 0; i < 4; ++i)
+            {
+                const int sampleX = math::clampInt(x0 + i - 1, 0, inWidth - 1);
+                row += __half2float(p[size_t(sampleY) * size_t(inWidth) + size_t(sampleX)]) * wx[i];
+            }
+            value += row * wy[j];
+        }
         const float original = eye[size_t(plane) * pixels + index];
         destination[size_t(plane) * pixels + index] = original * (1.0f - m) + value * m;
     }

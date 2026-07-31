@@ -127,6 +127,16 @@ must be finite, not a NaN.
 
 Cost: one extra plane read per output pixel. Negligible.
 
+**2 — bicubic upsample in the composite. Done.** The kernel agrees with
+PyTorch bicubic to 1.1e-6, which is a stronger check than stage 1 got: the
+reference is F.interpolate and the kernel is hand-written Catmull-Rom, so the
+two sides are genuinely independent. Against the bilinear it replaces, the lift
+differs by up to 0.018 / 0.034 / 0.069 at 1.5x / 2.7x / 5.3x, and unlike stage 1
+it is diffuse rather than edge-local -- it changes every lifted pixel, though
+only inside the feather where the composite uses the lift at all.
+
+Original note:
+
 **2 — bicubic upsample in the composite.** Replace the four-tap bilinear in
 `compositeUpscaledKernel` with a sixteen-tap Catmull-Rom, matching PyTorch's
 `mode="bicubic"` coefficient (a = -0.75) so the reference data can be generated

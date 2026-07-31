@@ -513,28 +513,22 @@ def _mask_blur(mask):
 
 
 def _composite(eye, filled, mask_blur, mask_hard):
-    """compositeUpscaledKernel: bilinear lift of the fill, feathered blend."""
+    """compositeUpscaledKernel: bicubic lift of the fill, feathered blend."""
     _, height, width = eye.shape
     in_height, in_width = filled.shape[-2:]
     m = np.clip(mask_blur + mask_hard, 0.0, 1.0)
 
-    scale_x = (in_width - 1) / max(width - 1, 1) if in_width > 1 else 0.0
-    scale_y = (in_height - 1) / max(height - 1, 1) if in_height > 1 else 0.0
-    sx = np.arange(width, dtype=np.float32) * np.float32(scale_x)
-    sy = np.arange(height, dtype=np.float32) * np.float32(scale_y)
-    x0 = np.clip(sx.astype(np.int32), 0, in_width - 1)
-    y0 = np.clip(sy.astype(np.int32), 0, in_height - 1)
-    x1 = np.clip(x0 + 1, 0, in_width - 1)
-    y1 = np.clip(y0 + 1, 0, in_height - 1)
-    fx = (sx - x0.astype(np.float32))[None, :]
-    fy = (sy - y0.astype(np.float32))[:, None]
-
-    lifted = np.empty_like(eye)
-    for plane in range(3):
-        p = filled[plane]
-        top = p[np.ix_(y0, x0)] + (p[np.ix_(y0, x1)] - p[np.ix_(y0, x0)]) * fx
-        bottom = p[np.ix_(y1, x0)] + (p[np.ix_(y1, x1)] - p[np.ix_(y1, x0)]) * fx
-        lifted[plane] = top + (bottom - top) * fy
+    # Bicubic, and taken straight from PyTorch rather than hand-rolled here, so
+    # that what the kernel is held to is the reference implementation and not a
+    # second copy of the same arithmetic.
+    #
+    # align_corners=True because the kernel's coordinate mapping is
+    # (in - 1) / (out - 1), and antialias deliberately OFF: PyTorch's antialiased
+    # path silently switches to a half-pixel transform and ignores align_corners,
+    # which is the trap that put the mlbw warp in CUDA in the first place.
+    lifted = torch.nn.functional.interpolate(
+        torch.from_numpy(filled).unsqueeze(0), size=(height, width),
+        mode="bicubic", align_corners=True)[0].numpy().astype(np.float32)
 
     # The kernel returns the untouched eye wherever the feather is zero rather
     # than blending by zero, so the reference has to as well: those two agree in
