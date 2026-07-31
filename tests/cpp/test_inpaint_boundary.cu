@@ -159,7 +159,7 @@ int main(int argc, char** argv)
         else
         {
             iw3::downscaleEyeKernel<<<grid2d(outWidth, outHeight), dim3(kBlock, kBlock)>>>(
-                eyeDevice, width, height, outWidth, outHeight, eyeHalf);
+                eyeDevice, width, height, maskDevice, outWidth, outHeight, eyeHalf);
             iw3::downscaleMaskKernel<<<grid2d(outWidth, outHeight), dim3(kBlock, kBlock)>>>(
                 maskDevice, width, height, outWidth, outHeight, maskHalf);
             iw3::maskBlurKernel<<<grid2d(width, height), dim3(kBlock, kBlock)>>>(

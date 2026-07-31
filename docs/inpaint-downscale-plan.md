@@ -111,6 +111,14 @@ Bar: the existing bilinear/box behaviour reproduced within 1e-5, *first* — so 
 harness is proven against the code as it stands before the code moves. Then each
 change below flips its own reference and the diff is visible.
 
+**1 — premultiplied downscale. Done.** Measured against the unweighted box on
+the same frame, worst pixel 0.0176 at 1.5x, 0.0297 at 2.7x and 0.0594 at 5.3x --
+scaling with the ratio as expected, and concentrated: 50 to 118 pixels exceed
+1/255, all of them at hole edges. At Full it is exactly zero, because that path
+is a straight cast and this kernel never runs.
+
+Original note:
+
 **1 — premultiplied downscale.** `downscaleEyeKernel` gains the mask as an
 argument, accumulates `sum(eye * valid)` and `sum(valid)`, and divides. Where a
 footprint is entirely masked the weight is zero and it falls back to the plain

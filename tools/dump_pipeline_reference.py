@@ -447,6 +447,37 @@ def _footprint(i, size, out_size):
     return low, high
 
 
+def _downscale_eye(eye, mask, out_width, out_height):
+    """downscaleEyeKernel: a box average weighted by which pixels are valid.
+
+    The naive box average has no idea which of the pixels it is averaging sit
+    inside a hole, so invalid content bleeds into the valid pixels next to every
+    hole edge and the network is handed that as if it were real. Weighting by
+    validity and renormalising is the standard fix -- premultiply, average,
+    divide by the coverage.
+
+    Where a footprint is entirely inside a hole there is no valid content to
+    average, so it falls back to the plain mean. That pixel is about to be
+    replaced by the network anyway; what matters is that it is finite and
+    deterministic rather than a division by zero.
+    """
+    height, width = eye.shape[-2:]
+    out = np.zeros(eye.shape[:-2] + (out_height, out_width), dtype=np.float32)
+    valid = (1.0 - mask).astype(np.float32)
+    for y in range(out_height):
+        y0, y1 = _footprint(y, height, out_height)
+        for x in range(out_width):
+            x0, x1 = _footprint(x, width, out_width)
+            patch = eye[..., y0:y1, x0:x1]
+            w = valid[y0:y1, x0:x1]
+            coverage = w.sum()
+            if coverage > 0.0:
+                out[..., y, x] = (patch * w).sum(axis=(-2, -1)) / coverage
+            else:
+                out[..., y, x] = patch.mean(axis=(-2, -1))
+    return out.astype(np.float16).astype(np.float32)
+
+
 def _downscale(plane, out_width, out_height, reduce_max=False):
     height, width = plane.shape[-2:]
     out = np.zeros(plane.shape[:-2] + (out_height, out_width), dtype=np.float32)
@@ -532,7 +563,7 @@ for index, (image_hw, depth_hw, divergence, max_width) in enumerate([
     height, width = image_hw
     out_width, out_height = _working_size(width, height, max_width)
 
-    reduced_eye = _downscale(eye, out_width, out_height)
+    reduced_eye = _downscale_eye(eye, mask, out_width, out_height)
     reduced_mask = _downscale(mask, out_width, out_height, reduce_max=True)
 
     # A stand-in for the graph's output, built from the reduced eye so it is

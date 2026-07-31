@@ -416,7 +416,8 @@ void MonoBwGpu::prepareInpaintInput(int maxWidth, void* stream)
         const dim3 blocks = grid2d(_workWidth, _workHeight);
         const dim3 block2d(kBlock, kBlock);
         downscaleEyeKernel<<<blocks, block2d, 0, cudaStream>>>(
-            _eye, _width, _height, _workWidth, _workHeight, static_cast<__half*>(_eyeHalf));
+            _eye, _width, _height, _processedMask, _workWidth, _workHeight,
+            static_cast<__half*>(_eyeHalf));
         downscaleMaskKernel<<<blocks, block2d, 0, cudaStream>>>(
             _processedMask, _width, _height, _workWidth, _workHeight,
             static_cast<__half*>(_maskHalf));
