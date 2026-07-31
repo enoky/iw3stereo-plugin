@@ -201,6 +201,18 @@ if(IW3_HAS_CUDA)
         RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/tests"
         CUDA_SEPARABLE_COMPILATION OFF)
 
+    # The reduce-and-composite either side of an inpaint graph, against the
+    # Python that models it. Launches the kernels directly -- what is under
+    # test is the boundary, not a pipeline around it.
+    add_executable(test_inpaint_boundary ../tests/cpp/test_inpaint_boundary.cu)
+    target_include_directories(test_inpaint_boundary PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/plugin"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../tests/cpp")
+    set_target_properties(test_inpaint_boundary PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/tests"
+        CUDA_SEPARABLE_COMPILATION OFF)
+
     # The plugin's monobw render path without an OFX host: real OrtRuntime, real
     # kernels, real device pointers. It is what localises a failure in Resolve to
     # either the glue or the pipeline.

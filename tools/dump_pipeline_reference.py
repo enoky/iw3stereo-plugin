@@ -412,6 +412,145 @@ else:
     print(f"skipping mlbw cases: {MASK_MLBW_CHECKPOINT} not found")
 
 
+# --- the inpaint graph boundary ---------------------------------------------
+# The reduce-and-composite either side of an inpaint graph: the only path in the
+# plugin with no output test at all until now. The Python golden tests do cover
+# max_width, but they test the *port*, which follows iw3 and resizes the whole
+# frame before warping; these kernels are the plugin's own and nothing has ever
+# compared their output to anything.
+#
+# So this models the kernels as they are today rather than as they ought to be.
+# That is the point: docs/inpaint-downscale-plan.md changes them next, and a
+# harness proven against the current behaviour first is what makes each change
+# show up as a deliberate diff instead of a surprise.
+#
+# Modelled here rather than called through the pipeline because the box filter
+# is not F.interpolate -- it averages over an integer footprint derived by
+# truncating division -- and reaching for interpolate would quietly test
+# something else.
+
+def _working_size(width, height, max_width):
+    """math::inpaintWorkingSize."""
+    if max_width <= 0 or width <= max_width:
+        return width, height
+    if max_width % 2 != 0:
+        max_width += 1
+    out_height = int((max_width / width) * height)
+    if out_height % 2 != 0:
+        out_height += 1
+    return max_width, out_height
+
+
+def _footprint(i, size, out_size):
+    low = (i * size) // out_size
+    high = max(low + 1, ((i + 1) * size) // out_size)
+    return low, high
+
+
+def _downscale(plane, out_width, out_height, reduce_max=False):
+    height, width = plane.shape[-2:]
+    out = np.zeros(plane.shape[:-2] + (out_height, out_width), dtype=np.float32)
+    for y in range(out_height):
+        y0, y1 = _footprint(y, height, out_height)
+        for x in range(out_width):
+            x0, x1 = _footprint(x, width, out_width)
+            patch = plane[..., y0:y1, x0:x1]
+            out[..., y, x] = patch.max(axis=(-2, -1)) if reduce_max else patch.mean(axis=(-2, -1))
+    # The buffers the graph is handed are __half; the rounding is part of it.
+    return out.astype(np.float16).astype(np.float32)
+
+
+def _mask_blur(mask):
+    """maskBlurKernel twice: horizontal then vertical, edges clamped."""
+    kernel = stereo_inpaint._gaussian_kernel1d(15).numpy().astype(np.float32)
+    radius = 15 // 2
+    height, width = mask.shape[-2:]
+
+    def pass1d(source, horizontal):
+        out = np.zeros_like(source)
+        for k in range(15):
+            offset = k - radius
+            if horizontal:
+                index = np.clip(np.arange(width) + offset, 0, width - 1)
+                out += source[..., :, index] * kernel[k]
+            else:
+                index = np.clip(np.arange(height) + offset, 0, height - 1)
+                out += source[..., index, :] * kernel[k]
+        return out
+
+    return pass1d(pass1d(mask, True), False)
+
+
+def _composite(eye, filled, mask_blur, mask_hard):
+    """compositeUpscaledKernel: bilinear lift of the fill, feathered blend."""
+    _, height, width = eye.shape
+    in_height, in_width = filled.shape[-2:]
+    m = np.clip(mask_blur + mask_hard, 0.0, 1.0)
+
+    scale_x = (in_width - 1) / max(width - 1, 1) if in_width > 1 else 0.0
+    scale_y = (in_height - 1) / max(height - 1, 1) if in_height > 1 else 0.0
+    sx = np.arange(width, dtype=np.float32) * np.float32(scale_x)
+    sy = np.arange(height, dtype=np.float32) * np.float32(scale_y)
+    x0 = np.clip(sx.astype(np.int32), 0, in_width - 1)
+    y0 = np.clip(sy.astype(np.int32), 0, in_height - 1)
+    x1 = np.clip(x0 + 1, 0, in_width - 1)
+    y1 = np.clip(y0 + 1, 0, in_height - 1)
+    fx = (sx - x0.astype(np.float32))[None, :]
+    fy = (sy - y0.astype(np.float32))[:, None]
+
+    lifted = np.empty_like(eye)
+    for plane in range(3):
+        p = filled[plane]
+        top = p[np.ix_(y0, x0)] + (p[np.ix_(y0, x1)] - p[np.ix_(y0, x0)]) * fx
+        bottom = p[np.ix_(y1, x0)] + (p[np.ix_(y1, x1)] - p[np.ix_(y1, x0)]) * fx
+        lifted[plane] = top + (bottom - top) * fy
+
+    # The kernel returns the untouched eye wherever the feather is zero rather
+    # than blending by zero, so the reference has to as well: those two agree in
+    # exact arithmetic and not necessarily in the last bit.
+    out = eye * (1.0 - m) + lifted * m
+    return np.where(m <= 0.0, eye, out).astype(np.float32)
+
+
+for index, (image_hw, depth_hw, divergence, max_width) in enumerate([
+        ((216, 384), (108, 192), 5.0, 256),   # 1.5x -- the shipped default's ratio
+        ((216, 384), (108, 192), 5.0, 144),   # 2.7x
+        ((216, 384), (108, 192), 5.0, 72),    # 5.3x -- 720 on a 4K timeline
+        ((216, 384), (108, 192), 5.0, 0),     # no reduction: must be the identity
+]):
+    image, depth = _monobw_pair(image_hw, depth_hw, 1000 + index)
+    with torch.inference_mode():
+        eye_t, raw = _monobw(image, depth, divergence=divergence, convergence=0.5,
+                             preserve_screen_border=False, fix_screen_border_mask=1,
+                             return_mask=True)
+        mask_t = stereo_inpaint.MonoBWInpaintImage.preprocess_mask(
+            raw, target_size=eye_t.shape[-2:], inner_dilation=2, outer_dilation=3,
+            base_width=depth_hw[1])
+
+    eye = eye_t[0].numpy().astype(np.float32)
+    mask = mask_t[0, 0].float().numpy().astype(np.float32)
+    height, width = image_hw
+    out_width, out_height = _working_size(width, height, max_width)
+
+    reduced_eye = _downscale(eye, out_width, out_height)
+    reduced_mask = _downscale(mask, out_width, out_height, reduce_max=True)
+
+    # A stand-in for the graph's output, built from the reduced eye so it is
+    # already fp16-exact and is obviously not the eye itself.
+    filled = np.clip(1.0 - reduced_eye, 0.0, 1.0).astype(np.float16).astype(np.float32)
+
+    if out_width == width and out_height == height:
+        # finishInpaintOutput only widens in this case -- no composite at all.
+        composited = filled.copy()
+    else:
+        composited = _composite(eye, filled, _mask_blur(mask), mask)
+
+    add(f"inpaint_boundary_{width}x{height}_to_{out_width}x{out_height}",
+        [width, height, out_width, out_height],
+        np.concatenate([eye.ravel(), mask.ravel(), filled.ravel()]),
+        np.concatenate([reduced_eye.ravel(), reduced_mask.ravel(), composited.ravel()]))
+
+
 # --- write -------------------------------------------------------------------
 os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)
 with open(OUTPUT, "wb") as handle:
